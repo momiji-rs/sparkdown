@@ -1,5 +1,13 @@
 # sparkdown
 
+[![CI](https://github.com/momiji-rs/sparkdown/actions/workflows/ci.yml/badge.svg)](https://github.com/momiji-rs/sparkdown/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/sparkdown.svg)](https://crates.io/crates/sparkdown)
+[![docs.rs](https://img.shields.io/docsrs/sparkdown)](https://docs.rs/sparkdown)
+[![CommonMark 0.31.2](https://img.shields.io/badge/CommonMark-0.31.2%20100%25-brightgreen.svg)](https://spec.commonmark.org/0.31.2/)
+[![MSRV](https://img.shields.io/badge/MSRV-1.95%2B-blue.svg)](Cargo.toml)
+[![dependencies](https://img.shields.io/badge/dependencies-0-brightgreen.svg)](Cargo.toml)
+[![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A fast, **standards-first** CommonMark parser in Rust.
 
 *markdown, with a spark.*
