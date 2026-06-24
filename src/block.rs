@@ -458,6 +458,12 @@ impl<'a> Parser<'a> {
         // Phase 2: look for new block starts.
         while !matched_leaf {
             self.find_next_nonspace();
+            // Fast skip: a non-indented line whose first non-space char can't
+            // begin any block is plain paragraph text — bypass all matchers.
+            if !self.indented && !maybe_special(peek(self.line, self.next_nonspace)) {
+                self.advance_next_nonspace();
+                break;
+            }
             let mut found = false;
             for start in 0..NUM_STARTS {
                 match self.try_start(start, container) {
@@ -889,6 +895,17 @@ impl<'a> Parser<'a> {
 }
 
 const NUM_STARTS: usize = 8;
+
+/// Could a line whose first non-space byte is `c` begin a block other than a
+/// paragraph? (`#` ATX, `>` quote, `` ` ``/`~` fence, `*+-_` thematic/list,
+/// `=`/`-` setext, `<` HTML, digit ordered list.) Used to skip block-start
+/// matching on plain prose lines.
+fn maybe_special(c: Option<u8>) -> bool {
+    matches!(
+        c,
+        Some(b'#' | b'>' | b'`' | b'~' | b'*' | b'+' | b'-' | b'_' | b'=' | b'<' | b'0'..=b'9')
+    )
+}
 
 fn can_contain(parent: Kind, child: Kind) -> bool {
     match parent {
