@@ -5,7 +5,8 @@
 //! sparkdown's contract is the inverse:
 //! handle the **whole** [CommonMark 0.31.2](https://spec.commonmark.org/0.31.2/)
 //! grammar and aim for byte-identical output with the reference `cmark`.
-//! The bar to beat on speed is `pulldown-cmark`.
+//! It's built first for ourselves: a fast, dependency-free engine that's
+//! pleasant to embed.
 //!
 //! ## Provenance
 //!

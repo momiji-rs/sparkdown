@@ -15,8 +15,9 @@ A fast, **standards-first** CommonMark parser in Rust.
 Where [rostdown](https://github.com/momiji-rs/rostdown) renders a kramdown
 **subset** and cleanly declines everything outside it, sparkdown's contract is
 the inverse: parse the **whole** [CommonMark 0.31.2](https://spec.commonmark.org/0.31.2/)
-grammar and aim for byte-identical output with the reference `cmark`. The
-speed bar to beat is `pulldown-cmark`.
+grammar and aim for byte-identical output with the reference `cmark`. It's
+built first for ourselves — a fast, dependency-free CommonMark engine that's
+pleasant to embed — not to chase any particular competitor.
 
 ## Status — ✅ 100% CommonMark 0.31.2
 
@@ -32,14 +33,14 @@ Passes all **652/652** examples of the official conformance suite.
 
 The block layer is a faithful port of the reference incremental algorithm
 (open-block tree + per-line continuation); the renderer matches cmark's
-whitespace byte-for-byte. Next: wire it into rostdown's perf substrate (arena +
-SWAR scan) and benchmark against `pulldown-cmark`.
+whitespace byte-for-byte. Ongoing work is performance — trimming allocations
+and wiring it onto rostdown's perf substrate (arena + SWAR scan).
 
 ```bash
 # Live CommonMark conformance number (652 official examples):
 cargo test --test spec -- --nocapture
 
-# Speed vs pulldown-cmark on the 198 KB spec fixture:
+# Throughput on the 198 KB CommonMark spec fixture:
 cargo bench
 ```
 
@@ -54,7 +55,8 @@ The performance substrate is grammar-agnostic and lifted **verbatim**:
 | `src/arena.rs`  | opt-in `ScopedAlloc` global allocator (`arena` feature) |
 | `src/entities.rs` | HTML entity tables                      |
 
-The grammar layer (`src/parse.rs`, `src/render.rs`) is **new** — rostdown's
+The grammar layer (`src/block.rs`, `src/inline.rs`, `src/render.rs`) is
+**new** — rostdown's
 parser is built around "decline if outside my subset", and its renderer bakes
 in kramdown semantics (heading auto-ids, default smart typography). Both are
 the opposite of what a full CommonMark engine needs, so they were rewritten
@@ -72,8 +74,9 @@ rather than forked.
 4. ~~Block quotes and list items (the container-block state machine).~~ ✅
 5. ~~HTML blocks (and raw inline HTML), link reference definitions.~~ ✅
 
-**100% conformance reached.** Remaining work is performance: share rostdown's
-`core` (arena + SWAR scan), then close the speed gap to `pulldown-cmark`.
+**100% conformance reached.** Ongoing work is performance — keeping it fast and
+lean (trimming allocations now; eventually sharing rostdown's `core`: arena +
+SWAR scan).
 
 ## License
 
