@@ -6,7 +6,7 @@
 
 use crate::block::{Kind, Tree};
 use crate::inline::{Scratch, render_inline};
-use crate::scan::memchr4;
+use crate::scan::find_escape;
 
 /// Render a parsed [`Tree`] to an HTML string.
 pub fn render(tree: &Tree) -> String {
@@ -139,7 +139,7 @@ fn in_tight_list(tree: &Tree, para: usize) -> bool {
 pub fn escape_html(s: &str, out: &mut String) {
     let bytes = s.as_bytes();
     let mut i = 0;
-    while let Some(rel) = memchr4(&bytes[i..], b'&', b'<', b'>', b'"') {
+    while let Some(rel) = find_escape(&bytes[i..]) {
         let hit = i + rel;
         out.push_str(&s[i..hit]);
         out.push_str(match bytes[hit] {
@@ -147,7 +147,7 @@ pub fn escape_html(s: &str, out: &mut String) {
             b'<' => "&lt;",
             b'>' => "&gt;",
             b'"' => "&quot;",
-            _ => unreachable!("memchr4 only reports &, <, >, \""),
+            _ => unreachable!("find_escape only reports &, <, >, \""),
         });
         i = hit + 1;
     }

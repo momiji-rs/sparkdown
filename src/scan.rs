@@ -82,10 +82,116 @@ pub(crate) fn memchr3(hay: &[u8], a: u8, b: u8, c: u8) -> Option<usize> {
     None
 }
 
-/// Index of the first byte in `hay` equal to `a`, `b`, `c`, or `d` — a
-/// dependency-free `memchr4` (used for HTML *attribute* escaping, whose
-/// special set is `&`/`<`/`>`/`"`).
+/// Index of the first HTML-text special (`&`, `<`, `>`, `"`) in `hay` —
+/// SIMD-accelerated (NEON on aarch64, SSE2 on x86_64; both baseline, so no
+/// runtime detection), with the SWAR [`memchr4`] as the portable fallback.
+/// Used by the hot escape loop.
 #[inline]
+pub(crate) fn find_escape(hay: &[u8]) -> Option<usize> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64; reads are bounded by `i + 16 <= len`.
+        unsafe { find_escape_neon(hay) }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: SSE2 is baseline on x86_64; reads are bounded by `i + 16 <= len`.
+        unsafe { find_escape_sse2(hay) }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        memchr4(hay, b'&', b'<', b'>', b'"')
+    }
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[inline]
+fn is_escape(b: u8) -> bool {
+    matches!(b, b'&' | b'<' | b'>' | b'"')
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn find_escape_neon(hay: &[u8]) -> Option<usize> {
+    use core::arch::aarch64::*;
+    let (amp, lt, gt, qt) = unsafe {
+        (
+            vdupq_n_u8(b'&'),
+            vdupq_n_u8(b'<'),
+            vdupq_n_u8(b'>'),
+            vdupq_n_u8(b'"'),
+        )
+    };
+    let mut i = 0;
+    while i + 16 <= hay.len() {
+        let m = unsafe {
+            let v = vld1q_u8(hay.as_ptr().add(i));
+            vorrq_u8(
+                vorrq_u8(vceqq_u8(v, amp), vceqq_u8(v, lt)),
+                vorrq_u8(vceqq_u8(v, gt), vceqq_u8(v, qt)),
+            )
+        };
+        // Narrow each 16-bit lane to 4 bits → a 64-bit "nibble per byte" mask.
+        let mask = unsafe {
+            vget_lane_u64(
+                vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(m), 4)),
+                0,
+            )
+        };
+        if mask != 0 {
+            return Some(i + (mask.trailing_zeros() as usize >> 2));
+        }
+        i += 16;
+    }
+    while i < hay.len() {
+        if is_escape(hay[i]) {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn find_escape_sse2(hay: &[u8]) -> Option<usize> {
+    use core::arch::x86_64::*;
+    let (amp, lt, gt, qt) = unsafe {
+        (
+            _mm_set1_epi8(b'&' as i8),
+            _mm_set1_epi8(b'<' as i8),
+            _mm_set1_epi8(b'>' as i8),
+            _mm_set1_epi8(b'"' as i8),
+        )
+    };
+    let mut i = 0;
+    while i + 16 <= hay.len() {
+        let mask = unsafe {
+            let v = _mm_loadu_si128(hay.as_ptr().add(i) as *const __m128i);
+            let m = _mm_or_si128(
+                _mm_or_si128(_mm_cmpeq_epi8(v, amp), _mm_cmpeq_epi8(v, lt)),
+                _mm_or_si128(_mm_cmpeq_epi8(v, gt), _mm_cmpeq_epi8(v, qt)),
+            );
+            _mm_movemask_epi8(m)
+        };
+        if mask != 0 {
+            return Some(i + mask.trailing_zeros() as usize);
+        }
+        i += 16;
+    }
+    while i < hay.len() {
+        if is_escape(hay[i]) {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Index of the first byte in `hay` equal to `a`, `b`, `c`, or `d` — a
+/// dependency-free `memchr4`. The SIMD `find_escape` fallback on non-x86/non-arm.
+#[inline]
+#[cfg_attr(any(target_arch = "aarch64", target_arch = "x86_64"), allow(dead_code))]
 pub(crate) fn memchr4(hay: &[u8], a: u8, b: u8, c: u8, d: u8) -> Option<usize> {
     let (ba, bb, bc, bd) = (broadcast(a), broadcast(b), broadcast(c), broadcast(d));
     let mut i = 0;
@@ -163,5 +269,29 @@ mod tests {
             memchr3(b"plain prose, no specials here", b'&', b'<', b'>'),
             None
         );
+    }
+
+    #[test]
+    fn find_escape_matches_scalar() {
+        let escape_scalar = |h: &[u8]| {
+            h.iter()
+                .position(|&b| matches!(b, b'&' | b'<' | b'>' | b'"'))
+        };
+        // Every length over a byte spread (covers SIMD body + scalar tail).
+        let bytes: Vec<u8> = (0u8..=255).cycle().take(400).collect();
+        for len in 0..bytes.len() {
+            let hay = &bytes[..len];
+            assert_eq!(find_escape(hay), escape_scalar(hay), "len={len}");
+        }
+        // A special at every position within and across SIMD blocks.
+        for pos in 0..40 {
+            for &sp in &[b'&', b'<', b'>', b'"'] {
+                let mut h = vec![b'x'; 40];
+                h[pos] = sp;
+                assert_eq!(find_escape(&h), Some(pos), "pos={pos} sp={sp}");
+            }
+        }
+        assert_eq!(find_escape(b""), None);
+        assert_eq!(find_escape(b"no specials at all here, just prose"), None);
     }
 }
