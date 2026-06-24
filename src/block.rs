@@ -262,7 +262,7 @@ impl<'a> Parser<'a> {
         let mut node = Node::new(kind, parent, self.line_number);
         // Paragraphs try to borrow a contiguous source slice; other leaves
         // (ATX heading, code, HTML) assemble into `buf`. Set the buffered start.
-        node.content_src = kind == Kind::Paragraph;
+        node.content_src = matches!(kind, Kind::Paragraph | Kind::CodeBlock | Kind::HtmlBlock);
         node.cstart = self.buf.len() as u32;
         node.cend = node.cstart;
         self.nodes.push(node);
@@ -273,18 +273,24 @@ impl<'a> Parser<'a> {
 
     fn add_line(&mut self) {
         let tip = self.tip;
-        // Try to (keep) borrowing a contiguous slice of the source.
+        // Try to (keep) borrowing a contiguous slice of the source. Borrowed
+        // ranges include each line's trailing newline (so code/HTML literals,
+        // which need it, work); the contiguous next line begins exactly at the
+        // current end.
         if self.nodes[tip].content_src {
-            let first = self.nodes[tip].cstart == self.nodes[tip].cend;
-            let contiguous =
-                self.offset == 0 && self.line_src_start == self.nodes[tip].cend as usize + 1;
-            if !self.partially_consumed_tab && (first || contiguous) {
-                let seg_start = self.line_src_start + self.offset;
-                let seg_end = self.line_src_start + self.line.len();
+            let cend = self.nodes[tip].cend as usize;
+            let first = self.nodes[tip].cstart as usize == cend;
+            let contiguous = self.offset == 0 && self.line_src_start == cend;
+            let line_end = self.line_src_start + self.line.len();
+            let has_nl = line_end < self.source.len() && self.source.as_bytes()[line_end] == b'\n';
+            // Code/HTML literals require a trailing newline; a final line at EOF
+            // without one must be assembled instead.
+            let needs_nl = matches!(self.nodes[tip].kind, Kind::CodeBlock | Kind::HtmlBlock);
+            if !self.partially_consumed_tab && (first || contiguous) && (has_nl || !needs_nl) {
                 if first {
-                    self.nodes[tip].cstart = seg_start as u32;
+                    self.nodes[tip].cstart = (self.line_src_start + self.offset) as u32;
                 }
-                self.nodes[tip].cend = seg_end as u32;
+                self.nodes[tip].cend = (line_end + has_nl as usize) as u32;
                 return;
             }
             // Contiguity broken: copy the borrowed prefix into `buf`, continue there.
@@ -305,8 +311,9 @@ impl<'a> Parser<'a> {
         self.nodes[tip].cend = self.buf.len() as u32;
     }
 
-    /// Move a node's borrowed source range into `buf` (adding the per-line
-    /// trailing newline the buffered form carries), so further lines append.
+    /// Move a node's borrowed source range into `buf` so further lines append.
+    /// The borrowed range already ends with a newline (contiguity only breaks
+    /// after a `\n`-terminated line), so none is added.
     fn materialize(&mut self, tip: usize) {
         let (s, e) = (
             self.nodes[tip].cstart as usize,
@@ -314,9 +321,7 @@ impl<'a> Parser<'a> {
         );
         let start = self.buf.len();
         if s != e {
-            // `source[s..e]` holds the joined lines without a trailing newline.
             self.buf.push_str(&self.source[s..e]);
-            self.buf.push('\n');
         }
         self.nodes[tip].content_src = false;
         self.nodes[tip].cstart = start as u32;
