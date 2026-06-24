@@ -487,10 +487,10 @@ fn already_normalized(s: &str) -> bool {
         match b {
             b' ' if prev_space => return false,
             b' ' => prev_space = true,
-            b'A'..=b'Z' => return false,        // needs lowercasing
-            0x09 | 0x0a..=0x0d => return false, // other whitespace needs collapsing
-            0..=0x7f => prev_space = false,     // plain ASCII
-            _ => return false,                  // non-ASCII: rebuild to case-fold safely
+            b'A'..=b'Z' => return false,    // needs lowercasing
+            0x09..=0x0d => return false,    // other whitespace needs collapsing
+            0..=0x7f => prev_space = false, // plain ASCII
+            _ => return false,              // non-ASCII: rebuild to case-fold safely
         }
     }
     true
