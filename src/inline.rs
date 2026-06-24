@@ -225,18 +225,35 @@ fn try_code_span(src: &str, bytes: &[u8], i: usize, out: &mut String) -> Option<
     None
 }
 
+/// A code span is bounded by single spaces (but not all spaces)?
+fn code_span_strips(s: &str) -> bool {
+    s.len() >= 2 && s.starts_with(' ') && s.ends_with(' ') && s.bytes().any(|b| b != b' ')
+}
+
 /// Render a code span interior: line endings become spaces, a single space is
-/// stripped from each end when bounded by spaces (but not all-spaces).
+/// stripped from each end when bounded by spaces (but not all-spaces). The
+/// common case (no embedded newline) escapes a slice directly — no allocation.
 fn emit_code_span(content: &str, out: &mut String) {
-    let mut s: String = content
-        .chars()
-        .map(|c| if c == '\n' { ' ' } else { c })
-        .collect();
-    if s.len() >= 2 && s.starts_with(' ') && s.ends_with(' ') && s.bytes().any(|b| b != b' ') {
-        s = s[1..s.len() - 1].to_string();
-    }
     out.push_str("<code>");
-    escape_html(&s, out);
+    if content.as_bytes().contains(&b'\n') {
+        // Rare: convert line endings to spaces, then strip surrounding space.
+        let mut s: String = content
+            .chars()
+            .map(|c| if c == '\n' { ' ' } else { c })
+            .collect();
+        if code_span_strips(&s) {
+            s.remove(0);
+            s.pop();
+        }
+        escape_html(&s, out);
+    } else {
+        let body = if code_span_strips(content) {
+            &content[1..content.len() - 1]
+        } else {
+            content
+        };
+        escape_html(body, out);
+    }
     out.push_str("</code>");
 }
 
@@ -458,8 +475,33 @@ fn skip_spaces(bytes: &[u8], mut i: usize) -> usize {
     i
 }
 
+/// Is `s` already a normalized label (trimmed, single-spaced, lowercase ASCII)?
+/// Such labels — the common case — need no rewrite.
+fn already_normalized(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.first() == Some(&b' ') || bytes.last() == Some(&b' ') {
+        return false;
+    }
+    let mut prev_space = false;
+    for &b in bytes {
+        match b {
+            b' ' if prev_space => return false,
+            b' ' => prev_space = true,
+            b'A'..=b'Z' => return false,        // needs lowercasing
+            0x09 | 0x0a..=0x0d => return false, // other whitespace needs collapsing
+            0..=0x7f => prev_space = false,     // plain ASCII
+            _ => return false,                  // non-ASCII: rebuild to case-fold safely
+        }
+    }
+    true
+}
+
 /// Normalize a link label: trim, collapse internal whitespace, case-fold.
-fn normalize_label(s: &str) -> String {
+/// Borrows when the label is already normalized.
+fn normalize_label(s: &str) -> Cow<'_, str> {
+    if already_normalized(s) {
+        return Cow::Borrowed(s);
+    }
     let mut out = String::new();
     let mut prev_ws = false;
     for c in s.trim().chars() {
@@ -481,7 +523,7 @@ fn normalize_label(s: &str) -> String {
             prev_ws = false;
         }
     }
-    out
+    Cow::Owned(out)
 }
 
 // ---- node list -----------------------------------------------------------
@@ -1101,13 +1143,13 @@ fn parse_link_target(
             } else {
                 normalize_label(&label)
             };
-            let (d, t) = refmap.get(&key)?;
+            let (d, t) = refmap.get(key.as_ref())?;
             return Some((d.clone(), t.clone(), end));
         }
         return None;
     }
     // Shortcut reference: the link text itself is the label.
-    let (d, t) = refmap.get(&normalize_label(text))?;
+    let (d, t) = refmap.get(normalize_label(text).as_ref())?;
     Some((d.clone(), t.clone(), i))
 }
 
@@ -1243,7 +1285,7 @@ pub fn take_ref_defs(text: &str) -> (usize, Vec<(String, String, Option<String>)
     let mut pos = 0;
     let mut defs = Vec::new();
     while let Some((end, label, dest, title)) = parse_ref_def(text, bytes, pos) {
-        defs.push((normalize_label(&label), dest, title));
+        defs.push((normalize_label(&label).into_owned(), dest, title));
         pos = end;
     }
     (pos, defs)
