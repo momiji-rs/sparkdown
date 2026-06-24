@@ -44,7 +44,7 @@ fn render_node(tree: &Tree, idx: usize, out: &mut String, scratch: &mut Scratch)
                 cr(out);
                 out.push_str("<p>");
             }
-            render_inline(&node.content, out, &tree.refmap, scratch);
+            render_inline(tree.content(idx), out, &tree.refmap, scratch);
             if !tight {
                 out.push_str("</p>");
                 cr(out);
@@ -56,7 +56,7 @@ fn render_node(tree: &Tree, idx: usize, out: &mut String, scratch: &mut Scratch)
             out.push_str("<h");
             out.push((b'0' + level) as char);
             out.push('>');
-            render_inline(&node.content, out, &tree.refmap, scratch);
+            render_inline(tree.content(idx), out, &tree.refmap, scratch);
             out.push_str("</h");
             out.push((b'0' + level) as char);
             out.push('>');
@@ -76,13 +76,13 @@ fn render_node(tree: &Tree, idx: usize, out: &mut String, scratch: &mut Scratch)
                 out.push('"');
             }
             out.push('>');
-            escape_html(&node.content, out);
+            escape_html(tree.content(idx), out);
             out.push_str("</code></pre>");
             cr(out);
         }
         Kind::HtmlBlock => {
             cr(out);
-            out.push_str(&node.content);
+            out.push_str(tree.content(idx));
             cr(out);
         }
         Kind::BlockQuote => {

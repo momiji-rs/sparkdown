@@ -41,8 +41,10 @@ pub struct Node {
     open: bool,
     last_line_blank: bool,
     start_line: u32,
-    /// Accumulated raw text (paragraph/heading inline source; code/html literal).
-    pub content: String,
+    /// Raw text as a `[cstart, cend)` range into the tree's shared `buf` — no
+    /// per-node allocation (paragraph/heading inline source; code/html literal).
+    cstart: u32,
+    cend: u32,
     pub level: u8,
     pub fenced: bool,
     fence_char: u8,
@@ -62,7 +64,8 @@ impl Node {
             open: true,
             last_line_blank: false,
             start_line: line,
-            content: String::new(),
+            cstart: 0,
+            cend: 0,
             level: 0,
             fenced: false,
             fence_char: 0,
@@ -80,6 +83,16 @@ pub struct Tree {
     pub root: usize,
     pub refmap: RefMap,
     pub source_len: usize,
+    /// Backing buffer for every node's text; nodes index it via `(cstart, cend)`.
+    buf: String,
+}
+
+impl Tree {
+    /// The raw text of node `idx` (inline source or code/HTML literal).
+    pub fn content(&self, idx: usize) -> &str {
+        let n = &self.nodes[idx];
+        &self.buf[n.cstart as usize..n.cend as usize]
+    }
 }
 
 /// Parse `src` into a block tree plus its link reference definitions.
@@ -102,6 +115,8 @@ struct Parser<'a> {
     last_matched_container: usize,
     all_closed: bool,
     refmap: RefMap,
+    /// Shared text buffer; each node's content is a range into it.
+    buf: String,
     // line state — borrows the source line (no per-line allocation)
     line: &'a [u8],
     line_number: u32,
@@ -125,6 +140,7 @@ impl<'a> Parser<'a> {
             last_matched_container: 0,
             all_closed: true,
             refmap: RefMap::new(),
+            buf: String::new(),
             line: &[],
             line_number: 0,
             offset: 0,
@@ -212,7 +228,11 @@ impl<'a> Parser<'a> {
         }
         let idx = self.nodes.len();
         let parent = self.tip;
-        self.nodes.push(Node::new(kind, parent, self.line_number));
+        let mut node = Node::new(kind, parent, self.line_number);
+        // Content starts at the current end of the shared buffer.
+        node.cstart = self.buf.len() as u32;
+        node.cend = node.cstart;
+        self.nodes.push(node);
         self.nodes[parent].children.push(idx);
         self.tip = idx;
         idx
@@ -223,15 +243,14 @@ impl<'a> Parser<'a> {
             self.offset += 1;
             let chars_to_tab = 4 - (self.column % 4);
             for _ in 0..chars_to_tab {
-                self.nodes[self.tip].content.push(' ');
+                self.buf.push(' ');
             }
         }
         let rest = &self.line[self.offset..];
         // line never contains an embedded NUL; push as UTF-8.
-        self.nodes[self.tip]
-            .content
-            .push_str(std::str::from_utf8(rest).unwrap_or(""));
-        self.nodes[self.tip].content.push('\n');
+        self.buf.push_str(std::str::from_utf8(rest).unwrap_or(""));
+        self.buf.push('\n');
+        self.nodes[self.tip].cend = self.buf.len() as u32;
     }
 
     fn close_unmatched_blocks(&mut self) {
@@ -253,49 +272,74 @@ impl<'a> Parser<'a> {
 
         match self.nodes[idx].kind {
             Kind::Paragraph => {
-                let mut content = std::mem::take(&mut self.nodes[idx].content);
+                let (s, e) = (
+                    self.nodes[idx].cstart as usize,
+                    self.nodes[idx].cend as usize,
+                );
                 // Strip leading whitespace and any link reference definitions.
-                let lead = content.len() - content.trim_start_matches(['\n', ' ', '\t']).len();
-                let (off, defs) = take_ref_defs(&content[lead..]);
+                let lead = {
+                    let sl = &self.buf[s..e];
+                    sl.len() - sl.trim_start_matches(['\n', ' ', '\t']).len()
+                };
+                let (off, defs) = take_ref_defs(&self.buf[s + lead..e]);
                 for (label, dest, title) in defs {
                     self.refmap.entry(label).or_insert((dest, title));
                 }
-                content.drain(..lead + off);
-                if content.trim_matches(['\n', ' ', '\t']).is_empty() {
-                    // Pure reference definitions: drop the empty paragraph.
-                    self.unlink(idx);
+                let bs = s + lead + off;
+                // Stored content trims surrounding newlines only; empties on all-ws.
+                let (empty, hl, inner_len) = {
+                    let body = &self.buf[bs..e];
+                    let hl = body.len() - body.trim_start_matches('\n').len();
+                    let inner = body.trim_matches('\n');
+                    (
+                        body.trim_matches(['\n', ' ', '\t']).is_empty(),
+                        hl,
+                        inner.len(),
+                    )
+                };
+                if empty {
+                    self.unlink(idx); // pure reference definitions
                 } else {
-                    // Stored content trims surrounding newlines only (in place).
-                    let end = content.trim_end_matches('\n').len();
-                    content.truncate(end);
-                    let nlead = content.len() - content.trim_start_matches('\n').len();
-                    content.drain(..nlead);
-                    self.nodes[idx].content = content;
+                    self.nodes[idx].cstart = (bs + hl) as u32;
+                    self.nodes[idx].cend = (bs + hl + inner_len) as u32;
                 }
             }
             Kind::Heading => {
-                let content = &mut self.nodes[idx].content;
-                let end = content.trim_end_matches(['\n', ' ', '\t']).len();
-                content.truncate(end);
-                let lead = content.len() - content.trim_start_matches(['\n', ' ', '\t']).len();
-                content.drain(..lead);
+                let (s, e) = (
+                    self.nodes[idx].cstart as usize,
+                    self.nodes[idx].cend as usize,
+                );
+                let (hl, tlen) = {
+                    let sl = &self.buf[s..e];
+                    let hl = sl.len() - sl.trim_start_matches(['\n', ' ', '\t']).len();
+                    (hl, sl.trim_matches(['\n', ' ', '\t']).len())
+                };
+                self.nodes[idx].cstart = (s + hl) as u32;
+                self.nodes[idx].cend = (s + hl + tlen) as u32;
             }
             Kind::CodeBlock => {
+                let (s, e) = (
+                    self.nodes[idx].cstart as usize,
+                    self.nodes[idx].cend as usize,
+                );
                 if self.nodes[idx].fenced {
-                    let content = std::mem::take(&mut self.nodes[idx].content);
-                    let nl = content.find('\n').unwrap_or(content.len());
-                    let first = &content[..nl];
-                    let rest = content.get(nl + 1..).unwrap_or("");
-                    self.nodes[idx].info = unescape_info(first.trim());
-                    self.nodes[idx].content = rest.to_string();
+                    // First line is the info string; the rest is the literal.
+                    let nl = self.buf[s..e].find('\n').map_or(e - s, |p| p);
+                    let info = unescape_info(self.buf[s..s + nl].trim());
+                    self.nodes[idx].info = info;
+                    self.nodes[idx].cstart = (s + nl + 1).min(e) as u32;
                 } else {
-                    let content = std::mem::take(&mut self.nodes[idx].content);
-                    self.nodes[idx].content = trim_trailing_blank_lines(&content);
+                    let keep = code_indented_end(&self.buf[s..e]);
+                    self.nodes[idx].cend = (s + keep) as u32;
                 }
             }
             Kind::HtmlBlock => {
-                let content = std::mem::take(&mut self.nodes[idx].content);
-                self.nodes[idx].content = trim_html_block(&content);
+                let (s, e) = (
+                    self.nodes[idx].cstart as usize,
+                    self.nodes[idx].cend as usize,
+                );
+                let keep = html_trim_end(&self.buf[s..e]);
+                self.nodes[idx].cend = (s + keep) as u32;
             }
             Kind::List => {
                 let tight = self.compute_tight(idx);
@@ -353,8 +397,9 @@ impl<'a> Parser<'a> {
     // ---- main loop ------------------------------------------------------
 
     fn parse(mut self, src: &'a str) -> Tree {
-        // Rough upper bound on node count, to avoid arena reallocations.
+        // Rough upper bounds, to avoid arena/buffer reallocations.
         self.nodes.reserve(src.len() / 32);
+        self.buf.reserve(src.len());
         for line in split_lines(src) {
             self.incorporate_line(line);
         }
@@ -368,6 +413,7 @@ impl<'a> Parser<'a> {
             root: 0,
             refmap: self.refmap,
             source_len: src.len(),
+            buf: self.buf,
         }
     }
 
@@ -605,8 +651,14 @@ impl<'a> Parser<'a> {
         self.close_unmatched_blocks();
         let h = self.add_child(Kind::Heading);
         self.nodes[h].level = hashes as u8;
+        // Push the heading text into the shared buffer and record its range
+        // (the source slices borrow `'a`, not `self`, so this is conflict-free).
         let after = std::str::from_utf8(&self.line[self.offset..]).unwrap_or("");
-        self.nodes[h].content = atx_content(after).to_string();
+        let content = atx_content(after);
+        let start = self.buf.len() as u32;
+        self.buf.push_str(content);
+        self.nodes[h].cstart = start;
+        self.nodes[h].cend = self.buf.len() as u32;
         self.advance_offset(self.line.len() - self.offset, false);
         2
     }
@@ -655,21 +707,26 @@ impl<'a> Parser<'a> {
         };
         self.close_unmatched_blocks();
         // Strip leading ref defs from the paragraph; if nothing remains, no heading.
-        let content = std::mem::take(&mut self.nodes[container].content);
-        let trimmed = content.trim_start_matches(['\n', ' ', '\t']);
-        let (off, defs) = take_ref_defs(trimmed);
+        let (s, e) = (
+            self.nodes[container].cstart as usize,
+            self.nodes[container].cend as usize,
+        );
+        let lead = {
+            let sl = &self.buf[s..e];
+            sl.len() - sl.trim_start_matches(['\n', ' ', '\t']).len()
+        };
+        let (off, defs) = take_ref_defs(&self.buf[s + lead..e]);
         for (label, dest, title) in defs {
             self.refmap.entry(label).or_insert((dest, title));
         }
-        let body = trimmed[off..].trim_matches(['\n', ' ', '\t']);
-        if body.is_empty() {
-            self.nodes[container].content = content;
-            return 0;
+        let bs = s + lead + off;
+        if self.buf[bs..e].trim_matches(['\n', ' ', '\t']).is_empty() {
+            return 0; // only reference definitions; not a heading
         }
-        // Reuse the paragraph node as the heading.
+        // Reuse the paragraph node as the heading (its finalize trims the range).
         self.nodes[container].kind = Kind::Heading;
         self.nodes[container].level = level;
-        self.nodes[container].content = body.to_string();
+        self.nodes[container].cstart = bs as u32;
         self.advance_offset(self.line.len() - self.offset, false);
         2
     }
@@ -966,8 +1023,9 @@ fn unescape_info(s: &str) -> String {
     crate::inline::unescape_string(s).into_owned()
 }
 
-/// Strip a trailing `(\n *)+` run (HTML-block literal normalization).
-fn trim_html_block(s: &str) -> String {
+/// Byte length of `s` after stripping a trailing `(\n *)+` run (HTML-block
+/// literal normalization).
+fn html_trim_end(s: &str) -> usize {
     let bytes = s.as_bytes();
     let mut end = s.len();
     loop {
@@ -981,27 +1039,26 @@ fn trim_html_block(s: &str) -> String {
             break;
         }
     }
-    s[..end].to_string()
+    end
 }
 
-fn trim_trailing_blank_lines(s: &str) -> String {
-    let mut lines: Vec<&str> = s.split('\n').collect();
-    if lines.last() == Some(&"") {
-        lines.pop();
+/// Byte length of `s` (whose lines each end in `\n`) to keep after dropping
+/// trailing blank lines — content + the last non-blank line's newline.
+fn code_indented_end(s: &str) -> usize {
+    let bytes = s.as_bytes();
+    let mut keep = 0;
+    let mut start = 0;
+    let mut i = 0;
+    while i <= bytes.len() {
+        if i == bytes.len() || bytes[i] == b'\n' {
+            if !s[start..i].trim_matches([' ', '\t']).is_empty() {
+                keep = (i + 1).min(s.len());
+            }
+            start = i + 1;
+        }
+        i += 1;
     }
-    while lines
-        .last()
-        .is_some_and(|l| l.trim_matches([' ', '\t']).is_empty())
-    {
-        lines.pop();
-    }
-    if lines.is_empty() {
-        String::new()
-    } else {
-        let mut out = lines.join("\n");
-        out.push('\n');
-        out
-    }
+    keep
 }
 
 // ---- HTML block start conditions ----------------------------------------
