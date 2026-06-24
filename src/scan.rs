@@ -154,6 +154,8 @@ unsafe fn find_escape_neon(hay: &[u8]) -> Option<usize> {
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
+// `_mm_loadu_si128` is an unaligned load; the *const __m128i cast is sound.
+#[allow(clippy::cast_ptr_alignment)]
 unsafe fn find_escape_sse2(hay: &[u8]) -> Option<usize> {
     use core::arch::x86_64::*;
     let (amp, lt, gt, qt) = unsafe {
