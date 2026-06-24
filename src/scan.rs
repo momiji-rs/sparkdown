@@ -285,7 +285,7 @@ mod tests {
         }
         // A special at every position within and across SIMD blocks.
         for pos in 0..40 {
-            for &sp in &[b'&', b'<', b'>', b'"'] {
+            for &sp in b"&<>\"" {
                 let mut h = vec![b'x'; 40];
                 h[pos] = sp;
                 assert_eq!(find_escape(&h), Some(pos), "pos={pos} sp={sp}");
