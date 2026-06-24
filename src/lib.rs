@@ -48,9 +48,35 @@ pub use arena::ScopedAlloc;
 ///
 /// **Scaffold status:** parses blank-line-separated paragraphs only and
 /// HTML-escapes their text. No inline parsing, no other block types yet.
+#[cfg(not(feature = "arena"))]
 pub fn to_html(src: &str) -> String {
     let tree = block::parse(src);
     render::render(&tree)
+}
+
+/// With the `arena` feature (and [`ScopedAlloc`] installed as the
+/// `#[global_allocator]`), the whole parse+render runs inside a bump scope:
+/// every intermediate allocation is a pointer bump and is freed wholesale.
+/// The result `String` is the one thing that must outlive the arena, so it is
+/// copied to the system allocator before the reset. Inert if `ScopedAlloc`
+/// isn't installed (allocations forward to System).
+#[cfg(feature = "arena")]
+pub fn to_html(src: &str) -> String {
+    let guard = arena::Scope::enter();
+    let html = {
+        let tree = block::parse(src);
+        render::render(&tree)
+    };
+    let outermost = arena::leave_no_reset();
+    core::mem::forget(guard); // we left manually
+    if outermost {
+        let owned = String::from(html.as_str()); // depth 0 → System
+        drop(html); // arena dealloc is a no-op
+        arena::reset();
+        owned
+    } else {
+        html // nested in an outer scope that owns the arena lifetime
+    }
 }
 
 /// Diagnostic re-exports so a profiler can wrap each phase. Not public API.
