@@ -12,12 +12,12 @@
 //! The performance substrate is lifted verbatim from rostdown — it is
 //! grammar-agnostic and already battle-tested:
 //!
-//! - [`scan`] — SWAR byte search (zero-dep, no `unsafe`).
-//! - [`bump`] — the always-on local bump arena.
-//! - [`arena`] — the opt-in `ScopedAlloc` global allocator (`arena` feature).
-//! - [`entities`] — HTML entity tables.
+//! - `scan` — SWAR byte search (zero-dep, no `unsafe`).
+//! - `bump` — the always-on local bump arena.
+//! - `arena` — the opt-in `ScopedAlloc` global allocator (`arena` feature).
+//! - `entities` — HTML entity tables.
 //!
-//! The grammar layer ([`parse`], [`render`]) is **new**: rostdown's parser
+//! The grammar layer (`block`, `render`) is **new**: rostdown's parser
 //! is built around "decline if outside my subset", the exact opposite of
 //! what a full CommonMark parser needs.
 //!
