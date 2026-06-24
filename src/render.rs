@@ -10,7 +10,9 @@ use crate::scan::find_escape;
 
 /// Render a parsed [`Tree`] to an HTML string.
 pub fn render(tree: &Tree) -> String {
-    // Size the buffer from the input so the common case grows rarely.
+    // Size the buffer from the input. A tighter estimate beats a generous one:
+    // over-reserving just page-faults more freshly-allocated memory on first
+    // write (measured slower) than absorbing the occasional grow.
     let mut out = String::with_capacity(tree.source_len + tree.source_len / 8 + 64);
     let mut scratch = Scratch::new();
     for &c in &tree.nodes[tree.root].children {

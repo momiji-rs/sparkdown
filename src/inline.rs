@@ -531,11 +531,9 @@ fn normalize_label(s: &str) -> Cow<'_, str> {
 /// An inline node. Phase 1 builds a doubly-linked list of these; phase 2/3
 /// (emphasis, links) splice tags before phase 4 renders.
 enum Node {
-    /// A `[start, end)` range of escaped text in the shared `cur` buffer — no
-    /// per-segment allocation.
+    /// A `[start, end)` range of computed HTML in the shared `cur` buffer
+    /// (escaped text, code spans, links/images) — no per-segment allocation.
     Span { start: usize, end: usize },
-    /// Dynamically built HTML (a link `<a>` open or an `<img>`), emitted verbatim.
-    Owned(String),
     /// A run of emphasis delimiters, literal until paired.
     Delim {
         ch: u8,
@@ -633,7 +631,6 @@ impl List {
 fn render_node(node: &Node, cur: &str, out: &mut String) {
     match node {
         Node::Span { start, end } => out.push_str(&cur[*start..*end]),
-        Node::Owned(s) => out.push_str(s),
         Node::Tag(t) => out.push_str(t),
         Node::Delim { ch, count, .. } => {
             for _ in 0..*count {
@@ -823,6 +820,7 @@ fn stream_inline(src: &str, out: &mut String) {
 }
 
 /// Parse `src` (a block's raw inline text) to HTML, appending to `out`.
+#[allow(unused_assignments)] // `seg` is updated at segment ends; the last is unused
 pub fn render_inline(src: &str, out: &mut String, refmap: &RefMap, scratch: &mut Scratch) {
     let bytes = src.as_bytes();
     // Fast path: no emphasis/link delimiters → stream directly, no allocation.
@@ -958,6 +956,9 @@ pub fn render_inline(src: &str, out: &mut String, refmap: &RefMap, scratch: &mut
                 let rb_src = i;
                 i += 1;
                 look_for_link_or_image(src, bytes, &mut i, list, stack, cur, refmap, rb, rb_src);
+                // A resolved link/image appended its tag to `cur` and spanned it
+                // directly; the next text segment starts after it.
+                seg = cur.len();
                 run = i;
             }
             b'\n' => {
@@ -979,7 +980,6 @@ pub fn render_inline(src: &str, out: &mut String, refmap: &RefMap, scratch: &mut
     escape_html(src[run..].trim_end_matches(' '), cur);
     flush!();
 
-    let _ = seg; // final flush's seg update is intentionally unused
     process_emphasis(list, stack, 0);
     render_list(list, cur, out);
 }
@@ -994,7 +994,7 @@ fn look_for_link_or_image(
     i: &mut usize,
     list: &mut List,
     stack: &mut Vec<StackItem>,
-    cur: &str,
+    cur: &mut String,
     refmap: &RefMap,
     rb_node: usize,
     rb_src: usize,
@@ -1029,6 +1029,7 @@ fn look_for_link_or_image(
     process_emphasis(list, stack, op + 1);
 
     if image {
+        // Alt text = the rendered link text with tags stripped.
         let mut inner = String::new();
         let mut node = list.slots[op_node].next;
         while let Some(idx) = node {
@@ -1040,40 +1041,46 @@ fn look_for_link_or_image(
         }
         let alt = strip_tags(&inner);
 
-        let mut h = String::from("<img src=\"");
-        escape_href(unescape_string(&dest_raw).as_ref(), &mut h);
-        h.push_str("\" alt=\"");
-        h.push_str(&alt);
-        h.push('"');
+        // Build the <img> tag into the shared buffer (no per-image allocation).
+        let start = cur.len();
+        cur.push_str("<img src=\"");
+        escape_href(unescape_string(&dest_raw).as_ref(), cur);
+        cur.push_str("\" alt=\"");
+        cur.push_str(&alt);
+        cur.push('"');
         if let Some(t) = &title_raw {
-            h.push_str(" title=\"");
-            escape_attr(unescape_string(t).as_ref(), &mut h);
-            h.push('"');
+            cur.push_str(" title=\"");
+            escape_attr(unescape_string(t).as_ref(), cur);
+            cur.push('"');
         }
-        h.push_str(" />");
-        list.slots[op_node].node = Node::Owned(h);
+        cur.push_str(" />");
+        let end = cur.len();
+        list.slots[op_node].node = Node::Span { start, end };
 
         // Unlink the link text and the closing bracket.
         let mut c = list.slots[op_node].next;
-        while let Some(cur) = c {
-            let nxt = list.slots[cur].next;
-            list.unlink(cur);
-            if cur == rb_node {
+        while let Some(n) = c {
+            let nxt = list.slots[n].next;
+            list.unlink(n);
+            if n == rb_node {
                 break;
             }
             c = nxt;
         }
     } else {
-        let mut open = String::from("<a href=\"");
-        escape_href(unescape_string(&dest_raw).as_ref(), &mut open);
-        open.push('"');
+        // Build the <a> open tag into the shared buffer (no per-link allocation).
+        let start = cur.len();
+        cur.push_str("<a href=\"");
+        escape_href(unescape_string(&dest_raw).as_ref(), cur);
+        cur.push('"');
         if let Some(t) = &title_raw {
-            open.push_str(" title=\"");
-            escape_attr(unescape_string(t).as_ref(), &mut open);
-            open.push('"');
+            cur.push_str(" title=\"");
+            escape_attr(unescape_string(t).as_ref(), cur);
+            cur.push('"');
         }
-        open.push('>');
-        list.slots[op_node].node = Node::Owned(open);
+        cur.push('>');
+        let end = cur.len();
+        list.slots[op_node].node = Node::Span { start, end };
         list.slots[rb_node].node = Node::Tag("</a>");
 
         // No links inside links: deactivate earlier `[` openers.
