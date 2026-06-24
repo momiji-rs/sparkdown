@@ -949,7 +949,7 @@ fn is_closing_fence(line: &[u8], from: usize, fence_char: u8, fence_len: usize) 
 fn unescape_info(s: &str) -> String {
     // The info string's backslash escapes and entities are resolved here; the
     // renderer takes its first word as the language class.
-    crate::inline::unescape_string(s)
+    crate::inline::unescape_string(s).into_owned()
 }
 
 /// Strip a trailing `(\n *)+` run (HTML-block literal normalization).

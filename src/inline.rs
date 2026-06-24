@@ -11,6 +11,7 @@
 use crate::entities::{named, remap_numeric};
 use crate::render::escape_html;
 use crate::scan::memchr3;
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 /// Link reference definitions: normalized label → (raw destination, raw title).
@@ -112,9 +113,12 @@ fn parse_entity(bytes: &[u8], i: usize) -> Option<(Resolved, usize)> {
 
 /// Resolve backslash escapes and entity references in `s`, returning the raw
 /// character value (used for link destinations and titles before attribute
-/// escaping).
-pub(crate) fn unescape_string(s: &str) -> String {
+/// escaping). Borrows when there is nothing to unescape (no `\` or `&`).
+pub(crate) fn unescape_string(s: &str) -> Cow<'_, str> {
     let bytes = s.as_bytes();
+    if !bytes.iter().any(|&b| b == b'\\' || b == b'&') {
+        return Cow::Borrowed(s);
+    }
     let mut out = String::new();
     let mut i = 0;
     while i < bytes.len() {
@@ -146,7 +150,7 @@ pub(crate) fn unescape_string(s: &str) -> String {
             }
         }
     }
-    out
+    Cow::Owned(out)
 }
 
 /// Is `b` safe to leave unescaped in an `href`? Mirrors cmark's HREF_SAFE set.
@@ -921,13 +925,13 @@ fn look_for_link_or_image(
         let alt = strip_tags(&inner);
 
         let mut h = String::from("<img src=\"");
-        escape_href(&unescape_string(&dest_raw), &mut h);
+        escape_href(unescape_string(&dest_raw).as_ref(), &mut h);
         h.push_str("\" alt=\"");
         h.push_str(&alt);
         h.push('"');
         if let Some(t) = &title_raw {
             h.push_str(" title=\"");
-            escape_attr(&unescape_string(t), &mut h);
+            escape_attr(unescape_string(t).as_ref(), &mut h);
             h.push('"');
         }
         h.push_str(" />");
@@ -945,11 +949,11 @@ fn look_for_link_or_image(
         }
     } else {
         let mut open = String::from("<a href=\"");
-        escape_href(&unescape_string(&dest_raw), &mut open);
+        escape_href(unescape_string(&dest_raw).as_ref(), &mut open);
         open.push('"');
         if let Some(t) = &title_raw {
             open.push_str(" title=\"");
-            escape_attr(&unescape_string(t), &mut open);
+            escape_attr(unescape_string(t).as_ref(), &mut open);
             open.push('"');
         }
         open.push('>');
