@@ -159,6 +159,9 @@ mod tests {
     #[test]
     fn empty_and_no_match() {
         assert_eq!(memchr3(b"", b'&', b'<', b'>'), None);
-        assert_eq!(memchr3(b"plain prose, no specials here", b'&', b'<', b'>'), None);
+        assert_eq!(
+            memchr3(b"plain prose, no specials here", b'&', b'<', b'>'),
+            None
+        );
     }
 }

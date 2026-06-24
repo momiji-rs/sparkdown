@@ -9,7 +9,7 @@
 //! The harness exists so the speed gap is measurable from the first real
 //! feature onward.
 
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 
 const DATA: &str = include_str!("../tests/fixtures/data.md");
 

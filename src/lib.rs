@@ -55,7 +55,7 @@ pub fn to_html(src: &str) -> String {
 /// Diagnostic re-exports so a profiler can wrap each phase. Not public API.
 #[cfg(feature = "profiling")]
 pub mod prof {
-    pub use crate::block::{parse, Tree};
+    pub use crate::block::{Tree, parse};
     pub use crate::render::render;
 }
 

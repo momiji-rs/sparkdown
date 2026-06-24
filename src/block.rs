@@ -6,7 +6,7 @@
 //! a node arena ([`Tree`]) that the renderer walks. Inline content is parsed
 //! lazily at render time.
 
-use crate::inline::{take_ref_defs, RefMap};
+use crate::inline::{RefMap, take_ref_defs};
 
 const CODE_INDENT: usize = 4;
 
@@ -148,7 +148,7 @@ impl<'a> Parser<'a> {
         let mut i = self.offset;
         let mut cols = self.column;
         loop {
-            match peek(&self.line, i) {
+            match peek(self.line, i) {
                 Some(b' ') => {
                     i += 1;
                     cols += 1;
@@ -160,7 +160,7 @@ impl<'a> Parser<'a> {
                 _ => break,
             }
         }
-        self.blank = matches!(peek(&self.line, i), None | Some(b'\n'));
+        self.blank = matches!(peek(self.line, i), None | Some(b'\n'));
         self.next_nonspace = i;
         self.next_nonspace_column = cols;
         self.indent = cols - self.column;
@@ -175,7 +175,7 @@ impl<'a> Parser<'a> {
 
     fn advance_offset(&mut self, mut count: usize, columns: bool) {
         while count > 0 {
-            match peek(&self.line, self.offset) {
+            match peek(self.line, self.offset) {
                 Some(b'\t') => {
                     let chars_to_tab = 4 - (self.column % 4);
                     if columns {
@@ -406,8 +406,8 @@ impl<'a> Parser<'a> {
         self.all_closed = container == self.oldtip;
         self.last_matched_container = container;
 
-        let mut matched_leaf =
-            self.nodes[container].kind != Kind::Paragraph && accepts_lines(self.nodes[container].kind);
+        let mut matched_leaf = self.nodes[container].kind != Kind::Paragraph
+            && accepts_lines(self.nodes[container].kind);
 
         // Phase 2: look for new block starts.
         while !matched_leaf {
@@ -440,10 +440,10 @@ impl<'a> Parser<'a> {
             self.add_line(); // lazy paragraph continuation
         } else {
             self.close_unmatched_blocks();
-            if self.blank {
-                if let Some(lc) = self.last_child(container) {
-                    self.nodes[lc].last_line_blank = true;
-                }
+            if self.blank
+                && let Some(lc) = self.last_child(container)
+            {
+                self.nodes[lc].last_line_blank = true;
             }
             let t = self.nodes[container].kind;
             let last_line_blank = self.blank
@@ -482,10 +482,10 @@ impl<'a> Parser<'a> {
         match self.nodes[c].kind {
             Kind::Document => 0,
             Kind::BlockQuote => {
-                if !self.indented && peek(&self.line, self.next_nonspace) == Some(b'>') {
+                if !self.indented && peek(self.line, self.next_nonspace) == Some(b'>') {
                     self.advance_next_nonspace();
                     self.advance_offset(1, false);
-                    if is_space_or_tab(peek(&self.line, self.offset)) {
+                    if is_space_or_tab(peek(self.line, self.offset)) {
                         self.advance_offset(1, true);
                     }
                     0
@@ -523,14 +523,14 @@ impl<'a> Parser<'a> {
                     let fc = self.nodes[c].fence_char;
                     let fl = self.nodes[c].fence_len;
                     let fo = self.nodes[c].fence_offset;
-                    if !self.indented && is_closing_fence(&self.line, self.next_nonspace, fc, fl) {
+                    if !self.indented && is_closing_fence(self.line, self.next_nonspace, fc, fl) {
                         let cur = c;
                         self.finalize(cur);
                         return 2;
                     }
                     // Remove up to fence_offset spaces of indentation.
                     let mut i = 0;
-                    while i < fo && is_space_or_tab(peek(&self.line, self.offset)) {
+                    while i < fo && is_space_or_tab(peek(self.line, self.offset)) {
                         self.advance_offset(1, true);
                         i += 1;
                     }
@@ -573,10 +573,10 @@ impl<'a> Parser<'a> {
     }
 
     fn start_block_quote(&mut self) -> u8 {
-        if !self.indented && peek(&self.line, self.next_nonspace) == Some(b'>') {
+        if !self.indented && peek(self.line, self.next_nonspace) == Some(b'>') {
             self.advance_next_nonspace();
             self.advance_offset(1, false);
-            if is_space_or_tab(peek(&self.line, self.offset)) {
+            if is_space_or_tab(peek(self.line, self.offset)) {
                 self.advance_offset(1, true);
             }
             self.close_unmatched_blocks();
@@ -631,7 +631,7 @@ impl<'a> Parser<'a> {
     }
 
     fn start_html_block(&mut self, container: usize) -> u8 {
-        if self.indented || peek(&self.line, self.next_nonspace) != Some(b'<') {
+        if self.indented || peek(self.line, self.next_nonspace) != Some(b'<') {
             return 0;
         }
         let rest = &self.line[self.next_nonspace..];
@@ -752,7 +752,10 @@ impl<'a> Parser<'a> {
                 match rest.get(digits) {
                     Some(&d @ (b'.' | b')')) => {
                         data.ordered = true;
-                        data.start = std::str::from_utf8(&rest[..digits]).unwrap().parse().unwrap();
+                        data.start = std::str::from_utf8(&rest[..digits])
+                            .unwrap()
+                            .parse()
+                            .unwrap();
                         data.delimiter = d;
                         marker_width = digits + 1;
                     }
@@ -771,7 +774,9 @@ impl<'a> Parser<'a> {
             if data.ordered && data.start != 1 {
                 return None;
             }
-            let after_blank = rest[marker_width..].iter().all(|&b| b == b' ' || b == b'\t');
+            let after_blank = rest[marker_width..]
+                .iter()
+                .all(|&b| b == b' ' || b == b'\t');
             if after_blank {
                 return None;
             }
@@ -783,18 +788,18 @@ impl<'a> Parser<'a> {
         let spaces_start_offset = self.offset;
         loop {
             self.advance_offset(1, true);
-            if self.column - spaces_start_col >= 5 || !is_space_or_tab(peek(&self.line, self.offset))
+            if self.column - spaces_start_col >= 5 || !is_space_or_tab(peek(self.line, self.offset))
             {
                 break;
             }
         }
-        let blank_item = peek(&self.line, self.offset).is_none();
+        let blank_item = peek(self.line, self.offset).is_none();
         let spaces = self.column - spaces_start_col;
-        if spaces >= 5 || spaces < 1 || blank_item {
+        if !(1..5).contains(&spaces) || blank_item {
             data.padding = marker_width + 1;
             self.column = spaces_start_col;
             self.offset = spaces_start_offset;
-            if is_space_or_tab(peek(&self.line, self.offset)) {
+            if is_space_or_tab(peek(self.line, self.offset)) {
                 self.advance_offset(1, true);
             }
         } else {
@@ -812,7 +817,9 @@ impl<'a> Parser<'a> {
         match k {
             1 => {
                 let l = line.to_ascii_lowercase();
-                l.contains("</script>") || l.contains("</pre>") || l.contains("</style>")
+                l.contains("</script>")
+                    || l.contains("</pre>")
+                    || l.contains("</style>")
                     || l.contains("</textarea>")
             }
             2 => line.contains("-->"),
@@ -931,7 +938,12 @@ fn fence_opener(rest: &[u8]) -> Option<(u8, usize)> {
         return None;
     }
     // Backtick info strings may not contain backticks.
-    if c == b'`' && rest[len..].iter().take_while(|&&b| b != b'\n').any(|&b| b == b'`') {
+    if c == b'`'
+        && rest[len..]
+            .iter()
+            .take_while(|&&b| b != b'\n')
+            .any(|&b| b == b'`')
+    {
         return None;
     }
     Some((c, len))
@@ -943,7 +955,9 @@ fn is_closing_fence(line: &[u8], from: usize, fence_char: u8, fence_len: usize) 
     if run < fence_len {
         return false;
     }
-    rest[run..].iter().all(|&b| b == b' ' || b == b'\t' || b == b'\n')
+    rest[run..]
+        .iter()
+        .all(|&b| b == b' ' || b == b'\t' || b == b'\n')
 }
 
 fn unescape_info(s: &str) -> String {
@@ -993,12 +1007,67 @@ fn trim_trailing_blank_lines(s: &str) -> String {
 // ---- HTML block start conditions ----------------------------------------
 
 const HTML_BLOCK_NAMES: &[&str] = &[
-    "address", "article", "aside", "base", "basefont", "blockquote", "body", "caption", "center",
-    "col", "colgroup", "dd", "details", "dialog", "dir", "div", "dl", "dt", "fieldset",
-    "figcaption", "figure", "footer", "form", "frame", "frameset", "h1", "h2", "h3", "h4", "h5",
-    "h6", "head", "header", "hr", "html", "iframe", "legend", "li", "link", "main", "menu",
-    "menuitem", "nav", "noframes", "ol", "optgroup", "option", "p", "param", "section", "summary",
-    "table", "tbody", "td", "tfoot", "th", "thead", "title", "tr", "track", "ul",
+    "address",
+    "article",
+    "aside",
+    "base",
+    "basefont",
+    "blockquote",
+    "body",
+    "caption",
+    "center",
+    "col",
+    "colgroup",
+    "dd",
+    "details",
+    "dialog",
+    "dir",
+    "div",
+    "dl",
+    "dt",
+    "fieldset",
+    "figcaption",
+    "figure",
+    "footer",
+    "form",
+    "frame",
+    "frameset",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "head",
+    "header",
+    "hr",
+    "html",
+    "iframe",
+    "legend",
+    "li",
+    "link",
+    "main",
+    "menu",
+    "menuitem",
+    "nav",
+    "noframes",
+    "ol",
+    "optgroup",
+    "option",
+    "p",
+    "param",
+    "section",
+    "summary",
+    "table",
+    "tbody",
+    "td",
+    "tfoot",
+    "th",
+    "thead",
+    "title",
+    "tr",
+    "track",
+    "ul",
 ];
 
 fn html_block_open(rest: &[u8], in_paragraph: bool) -> Option<u8> {
@@ -1009,7 +1078,10 @@ fn html_block_open(rest: &[u8], in_paragraph: bool) -> Option<u8> {
         let open = format!("<{tag}");
         if lower.starts_with(&open) {
             let after = lower.as_bytes().get(open.len());
-            if matches!(after, None | Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'>')) {
+            if matches!(
+                after,
+                None | Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'>')
+            ) {
                 return Some(1);
             }
         }
@@ -1033,7 +1105,10 @@ fn html_block_open(rest: &[u8], in_paragraph: bool) -> Option<u8> {
     // 6: block tag name
     let body = lower.strip_prefix("</").or_else(|| lower.strip_prefix('<'));
     if let Some(b) = body {
-        let name: String = b.chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
+        let name: String = b
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric())
+            .collect();
         if !name.is_empty() && HTML_BLOCK_NAMES.contains(&name.as_str()) {
             let after = &b[name.len()..];
             if after.is_empty()
@@ -1047,17 +1122,18 @@ fn html_block_open(rest: &[u8], in_paragraph: bool) -> Option<u8> {
         }
     }
     // 7: complete open or closing tag, alone on the line (not interrupting a paragraph)
-    if !in_paragraph {
-        if let Some(end) = full_tag(rest) {
-            if rest[end..].iter().all(|&b| b == b' ' || b == b'\t' || b == b'\n') {
-                let name_ok = !s.starts_with("<script")
-                    && !s.starts_with("<pre")
-                    && !s.starts_with("<style")
-                    && !s.starts_with("<textarea");
-                if name_ok {
-                    return Some(7);
-                }
-            }
+    if !in_paragraph
+        && let Some(end) = full_tag(rest)
+        && rest[end..]
+            .iter()
+            .all(|&b| b == b' ' || b == b'\t' || b == b'\n')
+    {
+        let name_ok = !s.starts_with("<script")
+            && !s.starts_with("<pre")
+            && !s.starts_with("<style")
+            && !s.starts_with("<textarea");
+        if name_ok {
+            return Some(7);
         }
     }
     None

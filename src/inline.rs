@@ -97,7 +97,10 @@ fn parse_entity(bytes: &[u8], i: usize) -> Option<(Resolved, usize)> {
         if n == 0 || digits.get(n) != Some(&b';') {
             return None;
         }
-        Some((Resolved::Cp(remap_numeric(value)), 1 + 1 + hex as usize + n + 1))
+        Some((
+            Resolved::Cp(remap_numeric(value)),
+            1 + 1 + hex as usize + n + 1,
+        ))
     } else {
         let mut n = 0usize;
         while n < rest.len() && rest[n].is_ascii_alphanumeric() {
@@ -174,8 +177,16 @@ fn escape_href(s: &str, out: &mut String) {
             out.push_str("&#x27;");
         } else {
             out.push('%');
-            out.push(char::from_digit((b >> 4) as u32, 16).unwrap().to_ascii_uppercase());
-            out.push(char::from_digit((b & 0xf) as u32, 16).unwrap().to_ascii_uppercase());
+            out.push(
+                char::from_digit((b >> 4) as u32, 16)
+                    .unwrap()
+                    .to_ascii_uppercase(),
+            );
+            out.push(
+                char::from_digit((b & 0xf) as u32, 16)
+                    .unwrap()
+                    .to_ascii_uppercase(),
+            );
         }
     }
 }
@@ -231,7 +242,9 @@ fn emit_code_span(content: &str, out: &mut String) {
 
 /// Is `s` (between `<` and `>`) an absolute-URI autolink?
 fn is_uri_autolink(s: &str) -> bool {
-    let Some(colon) = s.find(':') else { return false };
+    let Some(colon) = s.find(':') else {
+        return false;
+    };
     let scheme = &s[..colon];
     if scheme.len() < 2
         || scheme.len() > 32
@@ -260,7 +273,9 @@ fn is_email_autolink(s: &str) -> bool {
         && domain.split('.').all(|label| {
             !label.is_empty()
                 && label.len() <= 63
-                && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
                 && label.as_bytes()[0] != b'-'
                 && *label.as_bytes().last().unwrap() != b'-'
         })
@@ -319,7 +334,10 @@ fn try_raw_html(bytes: &[u8], i: usize) -> Option<usize> {
     }
     // Declaration: <! + ASCII letter ... >
     if r.starts_with(b"<!") && r.get(2).is_some_and(u8::is_ascii_alphabetic) {
-        return r[2..].iter().position(|&c| c == b'>').map(|p| i + 2 + p + 1);
+        return r[2..]
+            .iter()
+            .position(|&c| c == b'>')
+            .map(|p| i + 2 + p + 1);
     }
     // Processing instruction.
     if r.starts_with(b"<?") {
@@ -332,7 +350,10 @@ fn try_raw_html(bytes: &[u8], i: usize) -> Option<usize> {
             return None;
         }
         k += 1;
-        while r.get(k).is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'-') {
+        while r
+            .get(k)
+            .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'-')
+        {
             k += 1;
         }
         while r.get(k).is_some_and(|c| is_html_ws(*c)) {
@@ -343,7 +364,10 @@ fn try_raw_html(bytes: &[u8], i: usize) -> Option<usize> {
     // Open tag: <name attrs* optional-ws /?>
     if r.get(1).is_some_and(u8::is_ascii_alphabetic) {
         let mut k = 2;
-        while r.get(k).is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'-') {
+        while r
+            .get(k)
+            .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'-')
+        {
             k += 1;
         }
         loop {
@@ -362,10 +386,9 @@ fn try_raw_html(bytes: &[u8], i: usize) -> Option<usize> {
                 return None; // attributes must be preceded by whitespace
             }
             k += 1;
-            while r
-                .get(k)
-                .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b':' | b'-'))
-            {
+            while r.get(k).is_some_and(|c| {
+                c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b':' | b'-')
+            }) {
                 k += 1;
             }
             // Optional `= value`.
@@ -392,7 +415,8 @@ fn try_raw_html(bytes: &[u8], i: usize) -> Option<usize> {
                     Some(_) => {
                         let s = w;
                         while r.get(w).is_some_and(|c| {
-                            !is_html_ws(*c) && !matches!(c, b'"' | b'\'' | b'=' | b'<' | b'>' | b'`')
+                            !is_html_ws(*c)
+                                && !matches!(c, b'"' | b'\'' | b'=' | b'<' | b'>' | b'`')
                         }) {
                             w += 1;
                         }
@@ -498,12 +522,20 @@ struct List {
 
 impl List {
     fn new() -> Self {
-        List { slots: Vec::new(), head: None, tail: None }
+        List {
+            slots: Vec::new(),
+            head: None,
+            tail: None,
+        }
     }
 
     fn push(&mut self, node: Node) -> usize {
         let idx = self.slots.len();
-        self.slots.push(Slot { node, prev: self.tail, next: None });
+        self.slots.push(Slot {
+            node,
+            prev: self.tail,
+            next: None,
+        });
         match self.tail {
             Some(t) => self.slots[t].next = Some(idx),
             None => self.head = Some(idx),
@@ -515,7 +547,11 @@ impl List {
     fn splice_after(&mut self, at: usize, node: Node) {
         let idx = self.slots.len();
         let next = self.slots[at].next;
-        self.slots.push(Slot { node, prev: Some(at), next });
+        self.slots.push(Slot {
+            node,
+            prev: Some(at),
+            next,
+        });
         self.slots[at].next = Some(idx);
         match next {
             Some(n) => self.slots[n].prev = Some(idx),
@@ -526,7 +562,11 @@ impl List {
     fn splice_before(&mut self, at: usize, node: Node) {
         let idx = self.slots.len();
         let prev = self.slots[at].prev;
-        self.slots.push(Slot { node, prev, next: Some(at) });
+        self.slots.push(Slot {
+            node,
+            prev,
+            next: Some(at),
+        });
         self.slots[at].prev = Some(idx);
         match prev {
             Some(p) => self.slots[p].next = Some(idx),
@@ -618,9 +658,13 @@ fn flanking(ch: u8, before: Option<char>, after: Option<char>) -> (bool, bool) {
 /// Read a delimiter node's fields.
 fn delim(list: &List, idx: usize) -> Option<(u8, usize, usize, bool, bool)> {
     match list.slots[idx].node {
-        Node::Delim { ch, count, orig, can_open, can_close } => {
-            Some((ch, count, orig, can_open, can_close))
-        }
+        Node::Delim {
+            ch,
+            count,
+            orig,
+            can_open,
+            can_close,
+        } => Some((ch, count, orig, can_open, can_close)),
         _ => None,
     }
 }
@@ -643,7 +687,11 @@ pub struct Scratch {
 
 impl Scratch {
     pub fn new() -> Self {
-        Scratch { list: List::new(), stack: Vec::new(), cur: String::new() }
+        Scratch {
+            list: List::new(),
+            stack: Vec::new(),
+            cur: String::new(),
+        }
     }
     fn reset(&mut self) {
         self.list.slots.clear();
@@ -751,7 +799,10 @@ pub fn render_inline(src: &str, out: &mut String, refmap: &RefMap, scratch: &mut
     macro_rules! flush {
         () => {
             if cur.len() > seg {
-                list.push(Node::Span { start: seg, end: cur.len() });
+                list.push(Node::Span {
+                    start: seg,
+                    end: cur.len(),
+                });
                 seg = cur.len();
             }
         };
@@ -820,7 +871,13 @@ pub fn render_inline(src: &str, out: &mut String, refmap: &RefMap, scratch: &mut
                 let before = src[..i].chars().next_back();
                 let after = src[i + count..].chars().next();
                 let (can_open, can_close) = flanking(ch, before, after);
-                let idx = list.push(Node::Delim { ch, count, orig: count, can_open, can_close });
+                let idx = list.push(Node::Delim {
+                    ch,
+                    count,
+                    orig: count,
+                    can_open,
+                    can_close,
+                });
                 stack.push(StackItem::Emph(idx));
                 i += count;
                 run = i;
@@ -829,7 +886,12 @@ pub fn render_inline(src: &str, out: &mut String, refmap: &RefMap, scratch: &mut
                 escape_html(&src[run..i], cur);
                 flush!();
                 let node = list.push(Node::Tag("["));
-                stack.push(StackItem::Bracket { node, image: false, active: true, text_src: i + 1 });
+                stack.push(StackItem::Bracket {
+                    node,
+                    image: false,
+                    active: true,
+                    text_src: i + 1,
+                });
                 i += 1;
                 run = i;
             }
@@ -837,7 +899,12 @@ pub fn render_inline(src: &str, out: &mut String, refmap: &RefMap, scratch: &mut
                 escape_html(&src[run..i], cur);
                 flush!();
                 let node = list.push(Node::Tag("!["));
-                stack.push(StackItem::Bracket { node, image: true, active: true, text_src: i + 2 });
+                stack.push(StackItem::Bracket {
+                    node,
+                    image: true,
+                    active: true,
+                    text_src: i + 2,
+                });
                 i += 2;
                 run = i;
             }
@@ -895,7 +962,12 @@ fn look_for_link_or_image(
         return; // no opener: ] stays literal
     };
     let (op_node, image, active, text_src) = match stack[op] {
-        StackItem::Bracket { node, image, active, text_src } => (node, image, active, text_src),
+        StackItem::Bracket {
+            node,
+            image,
+            active,
+            text_src,
+        } => (node, image, active, text_src),
         _ => unreachable!(),
     };
     if !active {
@@ -962,7 +1034,12 @@ fn look_for_link_or_image(
 
         // No links inside links: deactivate earlier `[` openers.
         for e in stack.iter_mut() {
-            if let StackItem::Bracket { image: false, active, .. } = e {
+            if let StackItem::Bracket {
+                image: false,
+                active,
+                ..
+            } = e
+            {
                 *active = false;
             }
         }
@@ -982,12 +1059,12 @@ fn strip_tags(s: &str) -> String {
         if bytes[i] == b'<' {
             let end = s[i..].find('>').map_or(s.len(), |p| i + p + 1);
             let tag = &s[i..end];
-            if let Some(rest) = tag.strip_prefix("<img") {
-                if let Some(ap) = rest.find("alt=\"") {
-                    let after = &rest[ap + 5..];
-                    if let Some(q) = after.find('"') {
-                        out.push_str(&after[..q]);
-                    }
+            if let Some(rest) = tag.strip_prefix("<img")
+                && let Some(ap) = rest.find("alt=\"")
+            {
+                let after = &rest[ap + 5..];
+                if let Some(q) = after.find('"') {
+                    out.push_str(&after[..q]);
                 }
             }
             i = end;
@@ -1011,10 +1088,10 @@ fn parse_link_target(
     refmap: &RefMap,
     text: &str,
 ) -> Option<(String, Option<String>, usize)> {
-    if bytes.get(i) == Some(&b'(') {
-        if let Some(r) = parse_inline_paren(src, bytes, i) {
-            return Some(r);
-        }
+    if bytes.get(i) == Some(&b'(')
+        && let Some(r) = parse_inline_paren(src, bytes, i)
+    {
+        return Some(r);
     }
     // Full reference: [label]
     if bytes.get(i) == Some(&b'[') {
@@ -1204,10 +1281,10 @@ fn parse_ref_def(
         return Some((end, label, dest, title));
     }
     // A trailing-junk title invalidates only the title, not the whole def.
-    if title.is_some() {
-        if let Some(end) = ref_line_end(bytes, dj) {
-            return Some((end, label, dest, None));
-        }
+    if title.is_some()
+        && let Some(end) = ref_line_end(bytes, dj)
+    {
+        return Some((end, label, dest, None));
     }
     None
 }
@@ -1258,7 +1335,9 @@ fn process_emphasis(list: &mut List, stack: &mut Vec<StackItem>, start: usize) {
         let mut oi = ci;
         while oi > start {
             oi -= 1;
-            let StackItem::Emph(onode) = stack[oi] else { continue };
+            let StackItem::Emph(onode) = stack[oi] else {
+                continue;
+            };
             if (onode as isize) <= bottom {
                 break;
             }
@@ -1268,8 +1347,7 @@ fn process_emphasis(list: &mut List, stack: &mut Vec<StackItem>, start: usize) {
             if ocount == 0 {
                 continue;
             }
-            let odd_match =
-                (ccan_open || ocan_close) && corig % 3 != 0 && (oorig + corig) % 3 == 0;
+            let odd_match = (ccan_open || ocan_close) && corig % 3 != 0 && (oorig + corig) % 3 == 0;
             if och == cch && ocan_open && !odd_match {
                 opener = Some(oi);
                 break;
@@ -1278,7 +1356,9 @@ fn process_emphasis(list: &mut List, stack: &mut Vec<StackItem>, start: usize) {
 
         match opener {
             Some(oi) => {
-                let StackItem::Emph(onode) = stack[oi] else { unreachable!() };
+                let StackItem::Emph(onode) = stack[oi] else {
+                    unreachable!()
+                };
                 let ocount = delim(list, onode).unwrap().1;
                 let strong = ocount >= 2 && ccount >= 2;
                 let use_delims = if strong { 2 } else { 1 };
@@ -1307,8 +1387,11 @@ fn process_emphasis(list: &mut List, stack: &mut Vec<StackItem>, start: usize) {
                 }
             }
             None => {
-                openers_bottom[char_idx][corig % 3] =
-                    if ci == 0 { -1 } else { stack_node(&stack[ci - 1]) };
+                openers_bottom[char_idx][corig % 3] = if ci == 0 {
+                    -1
+                } else {
+                    stack_node(&stack[ci - 1])
+                };
                 if !ccan_open {
                     stack.remove(ci);
                 } else {
@@ -1372,7 +1455,10 @@ mod tests {
         assert_eq!(inline("**foo**"), "<strong>foo</strong>");
         assert_eq!(inline("***foo***"), "<em><strong>foo</strong></em>");
         assert_eq!(inline("foo_bar_baz"), "foo_bar_baz");
-        assert_eq!(inline("*foo **bar** baz*"), "<em>foo <strong>bar</strong> baz</em>");
+        assert_eq!(
+            inline("*foo **bar** baz*"),
+            "<em>foo <strong>bar</strong> baz</em>"
+        );
     }
 
     #[test]
@@ -1405,11 +1491,11 @@ mod tests {
             "<a href=\"/uri\" title=\"title\">link</a>"
         );
         assert_eq!(inline("[a *b*](/u)"), "<a href=\"/u\">a <em>b</em></a>");
-        assert_eq!(inline("![alt](/img.png)"), "<img src=\"/img.png\" alt=\"alt\" />");
         assert_eq!(
-            inline("![a *b*](/i)"),
-            "<img src=\"/i\" alt=\"a b\" />"
+            inline("![alt](/img.png)"),
+            "<img src=\"/img.png\" alt=\"alt\" />"
         );
+        assert_eq!(inline("![a *b*](/i)"), "<img src=\"/i\" alt=\"a b\" />");
         // no closer -> literal
         assert_eq!(inline("[not a link"), "[not a link");
         // no matching paren / def -> literal brackets
@@ -1419,7 +1505,10 @@ mod tests {
     #[test]
     fn reference_links_resolve_via_map() {
         let mut map = RefMap::new();
-        map.insert("foo".to_string(), ("/url".to_string(), Some("t".to_string())));
+        map.insert(
+            "foo".to_string(),
+            ("/url".to_string(), Some("t".to_string())),
+        );
         let mut sc = Scratch::new();
         let mut out = String::new();
         render_inline("[foo]", &mut out, &map, &mut sc);

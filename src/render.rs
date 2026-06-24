@@ -5,7 +5,7 @@
 //! exact whitespace, including tight-vs-loose list items.
 
 use crate::block::{Kind, Tree};
-use crate::inline::{render_inline, Scratch};
+use crate::inline::{Scratch, render_inline};
 use crate::scan::memchr4;
 
 /// Render a parsed [`Tree`] to an HTML string.
@@ -59,7 +59,7 @@ fn render_node(tree: &Tree, idx: usize, out: &mut String, scratch: &mut Scratch)
             render_inline(&node.content, out, &tree.refmap, scratch);
             out.push_str("</h");
             out.push((b'0' + level) as char);
-            out.push_str(">");
+            out.push('>');
             cr(out);
         }
         Kind::ThematicBreak => {

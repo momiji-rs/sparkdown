@@ -131,7 +131,12 @@ impl Bump {
     #[cold]
     #[inline(never)]
     fn grow(&self, need: usize) {
-        let cap = self.cur_cap.get().max(FIRST_CHUNK).max(need).next_power_of_two();
+        let cap = self
+            .cur_cap
+            .get()
+            .max(FIRST_CHUNK)
+            .max(need)
+            .next_power_of_two();
         let layout = Layout::from_size_align(cap, 1).expect("bump chunk layout");
         // SAFETY: `cap` is non-zero (>= FIRST_CHUNK), align 1 is valid.
         let p = unsafe { alloc::alloc(layout) };

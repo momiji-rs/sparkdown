@@ -491,7 +491,10 @@ mod tests {
         unsafe { ScopedAlloc.dealloc(p_sys, l) };
         resume(saved);
         let p_arena = unsafe { ScopedAlloc.alloc(l) };
-        assert!(in_arena(p_arena), "resumed scope bumps from the arena again");
+        assert!(
+            in_arena(p_arena),
+            "resumed scope bumps from the arena again"
+        );
         let _ = leave_no_reset();
         reset();
         std::mem::forget(scope);
