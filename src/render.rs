@@ -70,9 +70,9 @@ fn render_node(tree: &Tree, idx: usize, out: &mut String, scratch: &mut Scratch)
         Kind::CodeBlock => {
             cr(out);
             out.push_str("<pre><code");
-            if let Some(word) = node.info.split_whitespace().next() {
+            if let Some(word) = tree.info(idx).split_whitespace().next() {
                 out.push_str(" class=\"language-");
-                escape_html(word, out);
+                escape_html(crate::inline::unescape_string(word).as_ref(), out);
                 out.push('"');
             }
             out.push('>');

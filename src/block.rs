@@ -52,7 +52,10 @@ pub struct Node {
     fence_char: u8,
     fence_len: usize,
     fence_offset: usize,
-    pub info: String,
+    /// Fenced-code info string as a `[start, end)` range in the same store as
+    /// the content (selected by `content_src`) — no per-block allocation.
+    info_start: u32,
+    info_end: u32,
     html_kind: u8,
     pub list: Option<ListData>,
 }
@@ -74,7 +77,8 @@ impl Node {
             fence_char: 0,
             fence_len: 0,
             fence_offset: 0,
-            info: String::new(),
+            info_start: 0,
+            info_end: 0,
             html_kind: 0,
             list: None,
         }
@@ -102,6 +106,17 @@ impl Tree<'_> {
             &self.buf
         };
         &store[n.cstart as usize..n.cend as usize]
+    }
+
+    /// The fenced-code info string of node `idx` (raw; unescape at render).
+    pub fn info(&self, idx: usize) -> &str {
+        let n = &self.nodes[idx];
+        let store = if n.content_src {
+            self.source
+        } else {
+            &self.buf
+        };
+        &store[n.info_start as usize..n.info_end as usize]
     }
 }
 
@@ -372,13 +387,19 @@ impl<'a> Parser<'a> {
             Kind::CodeBlock => {
                 let (s, e, csrc) = self.content_range(idx);
                 if self.nodes[idx].fenced {
-                    // First line is the info string; the rest is the literal.
-                    let (nl, info) = {
+                    // First line is the info string (recorded as a range; the
+                    // renderer takes its first word and unescapes lazily); the
+                    // rest is the literal.
+                    let (nl, ts, te) = {
                         let store: &str = if csrc { self.source } else { &self.buf };
                         let nl = store[s..e].find('\n').map_or(e - s, |p| p);
-                        (nl, unescape_info(store[s..s + nl].trim()))
+                        let first = &store[s..s + nl];
+                        let lead = first.len() - first.trim_start().len();
+                        let trimmed = first.trim();
+                        (nl, s + lead, s + lead + trimmed.len())
                     };
-                    self.nodes[idx].info = info;
+                    self.nodes[idx].info_start = ts as u32;
+                    self.nodes[idx].info_end = te as u32;
                     self.nodes[idx].cstart = (s + nl + 1).min(e) as u32;
                 } else {
                     let keep = {
@@ -1094,12 +1115,6 @@ fn is_closing_fence(line: &[u8], from: usize, fence_char: u8, fence_len: usize) 
     rest[run..]
         .iter()
         .all(|&b| b == b' ' || b == b'\t' || b == b'\n')
-}
-
-fn unescape_info(s: &str) -> String {
-    // The info string's backslash escapes and entities are resolved here; the
-    // renderer takes its first word as the language class.
-    crate::inline::unescape_string(s).into_owned()
 }
 
 /// Byte length of `s` after stripping a trailing `(\n *)+` run (HTML-block
