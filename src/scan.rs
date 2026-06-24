@@ -190,6 +190,133 @@ unsafe fn find_escape_sse2(hay: &[u8]) -> Option<usize> {
     None
 }
 
+// ---- SIMD byte-set membership (the simdjson nibble-lookup technique) -------
+//
+// For a set whose members all have a high nibble ≤ 7, a byte `b` is in the set
+// iff `lo[b & 0xF] & hi[b >> 4] != 0`, where `lo`/`hi` are 16-byte tables. One
+// `pshufb`/`vqtbl1q` does the lookup, so 16 bytes are tested in a few ops. Used
+// to skip plain text to the next inline-significant byte.
+
+/// Inline triggers that the full inline scan must stop at:
+/// `\` `` ` `` `&` `<` `\n` `*` `_` `[` `]` `!`.
+const INLINE_LO: [u8; 16] = [
+    0x40, 0x04, 0, 0, 0, 0, 0x04, 0, 0, 0, 0x05, 0x20, 0x28, 0x20, 0, 0x20,
+];
+const INLINE_HI: [u8; 16] = [
+    0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+/// Triggers for the emphasis/link-free fast path: `\` `` ` `` `&` `<` `\n`.
+const STREAM_LO: [u8; 16] = [0x40, 0, 0, 0, 0, 0, 0x04, 0, 0, 0, 0x01, 0, 0x28, 0, 0, 0];
+const STREAM_HI: [u8; 16] = [
+    0x01, 0, 0x04, 0x08, 0, 0x20, 0x40, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+#[inline]
+pub(crate) fn find_inline(hay: &[u8]) -> Option<usize> {
+    find_in_set(hay, &INLINE_LO, &INLINE_HI)
+}
+
+#[inline]
+pub(crate) fn find_stream(hay: &[u8]) -> Option<usize> {
+    find_in_set(hay, &STREAM_LO, &STREAM_HI)
+}
+
+#[inline]
+fn in_set(b: u8, lo: &[u8; 16], hi: &[u8; 16]) -> bool {
+    lo[(b & 0x0F) as usize] & hi[(b >> 4) as usize] != 0
+}
+
+#[inline]
+fn find_in_set(hay: &[u8], lo: &[u8; 16], hi: &[u8; 16]) -> Option<usize> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { find_in_set_neon(hay, lo, hi) }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        // pshufb is SSSE3 (not the SSE2 baseline), so detect at runtime.
+        if std::is_x86_feature_detected!("ssse3") {
+            unsafe { find_in_set_ssse3(hay, lo, hi) }
+        } else {
+            hay.iter().position(|&b| in_set(b, lo, hi))
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        hay.iter().position(|&b| in_set(b, lo, hi))
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn find_in_set_neon(hay: &[u8], lo: &[u8; 16], hi: &[u8; 16]) -> Option<usize> {
+    use core::arch::aarch64::*;
+    let (lo_t, hi_t) = unsafe { (vld1q_u8(lo.as_ptr()), vld1q_u8(hi.as_ptr())) };
+    let mut i = 0;
+    while i + 16 <= hay.len() {
+        let mask = unsafe {
+            let v = vld1q_u8(hay.as_ptr().add(i));
+            let lo_m = vqtbl1q_u8(lo_t, vandq_u8(v, vdupq_n_u8(0x0F)));
+            let hi_m = vqtbl1q_u8(hi_t, vshrq_n_u8(v, 4));
+            let m = vandq_u8(lo_m, hi_m); // nonzero lane = member
+            let nz = vmvnq_u8(vceqzq_u8(m)); // 0xFF where member
+            vget_lane_u64(
+                vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(nz), 4)),
+                0,
+            )
+        };
+        if mask != 0 {
+            return Some(i + (mask.trailing_zeros() as usize >> 2));
+        }
+        i += 16;
+    }
+    while i < hay.len() {
+        if in_set(hay[i], lo, hi) {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+#[allow(clippy::cast_ptr_alignment)]
+unsafe fn find_in_set_ssse3(hay: &[u8], lo: &[u8; 16], hi: &[u8; 16]) -> Option<usize> {
+    use core::arch::x86_64::*;
+    let (lo_t, hi_t) = unsafe {
+        (
+            _mm_loadu_si128(lo.as_ptr() as *const __m128i),
+            _mm_loadu_si128(hi.as_ptr() as *const __m128i),
+        )
+    };
+    let mut i = 0;
+    while i + 16 <= hay.len() {
+        let mask = unsafe {
+            let v = _mm_loadu_si128(hay.as_ptr().add(i) as *const __m128i);
+            let lo_nib = _mm_and_si128(v, _mm_set1_epi8(0x0F));
+            let hi_nib = _mm_and_si128(_mm_srli_epi16(v, 4), _mm_set1_epi8(0x0F));
+            let lo_m = _mm_shuffle_epi8(lo_t, lo_nib);
+            let hi_m = _mm_shuffle_epi8(hi_t, hi_nib);
+            let m = _mm_and_si128(lo_m, hi_m);
+            // bits set where m != 0
+            !_mm_movemask_epi8(_mm_cmpeq_epi8(m, _mm_setzero_si128())) & 0xFFFF
+        };
+        if mask != 0 {
+            return Some(i + mask.trailing_zeros() as usize);
+        }
+        i += 16;
+    }
+    while i < hay.len() {
+        if in_set(hay[i], lo, hi) {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Index of the first byte in `hay` equal to `a`, `b`, `c`, or `d` — a
 /// dependency-free `memchr4`. The SIMD `find_escape` fallback on non-x86/non-arm.
 #[inline]
@@ -295,5 +422,49 @@ mod tests {
         }
         assert_eq!(find_escape(b""), None);
         assert_eq!(find_escape(b"no specials at all here, just prose"), None);
+    }
+
+    #[test]
+    fn find_set_matches_scalar() {
+        let inline_scalar = |h: &[u8]| {
+            h.iter().position(|&b| {
+                matches!(
+                    b,
+                    b'\\' | b'`' | b'&' | b'<' | b'\n' | b'*' | b'_' | b'[' | b']' | b'!'
+                )
+            })
+        };
+        let stream_scalar = |h: &[u8]| {
+            h.iter()
+                .position(|&b| matches!(b, b'\\' | b'`' | b'&' | b'<' | b'\n'))
+        };
+        let bytes: Vec<u8> = (0u8..=255).cycle().take(400).collect();
+        for len in 0..bytes.len() {
+            let hay = &bytes[..len];
+            assert_eq!(find_inline(hay), inline_scalar(hay), "inline len={len}");
+            assert_eq!(find_stream(hay), stream_scalar(hay), "stream len={len}");
+        }
+        // Each member at every position; and no false positives for neighbours.
+        for pos in 0..40 {
+            for &sp in b"\\`&<\n*_[]!" {
+                let mut h = vec![b'x'; 40];
+                h[pos] = sp;
+                assert_eq!(find_inline(&h), Some(pos), "inline pos={pos} sp={sp}");
+            }
+            for &sp in b"\\`&<\n" {
+                let mut h = vec![b'x'; 40];
+                h[pos] = sp;
+                assert_eq!(find_stream(&h), Some(pos), "stream pos={pos} sp={sp}");
+            }
+        }
+        // `!` `*` `_` `[` `]` are NOT stream triggers; `>` `{` are neither.
+        for &b in b"!*_[]>{ );0a" {
+            let h = vec![b; 40];
+            assert_eq!(find_stream(&h), None, "stream non-member {b}");
+        }
+        for &b in b">{ );0a^)" {
+            let h = vec![b; 40];
+            assert_eq!(find_inline(&h), None, "inline non-member {b}");
+        }
     }
 }

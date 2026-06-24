@@ -10,7 +10,7 @@
 
 use crate::entities::{named, remap_numeric};
 use crate::render::escape_html;
-use crate::scan::memchr3;
+use crate::scan::{find_inline, find_stream, memchr3};
 use std::borrow::Cow;
 use std::collections::HashMap;
 
@@ -815,7 +815,8 @@ fn stream_inline(src: &str, out: &mut String) {
                 i = skip_spaces(bytes, i + 1);
                 run = i;
             }
-            _ => i += 1,
+            // Skip plain text to the next significant byte in one SIMD pass.
+            _ => i += 1 + find_stream(&bytes[i + 1..]).unwrap_or(bytes.len() - i - 1),
         }
     }
     escape_html(src[run..].trim_end_matches(' '), out);
@@ -969,7 +970,8 @@ pub fn render_inline(src: &str, out: &mut String, refmap: &RefMap, scratch: &mut
                 i = skip_spaces(bytes, i + 1);
                 run = i;
             }
-            _ => i += 1,
+            // Skip plain text to the next significant byte in one SIMD pass.
+            _ => i += 1 + find_inline(&bytes[i + 1..]).unwrap_or(bytes.len() - i - 1),
         }
     }
     // Trailing spaces at the very end of a block are dropped (no following line
