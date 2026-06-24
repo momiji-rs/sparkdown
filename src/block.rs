@@ -57,7 +57,7 @@ pub struct Node {
     info_start: u32,
     info_end: u32,
     html_kind: u8,
-    pub list: Option<ListData>,
+    pub list: Option<Box<ListData>>,
 }
 
 impl Node {
@@ -633,7 +633,10 @@ impl<'a> Parser<'a> {
                 }
             }
             Kind::Item => {
-                let ld = self.nodes[c].list.clone().unwrap();
+                let (marker_offset, padding) = {
+                    let ld = self.nodes[c].list.as_ref().unwrap();
+                    (ld.marker_offset, ld.padding)
+                };
                 if self.blank {
                     if self.nodes[c].children.is_empty() {
                         1
@@ -641,8 +644,8 @@ impl<'a> Parser<'a> {
                         self.advance_next_nonspace();
                         0
                     }
-                } else if self.indent >= ld.marker_offset + ld.padding {
-                    self.advance_offset(ld.marker_offset + ld.padding, true);
+                } else if self.indent >= marker_offset + padding {
+                    self.advance_offset(marker_offset + padding, true);
                     0
                 } else {
                     1
@@ -856,10 +859,10 @@ impl<'a> Parser<'a> {
                 .is_some_and(|l| lists_match(l, &data));
         if !tip_is_matching_list {
             let l = self.add_child(Kind::List);
-            self.nodes[l].list = Some(data.clone());
+            self.nodes[l].list = Some(Box::new(data.clone()));
         }
         let item = self.add_child(Kind::Item);
-        self.nodes[item].list = Some(data);
+        self.nodes[item].list = Some(Box::new(data));
         1
     }
 
