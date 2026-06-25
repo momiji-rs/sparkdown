@@ -17,7 +17,7 @@
 //! step). Enough for position-reading plugins like remark-lint.
 
 use crate::block::{Kind, Tree, parse};
-use crate::inline::{InlineTok, Scratch, render_inline_to_tokens};
+use crate::inline::{InlineTok, Scratch, SpanTok, render_inline_to_tokens};
 
 /// An owned mdast node. Field names mirror the mdast spec so a thin serializer
 /// (in the example) maps each to `{ type, ... }` verbatim.
@@ -225,8 +225,9 @@ fn block_children(
     (v, last)
 }
 
-/// Build a text-bearing block's inline children with **block-granular** positions
-/// (the `[sb, eb)` source span). Per-inline source spans are Phase 2.
+/// Build a text-bearing block's inline children with per-node source positions.
+/// `[sb, eb)` is the block's source span — the fallback when a token's own span
+/// is unknown or the content is buffered (no direct source map).
 fn inline(
     tree: &Tree,
     idx: usize,
@@ -236,25 +237,9 @@ fn inline(
     eb: usize,
 ) -> Vec<Mdast> {
     let toks = render_inline_to_tokens(tree.content(idx), &tree.refmap, scratch, tree.opts);
-    let mut nodes = build_inline(toks);
+    let base = tree.inline_src_base(idx);
     let bpos = ctx.pos(sb, eb);
-    position_inline(&mut nodes, &bpos);
-    nodes
-}
-
-/// Wrap every inline node (and its descendants) in a `Positioned` with `pos`.
-fn position_inline(nodes: &mut Vec<Mdast>, pos: &Pos) {
-    for n in nodes.iter_mut() {
-        match n {
-            Mdast::Emphasis(c) | Mdast::Strong(c) | Mdast::Delete(c) => position_inline(c, pos),
-            Mdast::Link { children, .. } | Mdast::LinkReference { children, .. } => {
-                position_inline(children, pos)
-            }
-            _ => {}
-        }
-        let inner = std::mem::replace(n, Mdast::Break);
-        *n = Mdast::Positioned(pos.clone(), Box::new(inner));
-    }
+    build_inline(toks, ctx, base, &bpos)
 }
 
 /// An open inline container awaiting its close.
@@ -264,40 +249,85 @@ enum Frame {
     LinkRef { identifier: String, label: String, reftype: &'static str },
 }
 
-fn build_inline(toks: Vec<InlineTok>) -> Vec<Mdast> {
-    // A stack of (frame, accumulated children). The bottom frame is the root.
-    let mut stack: Vec<(Option<Frame>, Vec<Mdast>)> = vec![(None, Vec::new())];
-    // Coalesce adjacent text nodes (mdast-util-from-markdown emits a single
-    // `text` per run; matching that keeps the shape diff clean).
-    let push = |stack: &mut Vec<(Option<Frame>, Vec<Mdast>)>, node: Mdast| {
-        let siblings = &mut stack.last_mut().unwrap().1;
-        if let (Mdast::Text(new), Some(Mdast::Text(prev))) = (&node, siblings.last_mut()) {
-            prev.push_str(new);
-        } else {
-            siblings.push(node);
+/// Fold the [`SpanTok`] stream into a nested, positioned mdast. `base` is the
+/// source byte offset of the inline content (so a content offset `o` maps to
+/// source `base + o`); when `None` (buffered content) or a token span is unset,
+/// the block-granular `bpos` is used.
+fn build_inline(toks: Vec<SpanTok>, ctx: &PosCtx, base: Option<u32>, bpos: &Pos) -> Vec<Mdast> {
+    let mkpos = |s: u32, e: u32| -> Pos {
+        match base {
+            Some(b) if s != u32::MAX => ctx.pos((b + s) as usize, (b + e) as usize),
+            _ => bpos.clone(),
         }
     };
-    for tok in toks {
+    // (frame, children, open_start, open_end).
+    let mut stack: Vec<(Option<Frame>, Vec<Mdast>, u32, u32)> =
+        vec![(None, Vec::new(), u32::MAX, 0)];
+    for SpanTok { tok, start, end } in toks {
         match tok {
-            InlineTok::Text(s) => push(&mut stack, Mdast::Text(s)),
-            InlineTok::Code(v) => push(&mut stack, Mdast::InlineCode(v)),
-            InlineTok::Html(h) => push(&mut stack, Mdast::Html(h)),
-            InlineTok::Break => push(&mut stack, Mdast::Break),
-            InlineTok::Image { url, title, alt } => push(&mut stack, Mdast::Image { url, title, alt }),
-            InlineTok::ImageRef { identifier, label, reftype, alt } => {
-                push(&mut stack, Mdast::ImageReference { identifier, label, reftype, alt })
+            InlineTok::Text(s) => {
+                let pos = mkpos(start, end);
+                let sib = &mut stack.last_mut().unwrap().1;
+                // Coalesce adjacent text (matching from-markdown's single run),
+                // extending the merged node's end.
+                if let Some(Mdast::Positioned(ppos, last)) = sib.last_mut()
+                    && let Mdast::Text(prev) = last.as_mut()
+                {
+                    prev.push_str(&s);
+                    ppos.end = pos.end;
+                    continue;
+                }
+                sib.push(Mdast::Positioned(pos, Box::new(Mdast::Text(s))));
             }
-            InlineTok::Autolink { url, text } => push(
-                &mut stack,
-                Mdast::Link { url, title: None, children: vec![Mdast::Text(text)] },
-            ),
-            InlineTok::Open(kind) => stack.push((Some(Frame::Container(kind)), Vec::new())),
-            InlineTok::LinkOpen { url, title } => stack.push((Some(Frame::Link { url, title }), Vec::new())),
+            InlineTok::Code(v) => {
+                let p = mkpos(start, end);
+                stack.last_mut().unwrap().1.push(Mdast::Positioned(p, Box::new(Mdast::InlineCode(v))));
+            }
+            InlineTok::Html(h) => {
+                let p = mkpos(start, end);
+                stack.last_mut().unwrap().1.push(Mdast::Positioned(p, Box::new(Mdast::Html(h))));
+            }
+            InlineTok::Break => {
+                let p = mkpos(start, end);
+                stack.last_mut().unwrap().1.push(Mdast::Positioned(p, Box::new(Mdast::Break)));
+            }
+            InlineTok::Image { url, title, alt } => {
+                let p = mkpos(start, end);
+                stack.last_mut().unwrap().1.push(Mdast::Positioned(
+                    p,
+                    Box::new(Mdast::Image { url, title, alt }),
+                ));
+            }
+            InlineTok::ImageRef { identifier, label, reftype, alt } => {
+                let p = mkpos(start, end);
+                stack.last_mut().unwrap().1.push(Mdast::Positioned(
+                    p,
+                    Box::new(Mdast::ImageReference { identifier, label, reftype, alt }),
+                ));
+            }
+            InlineTok::Autolink { url, text } => {
+                // The link spans `<url>`; its text child spans the url itself.
+                let child = Mdast::Positioned(
+                    mkpos(start.saturating_add(1), end.saturating_sub(1)),
+                    Box::new(Mdast::Text(text)),
+                );
+                let p = mkpos(start, end);
+                stack.last_mut().unwrap().1.push(Mdast::Positioned(
+                    p,
+                    Box::new(Mdast::Link { url, title: None, children: vec![child] }),
+                ));
+            }
+            InlineTok::Open(kind) => {
+                stack.push((Some(Frame::Container(kind)), Vec::new(), start, end))
+            }
+            InlineTok::LinkOpen { url, title } => {
+                stack.push((Some(Frame::Link { url, title }), Vec::new(), start, end))
+            }
             InlineTok::LinkRefOpen { identifier, label, reftype } => {
-                stack.push((Some(Frame::LinkRef { identifier, label, reftype }), Vec::new()))
+                stack.push((Some(Frame::LinkRef { identifier, label, reftype }), Vec::new(), start, end))
             }
             InlineTok::Close(_) | InlineTok::LinkClose => {
-                let (frame, children) = stack.pop().unwrap();
+                let (frame, children, os, oe) = stack.pop().unwrap();
                 let node = match frame {
                     Some(Frame::Container("strong")) => Mdast::Strong(children),
                     Some(Frame::Container("delete")) => Mdast::Delete(children),
@@ -307,27 +337,29 @@ fn build_inline(toks: Vec<InlineTok>) -> Vec<Mdast> {
                         Mdast::LinkReference { identifier, label, reftype, children }
                     }
                     None => {
-                        // Unbalanced close (shouldn't happen): drop children inline.
                         for c in children {
-                            push(&mut stack, c);
+                            stack.last_mut().unwrap().1.push(c);
                         }
                         continue;
                     }
                 };
-                push(&mut stack, node);
+                // Container span: opener start … max(opener end, closer end). The
+                // link opener already carries the whole link's end; emphasis
+                // opener carries only its marker, so the closer extends it.
+                let cend = if end > oe { end } else { oe };
+                let p = mkpos(os, cend);
+                stack.last_mut().unwrap().1.push(Mdast::Positioned(p, Box::new(node)));
             }
         }
     }
-    // Any unclosed frames: flatten their children up (defensive).
     while stack.len() > 1 {
-        let (_, children) = stack.pop().unwrap();
+        let (_, children, _, _) = stack.pop().unwrap();
         for c in children {
             stack.last_mut().unwrap().1.push(c);
         }
     }
     stack.pop().unwrap().1
 }
-
 /// Split a fenced code-block info string into mdast `(lang, meta)`.
 fn code_info(info: &str) -> (Option<String>, Option<String>) {
     let info = crate::inline::unescape_string(info);

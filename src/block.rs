@@ -228,6 +228,16 @@ impl Tree<'_> {
         &self.defs[self.nodes[idx].def as usize]
     }
 
+    /// SPIKE (`ast` feature): for a text-bearing block whose content is borrowed
+    /// directly from the source (`content_src`), the source byte offset of its
+    /// content start — so inline content offsets map straight to source. `None`
+    /// for buffered content (blockquote/list), where no direct map exists.
+    #[cfg(feature = "ast")]
+    pub fn inline_src_base(&self, idx: usize) -> Option<u32> {
+        let n = &self.nodes[idx];
+        n.content_src.then_some(n.cstart)
+    }
+
     /// SPIKE (`ast` feature): a node's raw source byte span `(start, end)`.
     /// `start == u32::MAX` means unset (e.g. a synthesized container before its
     /// children resolve it). `end` may include a trailing newline (callers trim).

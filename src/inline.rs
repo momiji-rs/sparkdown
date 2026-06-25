@@ -680,6 +680,16 @@ pub enum InlineTok {
     ImageRef { identifier: String, label: String, reftype: &'static str, alt: String },
 }
 
+/// SPIKE (`ast`): an [`InlineTok`] tagged with the content byte range
+/// `[start, end)` that produced it (for unist `position`). `start == u32::MAX`
+/// means the span is unknown (the consumer falls back to the block span).
+#[cfg(feature = "ast")]
+pub struct SpanTok {
+    pub tok: InlineTok,
+    pub start: u32,
+    pub end: u32,
+}
+
 /// SPIKE: reverse [`escape_html`] (`&amp;`/`&lt;`/`&gt;`/`&quot;` only) to recover
 /// an mdast `text` value from a rendered span. escape_html escapes exactly these
 /// four, after entity/backslash resolution — so this is exact, not heuristic.
@@ -719,17 +729,19 @@ fn unescape_html_text(s: &str) -> String {
 /// Spans now hold *only* plain escaped text (every lossy construct is a
 /// [`Node::Sem`]/[`Node::LinkClose`]), so reconstruction is exact.
 #[cfg(feature = "ast")]
-fn list_to_tokens(list: &List, cur: &str, sem: &[Sem], out: &mut Vec<InlineTok>) {
+fn list_to_tokens(list: &List, cur: &str, sem: &[Sem], out: &mut Vec<SpanTok>) {
     let mut node = list.head;
     while let Some(idx) = node {
+        let (s, e) = list.slots[idx].cspan;
+        let mut push = |tok| out.push(SpanTok { tok, start: s, end: e });
         match &list.slots[idx].node {
             Node::Span { start, end } => {
                 let t = unescape_html_text(&cur[*start..*end]);
                 if !t.is_empty() {
-                    out.push(InlineTok::Text(t));
+                    push(InlineTok::Text(t));
                 }
             }
-            Node::Tag(t) => out.push(match *t {
+            Node::Tag(t) => push(match *t {
                 "<em>" => InlineTok::Open("emphasis"),
                 "</em>" => InlineTok::Close("emphasis"),
                 "<strong>" => InlineTok::Open("strong"),
@@ -740,9 +752,9 @@ fn list_to_tokens(list: &List, cur: &str, sem: &[Sem], out: &mut Vec<InlineTok>)
                 lit => InlineTok::Text(lit.to_owned()),
             }),
             Node::Delim { ch, count, .. } => {
-                out.push(InlineTok::Text(core::iter::repeat(*ch as char).take(*count).collect()))
+                push(InlineTok::Text(core::iter::repeat(*ch as char).take(*count).collect()))
             }
-            Node::Sem(i) => out.push(match &sem[*i as usize] {
+            Node::Sem(i) => push(match &sem[*i as usize] {
                 Sem::Code(v) => InlineTok::Code(v.clone()),
                 Sem::LinkOpen { url, title } => InlineTok::LinkOpen {
                     url: url.clone(),
@@ -771,7 +783,7 @@ fn list_to_tokens(list: &List, cur: &str, sem: &[Sem], out: &mut Vec<InlineTok>)
                     alt: alt.clone(),
                 },
             }),
-            Node::LinkClose => out.push(InlineTok::LinkClose),
+            Node::LinkClose => push(InlineTok::LinkClose),
         }
         node = list.slots[idx].next;
     }
@@ -781,6 +793,10 @@ struct Slot {
     node: Node,
     prev: Option<usize>,
     next: Option<usize>,
+    /// SPIKE (`ast`): the content byte range `[start, end)` that produced this
+    /// node, for unist `position`. `(0, 0)` until set in AST mode.
+    #[cfg(feature = "ast")]
+    cspan: (u32, u32),
 }
 
 /// A doubly-linked list over an append-only slot arena (slots are never freed,
@@ -808,6 +824,8 @@ impl List {
             node,
             prev: self.tail,
             next: None,
+            #[cfg(feature = "ast")]
+            cspan: (u32::MAX, 0),
         });
         match self.tail {
             Some(t) => self.slots[t].next = Some(idx),
@@ -817,34 +835,40 @@ impl List {
         idx
     }
 
-    fn splice_after(&mut self, at: usize, node: Node) {
+    fn splice_after(&mut self, at: usize, node: Node) -> usize {
         let idx = self.slots.len();
         let next = self.slots[at].next;
         self.slots.push(Slot {
             node,
             prev: Some(at),
             next,
+            #[cfg(feature = "ast")]
+            cspan: (u32::MAX, 0),
         });
         self.slots[at].next = Some(idx);
         match next {
             Some(n) => self.slots[n].prev = Some(idx),
             None => self.tail = Some(idx),
         }
+        idx
     }
 
-    fn splice_before(&mut self, at: usize, node: Node) {
+    fn splice_before(&mut self, at: usize, node: Node) -> usize {
         let idx = self.slots.len();
         let prev = self.slots[at].prev;
         self.slots.push(Slot {
             node,
             prev,
             next: Some(at),
+            #[cfg(feature = "ast")]
+            cspan: (u32::MAX, 0),
         });
         self.slots[at].prev = Some(idx);
         match prev {
             Some(p) => self.slots[p].next = Some(idx),
             None => self.head = Some(idx),
         }
+        idx
     }
 
     fn unlink(&mut self, idx: usize) {
@@ -967,7 +991,7 @@ pub struct Scratch {
     /// default) is the unchanged fast path — the one extra branch it adds is only
     /// compiled in `ast` builds.
     #[cfg(feature = "ast")]
-    toks: Option<Vec<InlineTok>>,
+    toks: Option<Vec<SpanTok>>,
 }
 
 impl Scratch {
@@ -1374,7 +1398,7 @@ pub fn render_inline_to_tokens(
     refmap: &RefMap,
     scratch: &mut Scratch,
     opts: Options,
-) -> Vec<InlineTok> {
+) -> Vec<SpanTok> {
     scratch.toks = Some(Vec::new());
     let mut sink = String::new(); // unused in token mode
     render_inline(src, &mut sink, refmap, scratch, opts);
@@ -1423,18 +1447,49 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
     let mut i = 0usize;
     let mut run = 0usize;
     let mut seg = 0usize; // start (in `cur`) of the open text segment
+    // SPIKE (`ast`): start (in `src` content) of the open text segment, for the
+    // text node's unist `position`.
+    #[cfg(feature = "ast")]
+    let mut cseg = 0usize;
 
-    // Close the open text segment into a Span node.
+    // Close the open text segment into a Span node. `$cend` is the content byte
+    // offset where the text ends (AST mode records `[cseg, $cend)` on the span;
+    // the HTML path ignores it).
     macro_rules! flush {
-        () => {
+        ($cend:expr) => {{
             if cur.len() > seg {
-                list.push(Node::Span {
+                let _id = list.push(Node::Span {
                     start: seg,
                     end: cur.len(),
                 });
+                #[cfg(feature = "ast")]
+                {
+                    list.slots[_id].cspan = (cseg as u32, ($cend) as u32);
+                }
                 seg = cur.len();
             }
-        };
+            #[cfg(feature = "ast")]
+            {
+                cseg = ($cend) as usize;
+            }
+        }};
+    }
+
+    // SPIKE (`ast`): set the content span on the node just pushed at `$idx` and
+    // advance the text-segment cursor. A no-op without the `ast` feature (the
+    // call sites live inside runtime `if ast_mode` blocks that still compile).
+    macro_rules! cspan {
+        ($idx:expr, $s:expr, $e:expr) => {{
+            #[cfg(feature = "ast")]
+            {
+                list.slots[$idx].cspan = ($s as u32, $e as u32);
+                cseg = ($e) as usize;
+            }
+            #[cfg(not(feature = "ast"))]
+            {
+                let _ = ($idx, $s, $e);
+            }
+        }};
     }
 
     while i < bytes.len() {
@@ -1443,15 +1498,21 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                 escape_html(&src[run..i], cur);
                 if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
                     if ast_mode {
-                        flush!();
+                        flush!(i);
                         let si = sem.len() as u32;
                         sem.push(Sem::Break);
-                        list.push(Node::Sem(si));
+                        let bid = list.push(Node::Sem(si));
+                        cspan!(bid, i, i + 1);
                         seg = cur.len();
+                        i = skip_spaces(bytes, i + 2);
+                        #[cfg(feature = "ast")]
+                        {
+                            cseg = i;
+                        }
                     } else {
                         cur.push_str("<br />\n");
+                        i = skip_spaces(bytes, i + 2);
                     }
-                    i = skip_spaces(bytes, i + 2);
                 } else if i + 1 < bytes.len() && is_ascii_punct(bytes[i + 1]) {
                     push_escaped_byte(cur, bytes[i + 1]);
                     i += 2;
@@ -1465,10 +1526,11 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                 escape_html(&src[run..i], cur);
                 if ast_mode {
                     if let Some((val, new_i)) = code_span_value(src, bytes, i) {
-                        flush!();
+                        flush!(i);
                         let si = sem.len() as u32;
                         sem.push(Sem::Code(val));
-                        list.push(Node::Sem(si));
+                        let cid = list.push(Node::Sem(si));
+                        cspan!(cid, i, new_i);
                         seg = cur.len();
                         i = new_i;
                     } else {
@@ -1512,10 +1574,11 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                         } else {
                             format!("mailto:{content}")
                         };
-                        flush!();
+                        flush!(i);
                         let si = sem.len() as u32;
                         sem.push(Sem::Autolink { url, text: content.to_owned() });
-                        list.push(Node::Sem(si));
+                        let aid = list.push(Node::Sem(si));
+                        cspan!(aid, i, i + consumed);
                         seg = cur.len();
                     } else {
                         cur.push_str(&html);
@@ -1523,10 +1586,11 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                     i += consumed;
                 } else if let Some(end) = try_raw_html(bytes, i) {
                     if ast_mode {
-                        flush!();
+                        flush!(i);
                         let si = sem.len() as u32;
                         sem.push(Sem::Html(src[i..end].to_owned()));
-                        list.push(Node::Sem(si));
+                        let hid = list.push(Node::Sem(si));
+                        cspan!(hid, i, end);
                         seg = cur.len();
                     } else if tf {
                         crate::render::filter_html(&src[i..end], cur);
@@ -1543,7 +1607,7 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
             b'*' | b'_' => {
                 let ch = bytes[i];
                 escape_html(&src[run..i], cur);
-                flush!();
+                flush!(i);
                 let count = bytes[i..].iter().take_while(|&&b| b == ch).count();
                 let before = src[..i].chars().next_back();
                 let after = src[i + count..].chars().next();
@@ -1555,6 +1619,8 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                     can_open,
                     can_close,
                 });
+                #[cfg(feature = "ast")]
+                cspan!(idx, i, i + count);
                 stack.push(StackItem::Emph(idx));
                 i += count;
                 run = i;
@@ -1563,7 +1629,7 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
             // 3+ tildes are literal. Only reachable when ST is on.
             b'~' if ST => {
                 escape_html(&src[run..i], cur);
-                flush!();
+                flush!(i);
                 let count = bytes[i..].iter().take_while(|&&b| b == b'~').count();
                 if count <= 2 {
                     let before = src[..i].chars().next_back();
@@ -1585,8 +1651,10 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
             }
             b'[' => {
                 escape_html(&src[run..i], cur);
-                flush!();
+                flush!(i);
                 let node = list.push(Node::Tag("["));
+                #[cfg(feature = "ast")]
+                cspan!(node, i, i + 1);
                 stack.push(StackItem::Bracket {
                     node,
                     image: false,
@@ -1598,8 +1666,10 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
             }
             b'!' if bytes.get(i + 1) == Some(&b'[') => {
                 escape_html(&src[run..i], cur);
-                flush!();
+                flush!(i);
                 let node = list.push(Node::Tag("!["));
+                #[cfg(feature = "ast")]
+                cspan!(node, i, i + 2);
                 stack.push(StackItem::Bracket {
                     node,
                     image: true,
@@ -1611,8 +1681,10 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
             }
             b']' => {
                 escape_html(&src[run..i], cur);
-                flush!();
+                flush!(i);
                 let rb = list.push(Node::Tag("]"));
+                #[cfg(feature = "ast")]
+                cspan!(rb, i, i + 1);
                 let rb_src = i;
                 i += 1;
                 look_for_link_or_image(
@@ -1622,6 +1694,10 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                 // A resolved link/image appended its tag to `cur` and spanned it
                 // directly; the next text segment starts after it.
                 seg = cur.len();
+                #[cfg(feature = "ast")]
+                {
+                    cseg = i;
+                }
                 run = i;
             }
             b'\n' => {
@@ -1631,17 +1707,26 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                 let hard = line.len() - trimmed.len() >= 2;
                 escape_html(trimmed, cur);
                 if (hard || HW) && ast_mode {
-                    flush!();
+                    // The text node ends before the trailing spaces; the break
+                    // spans them through the line ending.
+                    let text_end = run + trimmed.len();
+                    flush!(text_end);
                     let si = sem.len() as u32;
                     sem.push(Sem::Break);
-                    list.push(Node::Sem(si));
+                    let brk = list.push(Node::Sem(si));
+                    cspan!(brk, text_end, i + 1);
                     seg = cur.len();
+                    i = skip_spaces(bytes, i + 1);
+                    #[cfg(feature = "ast")]
+                    {
+                        cseg = i;
+                    }
                 } else {
                     // Soft break stays as text "\n"; in AST mode it is folded into
                     // the surrounding text node.
                     cur.push_str(if hard || HW { "<br />\n" } else { "\n" });
+                    i = skip_spaces(bytes, i + 1);
                 }
-                i = skip_spaces(bytes, i + 1);
                 run = i;
             }
             // GFM autolinks in delimiter-run text (when on). The URL trigger
@@ -1700,7 +1785,7 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
     // Trailing spaces at the very end of a block are dropped (no following line
     // to form a hard break).
     escape_html(src[run..].trim_end_matches(' '), cur);
-    flush!();
+    flush!(i);
 
     process_emphasis(list, stack, 0);
     // SPIKE: materialize owned inline nodes instead of rendering to `out`. The
@@ -1787,6 +1872,10 @@ fn look_for_link_or_image(
                 },
             });
             list.slots[op_node].node = Node::Sem(si);
+            #[cfg(feature = "ast")]
+            {
+                list.slots[op_node].cspan = ((text_src - 2) as u32, new_i as u32);
+            }
         } else {
             // Alt text = the rendered link text with tags stripped.
             let mut inner = String::new();
@@ -1842,6 +1931,11 @@ fn look_for_link_or_image(
             });
             list.slots[op_node].node = Node::Sem(si);
             list.slots[rb_node].node = Node::LinkClose;
+            #[cfg(feature = "ast")]
+            {
+                // The LinkOpen carries the whole link's span (`[`…end).
+                list.slots[op_node].cspan = ((text_src - 1) as u32, new_i as u32);
+            }
         } else {
             // Build the <a> open tag into the shared buffer (no per-link allocation).
             let start = cur.len();
@@ -2267,8 +2361,21 @@ fn process_emphasis(list: &mut List, stack: &mut Vec<StackItem>, start: usize) {
                         ("<em>", "</em>", 1)
                     }
                 };
-                list.splice_after(onode, Node::Tag(open_tag));
-                list.splice_before(cnode, Node::Tag(close_tag));
+                let otag = list.splice_after(onode, Node::Tag(open_tag));
+                let ctag = list.splice_before(cnode, Node::Tag(close_tag));
+                #[cfg(not(feature = "ast"))]
+                let _ = (otag, ctag);
+                // SPIKE (`ast`): emphasis markers are 1 byte each. The opener
+                // consumes its rightmost `use_delims`; the closer its leftmost.
+                #[cfg(feature = "ast")]
+                {
+                    let ostart = list.slots[onode].cspan.0 as usize;
+                    let o_end = ostart + ocount;
+                    list.slots[otag].cspan = ((o_end - use_delims) as u32, o_end as u32);
+                    let cstart = list.slots[cnode].cspan.0 as usize;
+                    let c_start = cstart + (corig - ccount);
+                    list.slots[ctag].cspan = (c_start as u32, (c_start + use_delims) as u32);
+                }
                 set_count(list, onode, ocount - use_delims);
                 set_count(list, cnode, ccount - use_delims);
 
