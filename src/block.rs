@@ -531,7 +531,20 @@ impl<'a> Parser<'a> {
 
     #[cfg(feature = "ast")]
     fn emit_defs(&mut self, before: usize, defs: Vec<(String, String, Option<String>)>) {
-        for (label, dest, title) in defs {
+        // For a top-level paragraph (contiguous in source), recover each def's
+        // exact source span; otherwise approximate with the paragraph's span.
+        let (ss, se) = (self.nodes[before].src_start, self.nodes[before].src_end);
+        let spans = if self.nodes[before].parent == 0
+            && ss != u32::MAX
+            && ss < se
+            && (se as usize) <= self.source.len()
+        {
+            let s = crate::inline::take_ref_def_spans(&self.source[ss as usize..se as usize]);
+            (s.len() == defs.len()).then_some(s)
+        } else {
+            None
+        };
+        for (i, (label, dest, title)) in defs.into_iter().enumerate() {
             let identifier = crate::inline::normalize_label(&label).into_owned();
             let di = self.defs.len() as u32;
             self.defs.push(DefData {
@@ -544,9 +557,16 @@ impl<'a> Parser<'a> {
             });
             let dn = self.insert_before(before, Kind::Definition);
             self.nodes[dn].def = di;
-            // Approximate span = the owning paragraph's (exact for a single def).
-            self.nodes[dn].src_start = self.nodes[before].src_start;
-            self.nodes[dn].src_end = self.nodes[before].src_end;
+            match &spans {
+                Some(sp) => {
+                    self.nodes[dn].src_start = ss + sp[i].0 as u32;
+                    self.nodes[dn].src_end = ss + sp[i].1 as u32;
+                }
+                None => {
+                    self.nodes[dn].src_start = self.nodes[before].src_start;
+                    self.nodes[dn].src_end = self.nodes[before].src_end;
+                }
+            }
             self.refmap.entry(identifier).or_insert((dest, title));
         }
     }

@@ -2213,18 +2213,36 @@ pub fn take_ref_defs(text: &str) -> (usize, Vec<(String, String, Option<String>)
     let bytes = text.as_bytes();
     let mut pos = 0;
     let mut defs = Vec::new();
-    while let Some((end, label, dest, title)) = parse_ref_def(text, bytes, pos) {
+    while let Some((end, label, dest, title, _, _)) = parse_ref_def(text, bytes, pos) {
         defs.push((label, dest, title));
         pos = end;
     }
     (pos, defs)
 }
 
+/// SPIKE (`ast`): the source byte span `(start, end)` of each leading reference
+/// definition (start at `[`, end after the last significant char — no trailing
+/// whitespace/newline), for the `definition` node's unist `position`.
+#[cfg(feature = "ast")]
+pub fn take_ref_def_spans(text: &str) -> Vec<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut pos = 0;
+    let mut spans = Vec::new();
+    while let Some((end, _, _, _, bracket, content_end)) = parse_ref_def(text, bytes, pos) {
+        spans.push((bracket, content_end));
+        pos = end;
+    }
+    spans
+}
+
+/// Returns `(end, label, dest, title, bracket_start, content_end)`. `bracket_start`
+/// is the `[`; `content_end` is just past the last significant byte (title, or
+/// dest when untitled) — both for AST `position`.
 fn parse_ref_def(
     text: &str,
     bytes: &[u8],
     start: usize,
-) -> Option<(usize, String, String, Option<String>)> {
+) -> Option<(usize, String, String, Option<String>, usize, usize)> {
     let mut j = start;
     let mut ind = 0;
     while ind < 3 && bytes.get(j) == Some(&b' ') {
@@ -2234,6 +2252,7 @@ fn parse_ref_def(
     if bytes.get(j) != Some(&b'[') {
         return None;
     }
+    let bracket = j;
     let (label, after) = read_bracket_label(text, bytes, j)?;
     if bytes.get(after) != Some(&b':') || normalize_label(label).is_empty() {
         return None;
@@ -2255,13 +2274,15 @@ fn parse_ref_def(
             label.to_string(),
             dest.to_string(),
             title.map(String::from),
+            bracket,
+            after_title,
         ));
     }
     // A trailing-junk title invalidates only the title, not the whole def.
     if title.is_some()
         && let Some(end) = ref_line_end(bytes, dj)
     {
-        return Some((end, label.to_string(), dest.to_string(), None));
+        return Some((end, label.to_string(), dest.to_string(), None, bracket, dj));
     }
     None
 }
