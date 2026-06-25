@@ -127,3 +127,44 @@ fn tagfilter() {
     // Off by default (inline raw HTML passes through verbatim).
     assert_eq!(to_html("a <title> b\n"), "<p>a <title> b</p>\n");
 }
+
+#[test]
+fn tables() {
+    let t = Options {
+        tables: true,
+        ..Options::default()
+    };
+    let go = |s: &str| to_html_with(s, &t);
+    // Basic table: thead + tbody, cells parsed as inline (GFM §4.10).
+    assert_eq!(
+        go("| foo | bar |\n| --- | --- |\n| baz | bim |\n"),
+        "<table>\n<thead>\n<tr>\n<th>foo</th>\n<th>bar</th>\n</tr>\n</thead>\n\
+         <tbody>\n<tr>\n<td>baz</td>\n<td>bim</td>\n</tr>\n</tbody>\n</table>\n"
+    );
+    // Alignment via the delimiter row; outer pipes optional on data rows.
+    assert_eq!(
+        go("| abc | defghi |\n:-: | -----------:\nbar | baz\n"),
+        "<table>\n<thead>\n<tr>\n<th align=\"center\">abc</th>\n\
+         <th align=\"right\">defghi</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n\
+         <td align=\"center\">bar</td>\n<td align=\"right\">baz</td>\n</tr>\n\
+         </tbody>\n</table>\n"
+    );
+    // `\|` is an escaped pipe (→ `|`) resolved before inline parsing (ex. 200).
+    assert_eq!(
+        go("| f\\|oo |\n| ------ |\n| b `\\|` az |\n"),
+        "<table>\n<thead>\n<tr>\n<th>f|oo</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n\
+         <td>b <code>|</code> az</td>\n</tr>\n</tbody>\n</table>\n"
+    );
+    // Header + delimiter with no data rows → no <tbody>.
+    assert_eq!(
+        go("| abc | def |\n| --- | --- |\n"),
+        "<table>\n<thead>\n<tr>\n<th>abc</th>\n<th>def</th>\n</tr>\n</thead>\n</table>\n"
+    );
+    // A column-count mismatch is not a table.
+    assert_eq!(go("| a | b |\n| - |\n"), "<p>| a | b |\n| - |</p>\n");
+    // Off by default.
+    assert_eq!(
+        to_html("| a | b |\n| - | - |\n"),
+        "<p>| a | b |\n| - | - |</p>\n"
+    );
+}

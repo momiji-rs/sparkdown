@@ -7,6 +7,7 @@
 use crate::block::{Kind, Tree};
 use crate::inline::{Scratch, render_inline};
 use crate::scan::{escape_block_mask, memchr1};
+use std::borrow::Cow;
 
 /// Render a parsed [`Tree`] to an HTML string.
 pub fn render(tree: &Tree) -> String {
@@ -143,7 +144,126 @@ fn render_node(tree: &Tree, idx: usize, out: &mut String, scratch: &mut Scratch)
             out.push_str("</li>");
             cr(out);
         }
+        Kind::Table => render_table(tree, idx, out, scratch),
     }
+}
+
+/// Per-column GFM table alignment.
+#[derive(Clone, Copy)]
+enum Align {
+    None,
+    Left,
+    Center,
+    Right,
+}
+
+/// Split a table row into raw cell slices, honoring `\|` escapes and dropping a
+/// single optional leading/trailing pipe.
+fn split_row_cells(line: &str) -> Vec<&str> {
+    let t = line.trim_matches([' ', '\t']);
+    let b = t.as_bytes();
+    let mut cells = Vec::new();
+    let mut start = 0;
+    let mut esc = false;
+    for (k, &c) in b.iter().enumerate() {
+        if esc {
+            esc = false;
+        } else if c == b'\\' {
+            esc = true;
+        } else if c == b'|' {
+            cells.push(&t[start..k]);
+            start = k + 1;
+        }
+    }
+    cells.push(&t[start..]);
+    if cells.first().is_some_and(|c| c.is_empty()) {
+        cells.remove(0);
+    }
+    if cells.len() > 1 && cells.last().is_some_and(|c| c.is_empty()) {
+        cells.pop();
+    }
+    cells
+}
+
+/// Parse the delimiter row into per-column alignments.
+fn parse_aligns(delim: &str) -> Vec<Align> {
+    split_row_cells(delim)
+        .iter()
+        .map(|c| {
+            let c = c.trim();
+            match (c.starts_with(':'), c.ends_with(':')) {
+                (true, true) => Align::Center,
+                (true, false) => Align::Left,
+                (false, true) => Align::Right,
+                (false, false) => Align::None,
+            }
+        })
+        .collect()
+}
+
+/// Emit one table row's cells as `<th>`/`<td>` (`tag`), padded/truncated to the
+/// column count and tagged with alignment.
+fn emit_row(
+    tree: &Tree,
+    row: &str,
+    aligns: &[Align],
+    tag: &str,
+    out: &mut String,
+    scratch: &mut Scratch,
+) {
+    let cells = split_row_cells(row);
+    for (col, &align) in aligns.iter().enumerate() {
+        let raw = cells.get(col).map_or("", |c| c.trim());
+        // GFM unescapes `\|` → `|` at the table layer, before inline parsing —
+        // so a pipe inside a code span renders as `|`, not `\|`.
+        let cell = if raw.contains("\\|") {
+            Cow::Owned(raw.replace("\\|", "|"))
+        } else {
+            Cow::Borrowed(raw)
+        };
+        out.push('<');
+        out.push_str(tag);
+        out.push_str(match align {
+            Align::None => "",
+            Align::Left => " align=\"left\"",
+            Align::Center => " align=\"center\"",
+            Align::Right => " align=\"right\"",
+        });
+        out.push('>');
+        render_inline(&cell, out, &tree.refmap, scratch, tree.opts);
+        out.push_str("</");
+        out.push_str(tag);
+        out.push_str(">\n");
+    }
+}
+
+/// Render a GFM pipe table. Content is `header\ndelimiter\n[data rows…]`.
+fn render_table(tree: &Tree, idx: usize, out: &mut String, scratch: &mut Scratch) {
+    let content = tree.content(idx);
+    let mut lines = content.lines().filter(|l| !l.trim().is_empty());
+    let (Some(header), Some(delim)) = (lines.next(), lines.next()) else {
+        return;
+    };
+    let aligns = parse_aligns(delim);
+    cr(out);
+    out.push_str("<table>\n<thead>\n<tr>\n");
+    emit_row(tree, header, &aligns, "th", out, scratch);
+    out.push_str("</tr>\n</thead>\n");
+    let mut body_open = false;
+    for row in lines {
+        if !body_open {
+            out.push_str("<tbody>\n");
+            body_open = true;
+        }
+        out.push_str("<tr>\n");
+        emit_row(tree, row, &aligns, "td", out, scratch);
+        out.push_str("</tr>\n");
+    }
+    if body_open {
+        out.push_str("</tbody>\n");
+    }
+    out.push_str("</table>");
+    cr(out);
 }
 
 /// GFM task list: if `para` is the first child of a list item and begins with a
