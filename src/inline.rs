@@ -9,6 +9,7 @@
 //! (inline + reference, the latter via the [`RefMap`]).
 
 use crate::entities::{named, remap_numeric};
+use crate::options::Options;
 use crate::render::escape_html;
 use crate::scan::{find_emph, find_inline, find_stream};
 use std::borrow::Cow;
@@ -767,7 +768,9 @@ impl Scratch {
 /// Stream inline content with no emphasis or link delimiters straight to
 /// `out`: zero allocation, single pass, no node list. Mirrors the text-handling
 /// arms of [`render_inline`] (kept in sync by the conformance suite).
-fn stream_inline(src: &str, out: &mut String) {
+// `HW` (hard_wraps) is a const generic so the default `HW = false` folds
+// `if hard || HW` back to the original `if hard` — zero per-newline cost.
+fn stream_inline<const HW: bool>(src: &str, out: &mut String) {
     let bytes = src.as_bytes();
     let mut i = 0usize;
     let mut run = 0usize;
@@ -831,7 +834,7 @@ fn stream_inline(src: &str, out: &mut String) {
                 let trimmed = line.trim_end_matches(' ');
                 let hard = line.len() - trimmed.len() >= 2;
                 escape_html(trimmed, out);
-                out.push_str(if hard { "<br />\n" } else { "\n" });
+                out.push_str(if hard || HW { "<br />\n" } else { "\n" });
                 i = skip_spaces(bytes, i + 1);
                 run = i;
             }
@@ -843,12 +846,34 @@ fn stream_inline(src: &str, out: &mut String) {
 }
 
 /// Parse `src` (a block's raw inline text) to HTML, appending to `out`.
+/// Parse `src` (a block's raw inline text) to HTML, appending to `out`. Picks
+/// the monomorphized inline renderer once per call so options resolved at this
+/// boundary (here, `hard_wraps`) cost nothing in the byte loop.
+pub fn render_inline(
+    src: &str,
+    out: &mut String,
+    refmap: &RefMap,
+    scratch: &mut Scratch,
+    opts: Options,
+) {
+    if opts.hard_wraps {
+        render_inline_impl::<true>(src, out, refmap, scratch);
+    } else {
+        render_inline_impl::<false>(src, out, refmap, scratch);
+    }
+}
+
 #[allow(unused_assignments)] // `seg` is updated at segment ends; the last is unused
-pub fn render_inline(src: &str, out: &mut String, refmap: &RefMap, scratch: &mut Scratch) {
+fn render_inline_impl<const HW: bool>(
+    src: &str,
+    out: &mut String,
+    refmap: &RefMap,
+    scratch: &mut Scratch,
+) {
     let bytes = src.as_bytes();
     // Fast path: no emphasis/link delimiters → stream directly, no allocation.
     if find_emph(bytes).is_none() {
-        stream_inline(src, out);
+        stream_inline::<HW>(src, out);
         return;
     }
     scratch.reset();
@@ -993,7 +1018,7 @@ pub fn render_inline(src: &str, out: &mut String, refmap: &RefMap, scratch: &mut
                 let trimmed = line.trim_end_matches(' ');
                 let hard = line.len() - trimmed.len() >= 2;
                 escape_html(trimmed, cur);
-                cur.push_str(if hard { "<br />\n" } else { "\n" });
+                cur.push_str(if hard || HW { "<br />\n" } else { "\n" });
                 i = skip_spaces(bytes, i + 1);
                 run = i;
             }
@@ -1499,7 +1524,13 @@ mod tests {
 
     fn inline(s: &str) -> String {
         let mut out = String::new();
-        render_inline(s, &mut out, &RefMap::new(), &mut Scratch::new());
+        render_inline(
+            s,
+            &mut out,
+            &RefMap::new(),
+            &mut Scratch::new(),
+            crate::options::Options::default(),
+        );
         out
     }
 
@@ -1594,11 +1625,23 @@ mod tests {
         );
         let mut sc = Scratch::new();
         let mut out = String::new();
-        render_inline("[foo]", &mut out, &map, &mut sc);
+        render_inline(
+            "[foo]",
+            &mut out,
+            &map,
+            &mut sc,
+            crate::options::Options::default(),
+        );
         assert_eq!(out, "<a href=\"/url\" title=\"t\">foo</a>");
 
         let mut out2 = String::new();
-        render_inline("[bar][foo]", &mut out2, &map, &mut sc);
+        render_inline(
+            "[bar][foo]",
+            &mut out2,
+            &map,
+            &mut sc,
+            crate::options::Options::default(),
+        );
         assert_eq!(out2, "<a href=\"/url\" title=\"t\">bar</a>");
     }
 }

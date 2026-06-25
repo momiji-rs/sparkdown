@@ -38,37 +38,45 @@ mod block;
 mod bump;
 mod entities;
 mod inline;
+mod options;
 mod render;
 mod scan;
 #[cfg(feature = "wasm")]
 mod wasm;
+
+pub use options::Options;
 
 #[cfg(feature = "arena")]
 pub use arena::ScopedAlloc;
 
 /// Render CommonMark `src` to HTML (full CommonMark 0.31.2).
 ///
-/// For repeated rendering, prefer a reusable [`Renderer`] — it keeps the
-/// working buffers warm across calls.
-#[cfg(not(feature = "arena"))]
+/// For opt-in GFM/extensions use [`to_html_with`]; for repeated rendering use a
+/// reusable [`Renderer`].
 pub fn to_html(src: &str) -> String {
-    let tree = block::parse(src);
-    render::render(&tree)
+    render_html(src, Options::default())
+}
+
+/// Render `src` to HTML with opt-in [`Options`] (GFM, hard wraps, …). With
+/// `Options::default()` this is exactly [`to_html`] — disabled features are
+/// resolved once per render, never in the byte loop.
+pub fn to_html_with(src: &str, opts: &Options) -> String {
+    render_html(src, *opts)
+}
+
+#[cfg(not(feature = "arena"))]
+fn render_html(src: &str, opts: Options) -> String {
+    render::render(&block::parse_with_opts(src, opts))
 }
 
 /// With the `arena` feature (and [`ScopedAlloc`] installed as the
 /// `#[global_allocator]`), the whole parse+render runs inside a bump scope:
-/// every intermediate allocation is a pointer bump and is freed wholesale.
-/// The result `String` is the one thing that must outlive the arena, so it is
-/// copied to the system allocator before the reset. Inert if `ScopedAlloc`
-/// isn't installed (allocations forward to System).
+/// every intermediate allocation is a pointer bump and is freed wholesale. The
+/// result `String` is copied to the system allocator before the reset.
 #[cfg(feature = "arena")]
-pub fn to_html(src: &str) -> String {
+fn render_html(src: &str, opts: Options) -> String {
     let guard = arena::Scope::enter();
-    let html = {
-        let tree = block::parse(src);
-        render::render(&tree)
-    };
+    let html = render::render(&block::parse_with_opts(src, opts));
     let outermost = arena::leave_no_reset();
     core::mem::forget(guard); // we left manually
     if outermost {
@@ -99,18 +107,25 @@ pub struct Renderer {
     nodes: Vec<block::Node>,
     buf: String,
     refmap: inline::RefMap,
+    opts: Options,
 }
 
 impl Renderer {
-    /// Create an empty context; its buffers grow to fit the first render and
-    /// are reused thereafter.
+    /// Create an empty context (CommonMark, no options); its buffers grow to
+    /// fit the first render and are reused thereafter.
     pub fn new() -> Self {
+        Self::with_options(Options::default())
+    }
+
+    /// Create a context with opt-in [`Options`] applied to every render.
+    pub fn with_options(opts: Options) -> Self {
         Renderer {
             scratch: inline::Scratch::new(),
             out: String::new(),
             nodes: Vec::new(),
             buf: String::new(),
             refmap: inline::RefMap::new(),
+            opts,
         }
     }
 
@@ -121,7 +136,7 @@ impl Renderer {
         let nodes = core::mem::take(&mut self.nodes);
         let buf = core::mem::take(&mut self.buf);
         let refmap = core::mem::take(&mut self.refmap);
-        let tree = block::parse_with(src, nodes, buf, refmap);
+        let tree = block::parse_with(src, self.opts, nodes, buf, refmap);
         render::render_with(&tree, &mut self.out, &mut self.scratch);
         (self.nodes, self.buf, self.refmap) = tree.recycle();
         &self.out

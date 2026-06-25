@@ -7,6 +7,7 @@
 //! lazily at render time.
 
 use crate::inline::{RefMap, take_ref_defs};
+use crate::options::Options;
 use crate::scan::memchr1;
 
 const CODE_INDENT: usize = 4;
@@ -101,6 +102,7 @@ pub struct Tree<'a> {
     pub root: usize,
     pub refmap: RefMap,
     pub source_len: usize,
+    pub opts: Options,
     /// The original input; nodes with `content_src` index into it (borrowed).
     source: &'a str,
     /// Buffer for assembled text (block quotes, lists, code/HTML literals).
@@ -148,15 +150,27 @@ impl Tree<'_> {
     }
 }
 
-/// Parse `src` into a block tree plus its link reference definitions.
+/// Parse `src` (CommonMark, no options) into a block tree plus its link
+/// reference definitions.
 pub fn parse(src: &str) -> Tree<'_> {
-    Parser::new().parse(src)
+    parse_with_opts(src, Options::default())
 }
 
-/// Like [`parse`], but reuses the given (recycled) buffers instead of
+/// Parse `src` with opt-in [`Options`].
+pub fn parse_with_opts(src: &str, opts: Options) -> Tree<'_> {
+    Parser::with(Vec::new(), String::new(), RefMap::new(), opts).parse(src)
+}
+
+/// Like [`parse_with_opts`], but reuses the given (recycled) buffers instead of
 /// allocating fresh ones. Pair with [`Tree::recycle`] for repeated parsing.
-pub fn parse_with(src: &str, nodes: Vec<Node>, buf: String, refmap: RefMap) -> Tree<'_> {
-    Parser::with(nodes, buf, refmap).parse(src)
+pub fn parse_with(
+    src: &str,
+    opts: Options,
+    nodes: Vec<Node>,
+    buf: String,
+    refmap: RefMap,
+) -> Tree<'_> {
+    Parser::with(nodes, buf, refmap, opts).parse(src)
 }
 
 fn peek(line: &[u8], i: usize) -> Option<u8> {
@@ -191,16 +205,13 @@ struct Parser<'a> {
     indented: bool,
     blank: bool,
     partially_consumed_tab: bool,
+    opts: Options,
 }
 
 impl<'a> Parser<'a> {
-    fn new() -> Self {
-        Self::with(Vec::new(), String::new(), RefMap::new())
-    }
-
     /// Build a parser from recycled buffers (cleared and reused), so repeated
     /// parsing avoids re-allocating the node arena, text buffer, and ref map.
-    fn with(mut nodes: Vec<Node>, mut buf: String, mut refmap: RefMap) -> Self {
+    fn with(mut nodes: Vec<Node>, mut buf: String, mut refmap: RefMap, opts: Options) -> Self {
         nodes.clear();
         buf.clear();
         refmap.clear();
@@ -225,6 +236,7 @@ impl<'a> Parser<'a> {
             indented: false,
             blank: false,
             partially_consumed_tab: false,
+            opts,
         }
     }
 
@@ -574,6 +586,7 @@ impl<'a> Parser<'a> {
             root: 0,
             refmap: self.refmap,
             source_len: src.len(),
+            opts: self.opts,
             source: src,
             buf: self.buf,
         }

@@ -54,7 +54,7 @@ fn render_node(tree: &Tree, idx: usize, out: &mut String, scratch: &mut Scratch)
                 cr(out);
                 out.push_str("<p>");
             }
-            render_inline(tree.content(idx), out, &tree.refmap, scratch);
+            render_inline(tree.content(idx), out, &tree.refmap, scratch, tree.opts);
             if !tight {
                 out.push_str("</p>");
                 cr(out);
@@ -66,7 +66,7 @@ fn render_node(tree: &Tree, idx: usize, out: &mut String, scratch: &mut Scratch)
             out.push_str("<h");
             out.push((b'0' + level) as char);
             out.push('>');
-            render_inline(tree.content(idx), out, &tree.refmap, scratch);
+            render_inline(tree.content(idx), out, &tree.refmap, scratch, tree.opts);
             out.push_str("</h");
             out.push((b'0' + level) as char);
             out.push('>');
