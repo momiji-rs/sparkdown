@@ -7,7 +7,7 @@
 #   Package → Settings → Trusted Publisher → GitHub Actions
 #   Repository: momiji-rs/sparkdown   Workflow: release-npm.yml
 # Then publish by pushing a tag:  git tag v0.0.2 && git push origin v0.0.2
-name: Publish Package
+name: Release
 
 on:
   push:
@@ -20,6 +20,35 @@ permissions:
   contents: read
 
 jobs:
+  # Attach the raw, optimized wasm modules (+ SHA-256 sums) to the GitHub Release
+  # for non-JS hosts (wasmtime, wazero, Workers, …) that want the bare module.
+  github-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release + upload assets
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Install binaryen (wasm-opt)
+        run: sudo apt-get update && sudo apt-get install -y binaryen
+      - name: Build + optimize both wasm modules
+        run: |
+          RF="-C target-feature=+simd128,+bulk-memory"
+          O="-O3 --enable-simd --enable-bulk-memory --strip-debug --strip-producers"
+          RUSTFLAGS="$RF" cargo build --target wasm32-unknown-unknown --release --features wasm
+          wasm-opt $O target/wasm32-unknown-unknown/release/sparkdown.wasm -o sparkdown.wasm
+          RUSTFLAGS="$RF" cargo build --target wasm32-unknown-unknown --release --features wasm,gfm
+          wasm-opt $O target/wasm32-unknown-unknown/release/sparkdown.wasm -o sparkdown-gfm.wasm
+          sha256sum sparkdown.wasm sparkdown-gfm.wasm > SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            sparkdown.wasm
+            sparkdown-gfm.wasm
+            SHA256SUMS.txt
+
   publish:
     runs-on: ubuntu-latest
     strategy:
