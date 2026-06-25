@@ -40,6 +40,8 @@ mod entities;
 mod inline;
 mod render;
 mod scan;
+#[cfg(feature = "wasm")]
+mod wasm;
 
 #[cfg(feature = "arena")]
 pub use arena::ScopedAlloc;

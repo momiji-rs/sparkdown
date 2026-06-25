@@ -1,0 +1,40 @@
+{
+  "name": "@momiji-rs/sparkdown",
+  "version": "0.0.1",
+  "description": "Fast, standards-first CommonMark → HTML (100% CommonMark 0.31.2), as WASI-free WebAssembly. Zero dependencies; runs in Node, browsers, bundlers, Deno, and edge runtimes.",
+  "type": "module",
+  "main": "./sparkdown.mjs",
+  "module": "./sparkdown.mjs",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./sparkdown.mjs"
+    }
+  },
+  "files": ["sparkdown.mjs", "wasm-inline.mjs", "index.d.ts", "README.md"],
+  "sideEffects": false,
+  "keywords": [
+    "markdown",
+    "commonmark",
+    "html",
+    "wasm",
+    "webassembly",
+    "parser",
+    "renderer"
+  ],
+  "license": "MIT",
+  "author": "rubyrs contributors",
+  "homepage": "https://github.com/momiji-rs/sparkdown#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/momiji-rs/sparkdown.git",
+    "directory": "npm"
+  },
+  "bugs": {
+    "url": "https://github.com/momiji-rs/sparkdown/issues"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

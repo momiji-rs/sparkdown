@@ -98,7 +98,15 @@ pub(crate) fn find_escape(hay: &[u8]) -> Option<usize> {
         // SAFETY: SSE2 is baseline on x86_64; reads are bounded by `i + 16 <= len`.
         unsafe { find_escape_sse2(hay) }
     }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+        find_escape_wasm(hay)
+    }
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    )))]
     {
         memchr4(hay, b'&', b'<', b'>', b'"')
     }
@@ -205,7 +213,15 @@ pub(crate) fn escape_block_mask(bytes: &[u8], i: usize) -> u16 {
     {
         unsafe { escape_block_mask_sse2(bytes.as_ptr().add(i)) }
     }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+        escape_block_mask_wasm(bytes.as_ptr().wrapping_add(i))
+    }
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    )))]
     {
         let mut m = 0u16;
         for b in 0..16 {
@@ -319,7 +335,15 @@ fn find_in_set(hay: &[u8], lo: &[u8; 16], hi: &[u8; 16]) -> Option<usize> {
             hay.iter().position(|&b| in_set(b, lo, hi))
         }
     }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+        find_in_set_wasm(hay, lo, hi)
+    }
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    )))]
     {
         hay.iter().position(|&b| in_set(b, lo, hi))
     }
@@ -380,6 +404,90 @@ unsafe fn find_in_set_ssse3(hay: &[u8], lo: &[u8; 16], hi: &[u8; 16]) -> Option<
             // bits set where m != 0
             !_mm_movemask_epi8(_mm_cmpeq_epi8(m, _mm_setzero_si128())) & 0xFFFF
         };
+        if mask != 0 {
+            return Some(i + mask.trailing_zeros() as usize);
+        }
+        i += 16;
+    }
+    while i < hay.len() {
+        if in_set(hay[i], lo, hi) {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+// ---- WebAssembly SIMD (v128) — same algorithms as NEON/SSE. `i8x16_swizzle`
+// is the table lookup (pshufb/vqtbl) and `i8x16_bitmask` the movemask. Enabled
+// when built with `-C target-feature=+simd128`. ------------------------------
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+fn find_escape_wasm(hay: &[u8]) -> Option<usize> {
+    use core::arch::wasm32::*;
+    let (amp, lt, gt, qt) = (
+        u8x16_splat(b'&'),
+        u8x16_splat(b'<'),
+        u8x16_splat(b'>'),
+        u8x16_splat(b'"'),
+    );
+    let mut i = 0;
+    while i + 16 <= hay.len() {
+        // SAFETY: bounded by `i + 16 <= len`.
+        let v = unsafe { v128_load(hay.as_ptr().add(i) as *const v128) };
+        let m = v128_or(
+            v128_or(i8x16_eq(v, amp), i8x16_eq(v, lt)),
+            v128_or(i8x16_eq(v, gt), i8x16_eq(v, qt)),
+        );
+        let mask = i8x16_bitmask(m);
+        if mask != 0 {
+            return Some(i + mask.trailing_zeros() as usize);
+        }
+        i += 16;
+    }
+    while i < hay.len() {
+        if matches!(hay[i], b'&' | b'<' | b'>' | b'"') {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+fn escape_block_mask_wasm(p: *const u8) -> u16 {
+    use core::arch::wasm32::*;
+    // SAFETY: the caller guarantees 16 readable bytes at `p`.
+    let v = unsafe { v128_load(p as *const v128) };
+    let m = v128_or(
+        v128_or(
+            i8x16_eq(v, u8x16_splat(b'&')),
+            i8x16_eq(v, u8x16_splat(b'<')),
+        ),
+        v128_or(
+            i8x16_eq(v, u8x16_splat(b'>')),
+            i8x16_eq(v, u8x16_splat(b'"')),
+        ),
+    );
+    i8x16_bitmask(m)
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+fn find_in_set_wasm(hay: &[u8], lo: &[u8; 16], hi: &[u8; 16]) -> Option<usize> {
+    use core::arch::wasm32::*;
+    // SAFETY: the tables are 16 bytes.
+    let lo_t = unsafe { v128_load(lo.as_ptr() as *const v128) };
+    let hi_t = unsafe { v128_load(hi.as_ptr() as *const v128) };
+    let zero = u8x16_splat(0);
+    let lo_mask = u8x16_splat(0x0F);
+    let mut i = 0;
+    while i + 16 <= hay.len() {
+        // SAFETY: bounded by `i + 16 <= len`.
+        let v = unsafe { v128_load(hay.as_ptr().add(i) as *const v128) };
+        let lo_m = i8x16_swizzle(lo_t, v128_and(v, lo_mask));
+        let hi_m = i8x16_swizzle(hi_t, u8x16_shr(v, 4));
+        let m = v128_and(lo_m, hi_m);
+        let mask = i8x16_bitmask(v128_not(i8x16_eq(m, zero)));
         if mask != 0 {
             return Some(i + mask.trailing_zeros() as usize);
         }

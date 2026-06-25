@@ -10,6 +10,11 @@ keywords = ["markdown", "commonmark", "html", "parser"]
 categories = ["text-processing", "parser-implementations"]
 authors = ["rubyrs contributors"]
 
+# `rlib` for normal Rust dependents; `cdylib` so `--features wasm` emits a
+# loadable `.wasm` on `wasm32-unknown-unknown`.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 # Empty [workspace] table: makes sparkdown its own workspace root so Cargo
 # does not attach it to the parent rostdown package during stage-1
 # scaffolding (this crate currently lives on a branch inside the rostdown
@@ -23,6 +28,9 @@ authors = ["rubyrs contributors"]
 arena = []
 # Exposes profile_phases() for benchmarks (parse-vs-render split). Diagnostic.
 profiling = []
+# WASI-free WebAssembly interface: raw C-ABI exports (src/wasm.rs) for
+# `wasm32-unknown-unknown`. Zero dependencies — drives from any wasm host.
+wasm = []
 
 [dependencies]
 
