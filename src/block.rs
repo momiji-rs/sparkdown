@@ -7,6 +7,7 @@
 //! lazily at render time.
 
 use crate::inline::{RefMap, take_ref_defs};
+use crate::scan::memchr1;
 
 const CODE_INDENT: usize = 4;
 
@@ -533,11 +534,15 @@ impl<'a> Parser<'a> {
         // it stays small for prose-heavy input.
         self.nodes.reserve(src.len() / 32);
         self.buf.reserve(src.len() / 4);
-        let base = src.as_ptr() as usize;
-        for line in split_lines(src) {
-            // Byte offset of this line within the source.
-            self.line_src_start = line.as_ptr() as usize - base;
-            self.incorporate_line(line);
+        // Iterate lines on the fly (SWAR `\n` search) rather than materializing
+        // a Vec of every line — no big allocation, one pass, vectorized split.
+        let bytes = src.as_bytes();
+        let mut start = 0;
+        while start < bytes.len() {
+            let end = memchr1(&bytes[start..], b'\n').map_or(bytes.len(), |p| start + p);
+            self.line_src_start = start;
+            self.incorporate_line(&bytes[start..end]);
+            start = end + 1;
         }
         while self.tip != 0 {
             let t = self.tip;
@@ -1070,25 +1075,6 @@ fn lists_match(a: &ListData, b: &ListData) -> bool {
 }
 
 // ---- line helpers --------------------------------------------------------
-
-fn split_lines(src: &str) -> Vec<&[u8]> {
-    if src.is_empty() {
-        return Vec::new();
-    }
-    let bytes = src.as_bytes();
-    let mut lines = Vec::new();
-    let mut start = 0;
-    for i in 0..bytes.len() {
-        if bytes[i] == b'\n' {
-            lines.push(&bytes[start..i]);
-            start = i + 1;
-        }
-    }
-    if start < bytes.len() {
-        lines.push(&bytes[start..]);
-    }
-    lines
-}
 
 fn atx_content(after: &str) -> &str {
     let c = after.trim_matches([' ', '\t']);
