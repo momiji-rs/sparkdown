@@ -136,9 +136,11 @@ even with **all** extensions active the parser still beats pulldown-cmark (the
 A **WASI-free** WebAssembly build runs in Node, browsers, bundlers, Deno, Bun,
 and edge runtimes with no `fetch`/`fs`/WASI setup. It ships two ways:
 
-- **npm** — [`@momiji-rs/sparkdown`](https://www.npmjs.com/package/@momiji-rs/sparkdown)
-  (pure CommonMark) and `@momiji-rs/sparkdown-gfm` (with GFM). Zero dependencies,
-  self-contained (the wasm is base64-inlined). Also on jsDelivr/unpkg for free.
+- **npm** — [`@momiji-rs/sparkdown`](https://www.npmjs.com/package/@momiji-rs/sparkdown):
+  pure CommonMark from the package root, GFM from the `@momiji-rs/sparkdown/gfm`
+  subpath (one package, two entries; a bundler only ships the variant you
+  import). Zero dependencies, self-contained (the wasm is base64-inlined). Also on
+  jsDelivr/unpkg for free.
 - **GitHub Releases** — the raw `sparkdown.wasm` / `sparkdown-gfm.wasm` modules
   (with SHA-256 sums) are attached to each tagged release, for non-JS hosts
   (wasmtime, wazero, Workers, Python, …) that want the bare module.
@@ -157,8 +159,11 @@ npm install @momiji-rs/sparkdown
 ```
 
 ```js
-import { toHtml } from "@momiji-rs/sparkdown";
+import { toHtml } from "@momiji-rs/sparkdown"; // CommonMark
 const html = await toHtml("# Hello *world*");
+
+import { toHtml as gfm } from "@momiji-rs/sparkdown/gfm"; // + GFM extensions
+await gfm("~~done~~ and www.example.com"); // strikethrough, autolinks, tables, … (toggle via options)
 ```
 
 Importing the package has **no side effect** — the wasm instantiates lazily on

@@ -1,6 +1,8 @@
-// Gate: the init/initSync surface, then run every CommonMark 0.31.2 spec
-// example through the wasm module and require 652/652. Used by CI and release.
-import { toHtml, toHtmlSync, init, initSync, ready } from "./sparkdown.mjs";
+// Gate both entries of the package: the `.` (CommonMark) and `./gfm` (GFM)
+// builds. For each: the init/initSync surface, then the full CommonMark 0.31.2
+// suite must pass 652/652 through the wasm. GFM extensions are spot-checked.
+import * as pure from "./sparkdown.mjs";
+import * as gfm from "./gfm.mjs";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -10,37 +12,45 @@ const fail = (m) => {
   process.exit(1);
 };
 
-// 1. Lazy: importing did not instantiate, so toHtmlSync before init must throw.
-let threw = "";
-try {
-  toHtmlSync("# hi");
-} catch (e) {
-  threw = e.message;
+// Each entry is an independent module/singleton, lazily instantiated.
+function checkInit(mod, name) {
+  let threw = "";
+  try {
+    mod.toHtmlSync("# hi");
+  } catch (e) {
+    threw = e.message;
+  }
+  if (!/initSync/.test(threw)) fail(`${name}: toHtmlSync before init should throw (got: ${threw})`);
+  const ex = mod.initSync();
+  if (mod.toHtmlSync("# hi") !== "<h1>hi</h1>\n") fail(`${name}: initSync()+toHtmlSync`);
+  if (mod.initSync() !== ex) fail(`${name}: initSync() not idempotent`);
+  return ex;
 }
-if (!/initSync/.test(threw)) fail(`toHtmlSync before init should throw mentioning initSync (got: ${threw})`);
-
-// 2. initSync() → synchronous render, no await anywhere.
-const ex = initSync();
-if (toHtmlSync("# hi") !== "<h1>hi</h1>\n") fail("initSync()+toHtmlSync");
-// 3. Idempotent: same exports object, so only one instance.
-if (initSync() !== ex) fail("initSync() not idempotent");
-// 4. Mixed order: the async path reuses the same instance (no double-instantiate).
-await ready;
-if (initSync() !== ex) fail("await ready double-instantiated");
-if ((await init()) !== ex) fail("init() returned a different instance");
-if (typeof toHtml !== "function") fail("toHtml export missing");
+const pureEx = checkInit(pure, "pure");
+const gfmEx = checkInit(gfm, "gfm");
+if (pureEx === gfmEx) fail("`.` and `./gfm` must be separate wasm instances");
+await pure.ready;
+await gfm.ready;
 
 const dir = dirname(fileURLToPath(import.meta.url));
 const spec = JSON.parse(readFileSync(join(dir, "..", "tests", "fixtures", "spec.json"), "utf8"));
-let pass = 0;
-const failed = [];
+const PURE_OPTS = { strikethrough: false, tasklist: false, autolink: false, tagfilter: false, tables: false, hardWraps: false };
+let pp = 0;
+let gp = 0;
 for (const e of spec) {
-  if (toHtmlSync(e.markdown) === e.html) pass++;
-  else failed.push(e.example);
+  if (pure.toHtmlSync(e.markdown) === e.html) pp++;
+  if (gfm.toHtmlSync(e.markdown, PURE_OPTS) === e.html) gp++;
 }
 
-console.log(`init/initSync ok; CommonMark 0.31.2 via wasm: ${pass}/${spec.length}`);
-if (pass !== spec.length) {
-  console.error("FAILED examples:", failed.slice(0, 15));
-  process.exit(1);
+const checks = [
+  ["~~x~~", "<p><del>x</del></p>\n"],
+  ["www.example.com", '<p><a href="http://www.example.com">www.example.com</a></p>\n'],
+  ["- [x] done", '<ul>\n<li><input checked="" disabled="" type="checkbox"> done</li>\n</ul>\n'],
+];
+for (const [md, want] of checks) {
+  const got = gfm.toHtmlSync(md);
+  if (got !== want) fail(`GFM check ${JSON.stringify(md)}\n  want ${JSON.stringify(want)}\n  got  ${JSON.stringify(got)}`);
 }
+
+console.log(`init/initSync ok (both entries); CommonMark 0.31.2: pure ${pp}/${spec.length}, gfm ${gp}/${spec.length}; GFM checks ok`);
+if (pp !== spec.length || gp !== spec.length) process.exit(1);

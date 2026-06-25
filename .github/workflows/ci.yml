@@ -89,17 +89,14 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: "24"
-      - name: Build wasm (+simd128, +bulk-memory)
-        run: RUSTFLAGS="-D warnings -C target-feature=+simd128,+bulk-memory" cargo build --target wasm32-unknown-unknown --release --features wasm
-      - name: Inline wasm + CommonMark conformance gate (652/652 through the wasm)
+      - name: Build + inline both wasm variants (the `.` and `./gfm` entries)
         run: |
-          npm run build
-          npm test
+          RF="-D warnings -C target-feature=+simd128,+bulk-memory"
+          W=../target/wasm32-unknown-unknown/release/sparkdown.wasm
+          RUSTFLAGS="$RF" cargo build --target wasm32-unknown-unknown --release --features wasm
+          (cd npm && node build.mjs "$W" wasm-inline.mjs)
+          RUSTFLAGS="$RF" cargo build --target wasm32-unknown-unknown --release --features wasm,gfm
+          (cd npm && node build.mjs "$W" gfm-wasm-inline.mjs)
+      - name: Conformance + GFM gate through the wasm (both entries, 652/652)
+        run: npm test
         working-directory: npm
-      - name: Build gfm wasm (+simd128, +bulk-memory)
-        run: RUSTFLAGS="-D warnings -C target-feature=+simd128,+bulk-memory" cargo build --target wasm32-unknown-unknown --release --features wasm,gfm
-      - name: Inline gfm wasm + conformance/GFM gate (npm-gfm package)
-        run: |
-          npm run build
-          npm test
-        working-directory: npm-gfm

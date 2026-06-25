@@ -6,7 +6,7 @@
 // build.mjs), so this package is self-contained: Node, browsers, bundlers,
 // Deno, Bun, and edge runtimes, with no fetch, fs, or asset configuration.
 
-import { WASM_BASE64 } from "./wasm-inline.mjs";
+import { WASM_BASE64 } from "./gfm-wasm-inline.mjs";
 
 function base64ToBytes(b64) {
   if (typeof Buffer !== "undefined") {

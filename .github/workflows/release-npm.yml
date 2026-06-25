@@ -65,14 +65,10 @@ jobs:
             sparkdown-gfm.wasm
             SHA256SUMS.txt
 
+  # One package, two subpath entries (`.` CommonMark + `./gfm`): build both wasm
+  # variants, inline each, then publish the single package.
   publish:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { dir: npm, features: wasm }
-          - { dir: npm-gfm, features: "wasm,gfm" }
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -85,11 +81,15 @@ jobs:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
           package-manager-cache: false # never cache in release builds
-      - name: Build the wasm (+simd128, +bulk-memory)
-        run: RUSTFLAGS="-C target-feature=+simd128,+bulk-memory" cargo build --target wasm32-unknown-unknown --release --features ${{ matrix.features }}
-      - run: npm run build --if-present # wasm-opt + base64 inline (build.mjs)
-        working-directory: ${{ matrix.dir }}
-      - run: npm test # CommonMark 652/652 (+ GFM checks) through the wasm
-        working-directory: ${{ matrix.dir }}
+      - name: Build + inline both wasm variants
+        run: |
+          RF="-C target-feature=+simd128,+bulk-memory"
+          W=../target/wasm32-unknown-unknown/release/sparkdown.wasm
+          RUSTFLAGS="$RF" cargo build --target wasm32-unknown-unknown --release --features wasm
+          (cd npm && node build.mjs "$W" wasm-inline.mjs)
+          RUSTFLAGS="$RF" cargo build --target wasm32-unknown-unknown --release --features wasm,gfm
+          (cd npm && node build.mjs "$W" gfm-wasm-inline.mjs)
+      - run: npm test # both entries: CommonMark 652/652 + GFM checks
+        working-directory: npm
       - run: npm publish --provenance --access public
-        working-directory: ${{ matrix.dir }}
+        working-directory: npm
