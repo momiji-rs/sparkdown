@@ -121,7 +121,7 @@ impl Tree<'_> {
         &store[n.cstart as usize..n.cend as usize]
     }
 
-    /// Consume the tree, returning its buffers for reuse by [`parse_with`].
+    /// Consume the tree, returning its buffers for reuse by `parse_with`.
     pub fn recycle(self) -> (Vec<Node>, String, RefMap) {
         (self.nodes, self.buf, self.refmap)
     }
@@ -161,7 +161,7 @@ pub fn parse_with_opts(src: &str, opts: Options) -> Tree<'_> {
     Parser::with(Vec::new(), String::new(), RefMap::new(), opts).parse(src)
 }
 
-/// Like [`parse_with_opts`], but reuses the given (recycled) buffers instead of
+/// Like `parse_with_opts`, but reuses the given (recycled) buffers instead of
 /// allocating fresh ones. Pair with [`Tree::recycle`] for repeated parsing.
 pub fn parse_with(
     src: &str,
