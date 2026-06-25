@@ -1,7 +1,9 @@
-# Publishes @momiji-rs/sparkdown to npm via OIDC **Trusted Publishing** — no
-# NPM_TOKEN secret, and npm attaches a signed provenance statement.
+# Publishes both npm packages via OIDC **Trusted Publishing** — no NPM_TOKEN
+# secret, and npm attaches a signed provenance statement:
+#   @momiji-rs/sparkdown      (npm/,     pure CommonMark)
+#   @momiji-rs/sparkdown-gfm  (npm-gfm/, CommonMark + GFM)
 #
-# One-time setup on npmjs.com:
+# One-time setup on npmjs.com, **per package**:
 #   Package → Settings → Trusted Publisher → GitHub Actions
 #   Repository: momiji-rs/sparkdown   Workflow: release-npm.yml
 # Then publish by pushing a tag:  git tag v0.0.2 && git push origin v0.0.2
@@ -20,6 +22,12 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { dir: npm, features: wasm }
+          - { dir: npm-gfm, features: "wasm,gfm" }
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -33,10 +41,10 @@ jobs:
           registry-url: "https://registry.npmjs.org"
           package-manager-cache: false # never cache in release builds
       - name: Build the wasm (+simd128, +bulk-memory)
-        run: RUSTFLAGS="-C target-feature=+simd128,+bulk-memory" cargo build --target wasm32-unknown-unknown --release --features wasm
+        run: RUSTFLAGS="-C target-feature=+simd128,+bulk-memory" cargo build --target wasm32-unknown-unknown --release --features ${{ matrix.features }}
       - run: npm run build --if-present # wasm-opt + base64 inline (build.mjs)
-        working-directory: npm
-      - run: npm test # 652/652 CommonMark conformance through the wasm
-        working-directory: npm
+        working-directory: ${{ matrix.dir }}
+      - run: npm test # CommonMark 652/652 (+ GFM checks) through the wasm
+        working-directory: ${{ matrix.dir }}
       - run: npm publish --provenance --access public
-        working-directory: npm
+        working-directory: ${{ matrix.dir }}

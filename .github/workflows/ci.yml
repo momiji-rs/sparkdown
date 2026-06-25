@@ -96,3 +96,10 @@ jobs:
           npm run build
           npm test
         working-directory: npm
+      - name: Build gfm wasm (+simd128, +bulk-memory)
+        run: RUSTFLAGS="-D warnings -C target-feature=+simd128,+bulk-memory" cargo build --target wasm32-unknown-unknown --release --features wasm,gfm
+      - name: Inline gfm wasm + conformance/GFM gate (npm-gfm package)
+        run: |
+          npm run build
+          npm test
+        working-directory: npm-gfm
