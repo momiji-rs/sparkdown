@@ -16,33 +16,6 @@
 
 use serde_json::Value;
 
-/// Diagnostic: `cargo test --test spec dump_failures -- --ignored --nocapture`
-#[test]
-#[ignore]
-fn dump_failures() {
-    let raw = include_str!("fixtures/spec.json");
-    let cases: Value = serde_json::from_str(raw).unwrap();
-    let mut by_section: std::collections::BTreeMap<String, usize> = Default::default();
-    for case in cases.as_array().unwrap() {
-        let md = case["markdown"].as_str().unwrap();
-        let expected = case["html"].as_str().unwrap();
-        let got = sparkdown::to_html(md);
-        if got != expected {
-            let ex = case["example"].as_u64().unwrap();
-            let sec = case["section"].as_str().unwrap();
-            *by_section.entry(sec.to_string()).or_default() += 1;
-            println!("=== ex{ex} [{sec}]");
-            println!("  md:   {md:?}");
-            println!("  want: {expected:?}");
-            println!("  got:  {got:?}");
-        }
-    }
-    println!("\n--- failures by section ---");
-    for (s, n) in &by_section {
-        println!("{n:3}  {s}");
-    }
-}
-
 /// Minimum passing examples the suite must not drop below. Bump this up as
 /// conformance improves so regressions are caught.
 /// History: 86 (paragraphs only) → 172 (leaf blocks: headings, thematic

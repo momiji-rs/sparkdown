@@ -44,3 +44,31 @@ fn gfm_preset_is_all_on() {
     let g = Options::gfm();
     assert!(g.strikethrough && g.tasklist && g.autolink && g.tagfilter && g.tables);
 }
+
+#[test]
+fn strikethrough() {
+    let st = Options {
+        strikethrough: true,
+        ..Options::default()
+    };
+    let go = |s: &str| to_html_with(s, &st);
+    // One or two tildes both strike (GFM spec example 491).
+    assert_eq!(go("~~foo~~"), "<p><del>foo</del></p>\n");
+    assert_eq!(go("~foo~"), "<p><del>foo</del></p>\n");
+    assert_eq!(
+        go("~~Hi~~ Hello, ~there~ world!"),
+        "<p><del>Hi</del> Hello, <del>there</del> world!</p>\n"
+    );
+    // `~`-like (not `_`-like): intraword strikes.
+    assert_eq!(go("a~~b~~c"), "<p>a<del>b</del>c</p>\n");
+    // Mismatched run lengths don't match; flanking blocks padded delimiters.
+    assert_eq!(go("~~foo~"), "<p>~~foo~</p>\n");
+    assert_eq!(go("~~ foo ~~"), "<p>~~ foo ~~</p>\n");
+    // 3+ tildes on their own line is a CommonMark tilde code fence, not strike.
+    assert_eq!(
+        go("~~~foo~~~"),
+        "<pre><code class=\"language-foo~~~\"></code></pre>\n"
+    );
+    // Off by default.
+    assert_eq!(to_html("~~foo~~"), "<p>~~foo~~</p>\n");
+}

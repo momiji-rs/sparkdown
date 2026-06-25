@@ -11,7 +11,7 @@
 use crate::entities::{named, remap_numeric};
 use crate::options::Options;
 use crate::render::escape_html;
-use crate::scan::{find_emph, find_inline, find_stream};
+use crate::scan::{find_emph, find_emph_gfm, find_inline, find_inline_gfm, find_stream};
 use std::borrow::Cow;
 use std::collections::HashMap;
 
@@ -845,10 +845,10 @@ fn stream_inline<const HW: bool>(src: &str, out: &mut String) {
     escape_html(src[run..].trim_end_matches(' '), out);
 }
 
-/// Parse `src` (a block's raw inline text) to HTML, appending to `out`.
 /// Parse `src` (a block's raw inline text) to HTML, appending to `out`. Picks
-/// the monomorphized inline renderer once per call so options resolved at this
-/// boundary (here, `hard_wraps`) cost nothing in the byte loop.
+/// the monomorphized inline renderer once per call so per-byte options
+/// (`hard_wraps`, `strikethrough`) resolved at this boundary cost nothing in the
+/// byte loop — disabled flags fold the gfm tables and the `~` arm away.
 pub fn render_inline(
     src: &str,
     out: &mut String,
@@ -856,23 +856,29 @@ pub fn render_inline(
     scratch: &mut Scratch,
     opts: Options,
 ) {
-    if opts.hard_wraps {
-        render_inline_impl::<true>(src, out, refmap, scratch);
-    } else {
-        render_inline_impl::<false>(src, out, refmap, scratch);
+    match (opts.hard_wraps, opts.strikethrough) {
+        (false, false) => render_inline_impl::<false, false>(src, out, refmap, scratch),
+        (false, true) => render_inline_impl::<false, true>(src, out, refmap, scratch),
+        (true, false) => render_inline_impl::<true, false>(src, out, refmap, scratch),
+        (true, true) => render_inline_impl::<true, true>(src, out, refmap, scratch),
     }
 }
 
 #[allow(unused_assignments)] // `seg` is updated at segment ends; the last is unused
-fn render_inline_impl<const HW: bool>(
+fn render_inline_impl<const HW: bool, const ST: bool>(
     src: &str,
     out: &mut String,
     refmap: &RefMap,
     scratch: &mut Scratch,
 ) {
     let bytes = src.as_bytes();
-    // Fast path: no emphasis/link delimiters → stream directly, no allocation.
-    if find_emph(bytes).is_none() {
+    // Fast path: no emphasis/link (or `~` when ST) delimiters → stream directly.
+    let gate = if ST {
+        find_emph_gfm(bytes)
+    } else {
+        find_emph(bytes)
+    };
+    if gate.is_none() {
         stream_inline::<HW>(src, out);
         return;
     }
@@ -972,6 +978,30 @@ fn render_inline_impl<const HW: bool>(
                 i += count;
                 run = i;
             }
+            // GFM strikethrough: a `~` run of 1 or 2 is a delimiter (→ <del>);
+            // 3+ tildes are literal. Only reachable when ST is on.
+            b'~' if ST => {
+                escape_html(&src[run..i], cur);
+                flush!();
+                let count = bytes[i..].iter().take_while(|&&b| b == b'~').count();
+                if count <= 2 {
+                    let before = src[..i].chars().next_back();
+                    let after = src[i + count..].chars().next();
+                    let (can_open, can_close) = flanking(b'~', before, after);
+                    let idx = list.push(Node::Delim {
+                        ch: b'~',
+                        count,
+                        orig: count,
+                        can_open,
+                        can_close,
+                    });
+                    stack.push(StackItem::Emph(idx));
+                } else {
+                    cur.push_str(&src[i..i + count]);
+                }
+                i += count;
+                run = i;
+            }
             b'[' => {
                 escape_html(&src[run..i], cur);
                 flush!();
@@ -1023,7 +1053,15 @@ fn render_inline_impl<const HW: bool>(
                 run = i;
             }
             // Skip plain text to the next significant byte in one SIMD pass.
-            _ => i += 1 + find_inline(&bytes[i + 1..]).unwrap_or(bytes.len() - i - 1),
+            _ => {
+                let rest = &bytes[i + 1..];
+                let skip = if ST {
+                    find_inline_gfm(rest)
+                } else {
+                    find_inline(rest)
+                };
+                i += 1 + skip.unwrap_or(bytes.len() - i - 1);
+            }
         }
     }
     // Trailing spaces at the very end of a block are dropped (no following line
@@ -1419,8 +1457,10 @@ fn ref_line_end(bytes: &[u8], j: usize) -> Option<usize> {
 
 /// Phase 2: pair emphasis delimiters on the stack at or above `start`,
 /// splicing `<em>`/`<strong>` tags into the list. Removes consumed entries.
+// GFM strikethrough (`~`) is handled when a `~` delimiter is present, which
+// only happens with the option on; `strike` is branch-predicted false otherwise.
 fn process_emphasis(list: &mut List, stack: &mut Vec<StackItem>, start: usize) {
-    let mut openers_bottom = [[-1isize; 3]; 2];
+    let mut openers_bottom = [[-1isize; 3]; 3];
     let mut ci = start;
 
     while ci < stack.len() {
@@ -1436,7 +1476,14 @@ fn process_emphasis(list: &mut List, stack: &mut Vec<StackItem>, start: usize) {
             ci += 1;
             continue;
         }
-        let char_idx = if cch == b'*' { 0 } else { 1 };
+        let strike = cch == b'~';
+        let char_idx = if strike {
+            2
+        } else if cch == b'*' {
+            0
+        } else {
+            1
+        };
         let bottom = openers_bottom[char_idx][corig % 3];
 
         let mut opener: Option<usize> = None;
@@ -1455,8 +1502,12 @@ fn process_emphasis(list: &mut List, stack: &mut Vec<StackItem>, start: usize) {
             if ocount == 0 {
                 continue;
             }
-            let odd_match = (ccan_open || ocan_close) && corig % 3 != 0 && (oorig + corig) % 3 == 0;
-            if och == cch && ocan_open && !odd_match {
+            // The "multiple of 3" rule is emphasis-only; GFM `~` matches by
+            // equal run length instead.
+            let odd_match =
+                !strike && (ccan_open || ocan_close) && corig % 3 != 0 && (oorig + corig) % 3 == 0;
+            let len_match = !strike || ocount == ccount;
+            if och == cch && ocan_open && !odd_match && len_match {
                 opener = Some(oi);
                 break;
             }
@@ -1468,12 +1519,16 @@ fn process_emphasis(list: &mut List, stack: &mut Vec<StackItem>, start: usize) {
                     unreachable!()
                 };
                 let ocount = delim(list, onode).unwrap().1;
-                let strong = ocount >= 2 && ccount >= 2;
-                let use_delims = if strong { 2 } else { 1 };
-                let (open_tag, close_tag) = if strong {
-                    ("<strong>", "</strong>")
+                let (open_tag, close_tag, use_delims) = if strike {
+                    // GFM strikethrough — equal-length match consumes the run.
+                    ("<del>", "</del>", ocount)
                 } else {
-                    ("<em>", "</em>")
+                    let strong = ocount >= 2 && ccount >= 2;
+                    if strong {
+                        ("<strong>", "</strong>", 2)
+                    } else {
+                        ("<em>", "</em>", 1)
+                    }
                 };
                 list.splice_after(onode, Node::Tag(open_tag));
                 list.splice_before(cnode, Node::Tag(close_tag));

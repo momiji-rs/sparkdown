@@ -315,6 +315,27 @@ pub(crate) fn find_emph(hay: &[u8]) -> Option<usize> {
     find_in_set(hay, &EMPH_LO, &EMPH_HI)
 }
 
+// GFM variants: the inline / gate sets plus `~` (0x7E → lo nibble 14, hi nibble
+// 7), so strikethrough's `~` becomes a scan stop only when the option is on.
+const INLINE_GFM_LO: [u8; 16] = [
+    0x40, 0x04, 0, 0, 0, 0, 0x04, 0, 0, 0, 0x05, 0x20, 0x28, 0x20, 0x80, 0x20,
+];
+const INLINE_GFM_HI: [u8; 16] = [
+    0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+const EMPH_GFM_LO: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x04, 0x20, 0, 0, 0x80, 0x20];
+const EMPH_GFM_HI: [u8; 16] = [0, 0, 0x04, 0, 0, 0x20, 0, 0x80, 0, 0, 0, 0, 0, 0, 0, 0];
+
+#[inline]
+pub(crate) fn find_inline_gfm(hay: &[u8]) -> Option<usize> {
+    find_in_set(hay, &INLINE_GFM_LO, &INLINE_GFM_HI)
+}
+
+#[inline]
+pub(crate) fn find_emph_gfm(hay: &[u8]) -> Option<usize> {
+    find_in_set(hay, &EMPH_GFM_LO, &EMPH_GFM_HI)
+}
+
 #[inline]
 fn in_set(b: u8, lo: &[u8; 16], hi: &[u8; 16]) -> bool {
     lo[(b & 0x0F) as usize] & hi[(b >> 4) as usize] != 0
@@ -624,12 +645,34 @@ mod tests {
                 .position(|&b| matches!(b, b'\\' | b'`' | b'&' | b'<' | b'\n'))
         };
         let emph_scalar = |h: &[u8]| h.iter().position(|&b| matches!(b, b'*' | b'_' | b'['));
+        let inline_gfm_scalar = |h: &[u8]| {
+            h.iter().position(|&b| {
+                matches!(
+                    b,
+                    b'\\' | b'`' | b'&' | b'<' | b'\n' | b'*' | b'_' | b'[' | b']' | b'!' | b'~'
+                )
+            })
+        };
+        let emph_gfm_scalar = |h: &[u8]| {
+            h.iter()
+                .position(|&b| matches!(b, b'*' | b'_' | b'[' | b'~'))
+        };
         let bytes: Vec<u8> = (0u8..=255).cycle().take(400).collect();
         for len in 0..bytes.len() {
             let hay = &bytes[..len];
             assert_eq!(find_inline(hay), inline_scalar(hay), "inline len={len}");
             assert_eq!(find_stream(hay), stream_scalar(hay), "stream len={len}");
             assert_eq!(find_emph(hay), emph_scalar(hay), "emph len={len}");
+            assert_eq!(
+                find_inline_gfm(hay),
+                inline_gfm_scalar(hay),
+                "inline_gfm len={len}"
+            );
+            assert_eq!(
+                find_emph_gfm(hay),
+                emph_gfm_scalar(hay),
+                "emph_gfm len={len}"
+            );
         }
         // Each member at every position; and no false positives for neighbours.
         for pos in 0..40 {
