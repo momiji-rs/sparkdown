@@ -27,7 +27,9 @@ jobs:
           bins: cargo-codspeed
 
       - name: Build the benchmark target(s)
-        run: cargo codspeed build
+        # `--features gfm` so the `sparkdown-gfm` bench (cfg-gated) is compiled
+        # and tracked too, not just the pure path + pulldown.
+        run: cargo codspeed build --features gfm
 
       - name: Run the benchmarks
         uses: CodSpeedHQ/action@v4
