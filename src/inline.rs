@@ -770,7 +770,7 @@ impl Scratch {
 /// arms of [`render_inline`] (kept in sync by the conformance suite).
 // `HW` (hard_wraps) is a const generic so the default `HW = false` folds
 // `if hard || HW` back to the original `if hard` — zero per-newline cost.
-fn stream_inline<const HW: bool>(src: &str, out: &mut String) {
+fn stream_inline<const HW: bool>(src: &str, out: &mut String, tf: bool) {
     let bytes = src.as_bytes();
     let mut i = 0usize;
     let mut run = 0usize;
@@ -821,7 +821,11 @@ fn stream_inline<const HW: bool>(src: &str, out: &mut String) {
                     out.push_str(&html);
                     i += consumed;
                 } else if let Some(end) = try_raw_html(bytes, i) {
-                    out.push_str(&src[i..end]);
+                    if tf {
+                        crate::render::filter_html(&src[i..end], out);
+                    } else {
+                        out.push_str(&src[i..end]);
+                    }
                     i = end;
                 } else {
                     out.push_str("&lt;");
@@ -861,11 +865,12 @@ pub fn render_inline(
     scratch: &mut Scratch,
     opts: Options,
 ) {
+    let tf = opts.tagfilter;
     match (opts.hard_wraps, opts.strikethrough) {
-        (false, false) => render_inline_impl::<false, false>(src, out, refmap, scratch),
-        (false, true) => render_inline_impl::<false, true>(src, out, refmap, scratch),
-        (true, false) => render_inline_impl::<true, false>(src, out, refmap, scratch),
-        (true, true) => render_inline_impl::<true, true>(src, out, refmap, scratch),
+        (false, false) => render_inline_impl::<false, false>(src, out, refmap, scratch, tf),
+        (false, true) => render_inline_impl::<false, true>(src, out, refmap, scratch, tf),
+        (true, false) => render_inline_impl::<true, false>(src, out, refmap, scratch, tf),
+        (true, true) => render_inline_impl::<true, true>(src, out, refmap, scratch, tf),
     }
 }
 
@@ -875,6 +880,7 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
     out: &mut String,
     refmap: &RefMap,
     scratch: &mut Scratch,
+    tf: bool,
 ) {
     let bytes = src.as_bytes();
     // Fast path: no emphasis/link (or `~` when ST) delimiters → stream directly.
@@ -884,7 +890,7 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
         find_emph(bytes)
     };
     if gate.is_none() {
-        stream_inline::<HW>(src, out);
+        stream_inline::<HW>(src, out, tf);
         return;
     }
     scratch.reset();
@@ -956,7 +962,11 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                     cur.push_str(&html);
                     i += consumed;
                 } else if let Some(end) = try_raw_html(bytes, i) {
-                    cur.push_str(&src[i..end]); // verbatim
+                    if tf {
+                        crate::render::filter_html(&src[i..end], cur);
+                    } else {
+                        cur.push_str(&src[i..end]); // verbatim
+                    }
                     i = end;
                 } else {
                     cur.push_str("&lt;");

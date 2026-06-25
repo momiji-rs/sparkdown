@@ -6,7 +6,7 @@
 
 use crate::block::{Kind, Tree};
 use crate::inline::{Scratch, render_inline};
-use crate::scan::escape_block_mask;
+use crate::scan::{escape_block_mask, memchr1};
 
 /// Render a parsed [`Tree`] to an HTML string.
 pub fn render(tree: &Tree) -> String {
@@ -101,7 +101,11 @@ fn render_node(tree: &Tree, idx: usize, out: &mut String, scratch: &mut Scratch)
         }
         Kind::HtmlBlock => {
             cr(out);
-            out.push_str(tree.content(idx));
+            if tree.opts.tagfilter {
+                filter_html(tree.content(idx), out);
+            } else {
+                out.push_str(tree.content(idx));
+            }
             cr(out);
         }
         Kind::BlockQuote => {
@@ -172,6 +176,52 @@ fn task_input(tree: &Tree, para: usize, out: &mut String) -> usize {
         "<input disabled=\"\" type=\"checkbox\">"
     });
     3
+}
+
+/// GFM disallowed raw-HTML tags (case-insensitive); a `<` starting one of these
+/// is neutralized to `&lt;` (GFM §6.11).
+const TAGFILTER_TAGS: [&[u8]; 9] = [
+    b"title",
+    b"textarea",
+    b"style",
+    b"xmp",
+    b"iframe",
+    b"noembed",
+    b"noframes",
+    b"script",
+    b"plaintext",
+];
+
+/// Does `rest` (the bytes just past a `<`) start with a blacklisted tag name
+/// terminated by a tag delimiter (space/tab/newline/`/`/`>`) or end-of-input?
+fn is_filtered_tag(rest: &[u8]) -> bool {
+    for tag in TAGFILTER_TAGS {
+        if rest.len() >= tag.len() && rest[..tag.len()].eq_ignore_ascii_case(tag) {
+            return matches!(
+                rest.get(tag.len()),
+                None | Some(b' ' | b'\t' | b'\n' | b'\r' | 0x0c | b'>' | b'/')
+            );
+        }
+    }
+    false
+}
+
+/// GFM tag filter: copy `s` to `out`, replacing the leading `<` of any disallowed
+/// raw-HTML tag with `&lt;`. Used for both HTML blocks and inline raw HTML.
+pub(crate) fn filter_html(s: &str, out: &mut String) {
+    let b = s.as_bytes();
+    let mut clean = 0;
+    let mut i = 0;
+    while let Some(off) = memchr1(&b[i..], b'<') {
+        let lt = i + off;
+        if is_filtered_tag(&b[lt + 1..]) {
+            out.push_str(&s[clean..lt]);
+            out.push_str("&lt;");
+            clean = lt + 1;
+        }
+        i = lt + 1;
+    }
+    out.push_str(&s[clean..]);
 }
 
 /// A paragraph is rendered bare (no `<p>`) when it is a direct child of an item

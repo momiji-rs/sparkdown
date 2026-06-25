@@ -101,3 +101,29 @@ fn tasklist() {
     // Off by default.
     assert_eq!(to_html("- [ ] foo\n"), "<ul>\n<li>[ ] foo</li>\n</ul>\n");
 }
+
+#[test]
+fn tagfilter() {
+    let tf = Options {
+        tagfilter: true,
+        ..Options::default()
+    };
+    let go = |s: &str| to_html_with(s, &tf);
+    // Inline raw HTML — only blacklisted tags are neutralized (GFM §6.11).
+    assert_eq!(
+        go("<strong> <title> <style> <em>\n"),
+        "<p><strong> &lt;title> &lt;style> <em></p>\n"
+    );
+    // Prefix match alone is not enough — `<scriptx>` is left intact.
+    assert_eq!(
+        go("<scriptx> and <script>\n"),
+        "<p><scriptx> and &lt;script></p>\n"
+    );
+    // HTML block: opening tag filtered, closing tag (`</`) left as-is.
+    assert_eq!(
+        go("<div>\n<script>\nok\n</script>\n</div>\n"),
+        "<div>\n&lt;script>\nok\n</script>\n</div>\n"
+    );
+    // Off by default (inline raw HTML passes through verbatim).
+    assert_eq!(to_html("a <title> b\n"), "<p>a <title> b</p>\n");
+}
