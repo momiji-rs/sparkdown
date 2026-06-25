@@ -9,7 +9,8 @@
     "plugins": "node plugin_demo.mjs",
     "lint": "node lint_demo.mjs",
     "usage": "node usage_demo.mjs",
-    "boundary": "node wasm_boundary.mjs"
+    "boundary": "node wasm_boundary.mjs",
+    "e2e": "node e2e_bench.mjs"
   },
   "dependencies": {
     "hast-util-to-html": "^9",
@@ -26,6 +27,7 @@
     "remark-parse": "^11.0.0",
     "remark-rehype": "^11.1.2",
     "remark-toc": "^9.0.0",
+    "satteri": "^0.9.3",
     "unified": "^11.0.5",
     "unist-util-visit": "^5.1.0",
     "vfile": "^6.0.3"
