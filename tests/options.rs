@@ -168,3 +168,42 @@ fn tables() {
         "<p>| a | b |\n| - | - |</p>\n"
     );
 }
+
+#[test]
+fn autolink() {
+    let a = Options {
+        autolink: true,
+        ..Options::default()
+    };
+    let go = |s: &str| to_html_with(s, &a);
+    // `www.` gets an http:// href; visible text is verbatim (GFM §6.9).
+    assert_eq!(
+        go("Visit www.commonmark.org/help\n"),
+        "<p>Visit <a href=\"http://www.commonmark.org/help\">www.commonmark.org/help</a></p>\n"
+    );
+    // Scheme URLs; `&` is part of the URL (overrides the entity scan) and escaped.
+    assert_eq!(
+        go("x https://a.org/p?a=1&b=2 y\n"),
+        "<p>x <a href=\"https://a.org/p?a=1&amp;b=2\">https://a.org/p?a=1&amp;b=2</a> y</p>\n"
+    );
+    // Bare email → mailto.
+    assert_eq!(
+        go("ask foo.bar@example.com please\n"),
+        "<p>ask <a href=\"mailto:foo.bar@example.com\">foo.bar@example.com</a> please</p>\n"
+    );
+    // Trailing `.` is trimmed; an unbalanced `)` is excluded.
+    assert_eq!(
+        go("see www.x.org/a.b. ok\n"),
+        "<p>see <a href=\"http://www.x.org/a.b\">www.x.org/a.b</a>. ok</p>\n"
+    );
+    assert_eq!(
+        go("(www.example.com)\n"),
+        "<p>(<a href=\"http://www.example.com\">www.example.com</a>)</p>\n"
+    );
+    // No false positives, and off by default.
+    assert_eq!(go("website hhttp plain\n"), "<p>website hhttp plain</p>\n");
+    assert_eq!(
+        to_html("see http://example.com\n"),
+        "<p>see http://example.com</p>\n"
+    );
+}

@@ -770,6 +770,235 @@ impl Scratch {
 /// arms of [`render_inline`] (kept in sync by the conformance suite).
 // `HW` (hard_wraps) is a const generic so the default `HW = false` folds
 // `if hard || HW` back to the original `if hard` — zero per-newline cost.
+/// A GFM extended autolink may begin at text start or just after whitespace or
+/// one of `*`, `_`, `~`, `(`.
+fn al_boundary(b: &[u8], i: usize) -> bool {
+    i == 0 || matches!(b[i - 1], b' ' | b'\t' | b'\n' | b'*' | b'_' | b'~' | b'(')
+}
+
+/// Trim trailing punctuation off a matched autolink (GFM §6.9): `?!.,:*_~`, an
+/// unbalanced `)`, and a trailing entity reference `&…;`.
+fn gfm_trim_url(b: &[u8], start: usize, mut end: usize) -> usize {
+    while end > start {
+        match b[end - 1] {
+            b'?' | b'!' | b'.' | b',' | b':' | b'*' | b'_' | b'~' => end -= 1,
+            b')' => {
+                let opens = b[start..end].iter().filter(|&&x| x == b'(').count();
+                let closes = b[start..end].iter().filter(|&&x| x == b')').count();
+                if closes > opens {
+                    end -= 1;
+                } else {
+                    break;
+                }
+            }
+            b';' => {
+                let mut j = end - 1;
+                while j > start && b[j - 1].is_ascii_alphanumeric() {
+                    j -= 1;
+                }
+                if j > start && b[j - 1] == b'&' {
+                    end = j - 1;
+                } else {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    end
+}
+
+/// If a `www.` / `http(s)://` autolink starts at `b[start]`, return its end.
+fn gfm_scan_url(b: &[u8], start: usize) -> Option<usize> {
+    let rest = &b[start..];
+    let scan = if rest.starts_with(b"http://") {
+        start + 7
+    } else if rest.starts_with(b"https://") {
+        start + 8
+    } else if rest.starts_with(b"www.") {
+        start + 4
+    } else {
+        return None;
+    };
+    // Domain: dot-separated labels of [A-Za-z0-9_-]; needs at least one dot.
+    let mut i = scan;
+    let mut dots = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'.' => dots += 1,
+            c if c.is_ascii_alphanumeric() || c == b'-' || c == b'_' => {}
+            _ => break,
+        }
+        i += 1;
+    }
+    if i == scan || dots == 0 {
+        return None;
+    }
+    // Path: up to whitespace or `<`.
+    let mut end = i;
+    while end < b.len() && !matches!(b[end], b' ' | b'\t' | b'\n' | b'\r' | b'<') {
+        end += 1;
+    }
+    let end = gfm_trim_url(b, start, end);
+    (end > scan && b[scan..end].contains(&b'.')).then_some(end)
+}
+
+/// If a bare email autolink ends at the `@` `b[at]`, return `(localpart start,
+/// end)`. The local part must sit at an autolink boundary.
+fn gfm_scan_email(b: &[u8], at: usize) -> Option<(usize, usize)> {
+    let mut s = at;
+    while s > 0
+        && matches!(b[s - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'_' | b'+' | b'-')
+    {
+        s -= 1;
+    }
+    if s == at || !al_boundary(b, s) {
+        return None;
+    }
+    // Domain: [A-Za-z0-9_-] labels separated by `.`, at least one dot, ending on
+    // an alphanumeric (a trailing `.`/`-`/`_` is not part of the address).
+    let mut i = at + 1;
+    let dstart = i;
+    while i < b.len() {
+        match b[i] {
+            b'.' | b'-' | b'_' => {}
+            c if c.is_ascii_alphanumeric() => {}
+            _ => break,
+        }
+        i += 1;
+    }
+    let mut e = i;
+    while e > dstart && !b[e - 1].is_ascii_alphanumeric() {
+        e -= 1;
+    }
+    (e > dstart && b[dstart..e].contains(&b'.')).then_some((s, e))
+}
+
+/// Emit a `www.`/`http(s)://` autolink as `<a href="…">…</a>` (www gets an
+/// `http://` href prefix; the visible text is verbatim).
+fn emit_url(src: &str, start: usize, end: usize, out: &mut String) {
+    let text = &src[start..end];
+    out.push_str("<a href=\"");
+    if !text.starts_with("http") {
+        out.push_str("http://");
+    }
+    escape_href(text, out);
+    out.push_str("\">");
+    escape_html(text, out);
+    out.push_str("</a>");
+}
+
+/// Emit a bare email autolink as `<a href="mailto:…">…</a>`.
+fn emit_email(src: &str, start: usize, end: usize, out: &mut String) {
+    let email = &src[start..end];
+    out.push_str("<a href=\"mailto:");
+    escape_href(email, out);
+    out.push_str("\">");
+    escape_html(email, out);
+    out.push_str("</a>");
+}
+
+/// Like [`stream_inline`] but also recognizes GFM extended autolinks (bare
+/// `www.`/`http(s)://`/email) in the streamed text. A separate function so the
+/// default fast path stays byte-identical; only reached when `autolink` is on.
+fn stream_autolink(src: &str, out: &mut String, hw: bool, tf: bool) {
+    let bytes = src.as_bytes();
+    let mut i = 0usize;
+    let mut run = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                escape_html(&src[run..i], out);
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+                    out.push_str("<br />\n");
+                    i = skip_spaces(bytes, i + 2);
+                } else if i + 1 < bytes.len() && is_ascii_punct(bytes[i + 1]) {
+                    push_escaped_byte(out, bytes[i + 1]);
+                    i += 2;
+                } else {
+                    out.push('\\');
+                    i += 1;
+                }
+                run = i;
+            }
+            b'`' => {
+                escape_html(&src[run..i], out);
+                if let Some(new_i) = try_code_span(src, bytes, i, out) {
+                    i = new_i;
+                } else {
+                    let n = bytes[i..].iter().take_while(|&&b| b == b'`').count();
+                    out.push_str(&src[i..i + n]);
+                    i += n;
+                }
+                run = i;
+            }
+            b'&' => {
+                escape_html(&src[run..i], out);
+                if let Some((val, consumed)) = parse_entity(bytes, i) {
+                    match val {
+                        Resolved::Cp(cp) => push_char_escaped(out, cp),
+                        Resolved::Text(s) => push_str_escaped(out, s),
+                    }
+                    i += consumed;
+                } else {
+                    out.push_str("&amp;");
+                    i += 1;
+                }
+                run = i;
+            }
+            b'<' => {
+                escape_html(&src[run..i], out);
+                if let Some((consumed, html)) = try_autolink(src, bytes, i) {
+                    out.push_str(&html);
+                    i += consumed;
+                } else if let Some(end) = try_raw_html(bytes, i) {
+                    if tf {
+                        crate::render::filter_html(&src[i..end], out);
+                    } else {
+                        out.push_str(&src[i..end]);
+                    }
+                    i = end;
+                } else {
+                    out.push_str("&lt;");
+                    i += 1;
+                }
+                run = i;
+            }
+            b'\n' => {
+                let line = &src[run..i];
+                let trimmed = line.trim_end_matches(' ');
+                let hard = line.len() - trimmed.len() >= 2;
+                escape_html(trimmed, out);
+                out.push_str(if hard || hw { "<br />\n" } else { "\n" });
+                i = skip_spaces(bytes, i + 1);
+                run = i;
+            }
+            b'@' => {
+                if let Some((s, e)) = gfm_scan_email(bytes, i) {
+                    escape_html(&src[run..s], out);
+                    emit_email(src, s, e, out);
+                    i = e;
+                    run = i;
+                } else {
+                    i += 1;
+                }
+            }
+            b'w' | b'W' | b'h' | b'H' if al_boundary(bytes, i) => {
+                if let Some(end) = gfm_scan_url(bytes, i) {
+                    escape_html(&src[run..i], out);
+                    emit_url(src, i, end, out);
+                    i = end;
+                    run = i;
+                } else {
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    escape_html(&src[run..], out);
+}
+
 fn stream_inline<const HW: bool>(src: &str, out: &mut String, tf: bool) {
     let bytes = src.as_bytes();
     let mut i = 0usize;
@@ -866,11 +1095,12 @@ pub fn render_inline(
     opts: Options,
 ) {
     let tf = opts.tagfilter;
+    let al = opts.autolink;
     match (opts.hard_wraps, opts.strikethrough) {
-        (false, false) => render_inline_impl::<false, false>(src, out, refmap, scratch, tf),
-        (false, true) => render_inline_impl::<false, true>(src, out, refmap, scratch, tf),
-        (true, false) => render_inline_impl::<true, false>(src, out, refmap, scratch, tf),
-        (true, true) => render_inline_impl::<true, true>(src, out, refmap, scratch, tf),
+        (false, false) => render_inline_impl::<false, false>(src, out, refmap, scratch, tf, al),
+        (false, true) => render_inline_impl::<false, true>(src, out, refmap, scratch, tf, al),
+        (true, false) => render_inline_impl::<true, false>(src, out, refmap, scratch, tf, al),
+        (true, true) => render_inline_impl::<true, true>(src, out, refmap, scratch, tf, al),
     }
 }
 
@@ -881,6 +1111,7 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
     refmap: &RefMap,
     scratch: &mut Scratch,
     tf: bool,
+    al: bool,
 ) {
     let bytes = src.as_bytes();
     // Fast path: no emphasis/link (or `~` when ST) delimiters → stream directly.
@@ -890,7 +1121,11 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
         find_emph(bytes)
     };
     if gate.is_none() {
-        stream_inline::<HW>(src, out, tf);
+        if al {
+            stream_autolink(src, out, HW, tf);
+        } else {
+            stream_inline::<HW>(src, out, tf);
+        }
         return;
     }
     scratch.reset();
