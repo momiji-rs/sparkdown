@@ -243,7 +243,9 @@ fn block(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> (Mdast
                 spread: ld.spread,
                 children: kids,
             };
-            (m, sb, last.unwrap_or(se))
+            // `se` (set only for a blockquote-marker blank line absorbed by the
+            // list) can extend past the last item; otherwise it is 0.
+            (m, sb, last.map_or(se, |l| l.max(se)))
         }
         Kind::Item => {
             let (kids, last) = block_children(tree, idx, scratch, ctx);

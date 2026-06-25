@@ -1060,6 +1060,29 @@ impl<'a> Parser<'a> {
             {
                 self.nodes[lc].last_line_blank = true;
             }
+            // SPIKE (`ast`): a blank line carrying blockquote markers (e.g. ">>")
+            // is absorbed by an open ancestor list — mdast extends the list's
+            // position through it. (A bare blank line at the top level is not.)
+            #[cfg(feature = "ast")]
+            if self.blank {
+                let mut list = usize::MAX;
+                let mut in_bq = false;
+                let mut n = self.tip;
+                loop {
+                    match self.nodes[n].kind {
+                        Kind::List if list == usize::MAX => list = n,
+                        Kind::BlockQuote => in_bq = true,
+                        _ => {}
+                    }
+                    if n == 0 {
+                        break;
+                    }
+                    n = self.nodes[n].parent;
+                }
+                if list != usize::MAX && in_bq {
+                    self.nodes[list].src_end = (self.line_src_start + self.line.len()) as u32;
+                }
+            }
             let t = self.nodes[container].kind;
             let last_line_blank = self.blank
                 && !(t == Kind::BlockQuote
