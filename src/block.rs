@@ -119,6 +119,11 @@ impl Tree<'_> {
         &store[n.cstart as usize..n.cend as usize]
     }
 
+    /// Consume the tree, returning its buffers for reuse by [`parse_with`].
+    pub fn recycle(self) -> (Vec<Node>, String, RefMap) {
+        (self.nodes, self.buf, self.refmap)
+    }
+
     /// First child of node `idx` in the intrusive child list, if any.
     pub fn first_child(&self, idx: usize) -> Option<usize> {
         let c = self.nodes[idx].first_child;
@@ -146,6 +151,12 @@ impl Tree<'_> {
 /// Parse `src` into a block tree plus its link reference definitions.
 pub fn parse(src: &str) -> Tree<'_> {
     Parser::new().parse(src)
+}
+
+/// Like [`parse`], but reuses the given (recycled) buffers instead of
+/// allocating fresh ones. Pair with [`Tree::recycle`] for repeated parsing.
+pub fn parse_with(src: &str, nodes: Vec<Node>, buf: String, refmap: RefMap) -> Tree<'_> {
+    Parser::with(nodes, buf, refmap).parse(src)
 }
 
 fn peek(line: &[u8], i: usize) -> Option<u8> {
@@ -184,16 +195,25 @@ struct Parser<'a> {
 
 impl<'a> Parser<'a> {
     fn new() -> Self {
-        let root = Node::new(Kind::Document, 0, 0);
+        Self::with(Vec::new(), String::new(), RefMap::new())
+    }
+
+    /// Build a parser from recycled buffers (cleared and reused), so repeated
+    /// parsing avoids re-allocating the node arena, text buffer, and ref map.
+    fn with(mut nodes: Vec<Node>, mut buf: String, mut refmap: RefMap) -> Self {
+        nodes.clear();
+        buf.clear();
+        refmap.clear();
+        nodes.push(Node::new(Kind::Document, 0, 0));
         Parser {
-            nodes: vec![root],
+            nodes,
             tip: 0,
             oldtip: 0,
             last_matched_container: 0,
             all_closed: true,
-            refmap: RefMap::new(),
+            refmap,
             source: "",
-            buf: String::new(),
+            buf,
             line: &[],
             line_src_start: 0,
             line_number: 0,

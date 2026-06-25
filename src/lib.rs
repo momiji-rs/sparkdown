@@ -46,10 +46,10 @@ mod wasm;
 #[cfg(feature = "arena")]
 pub use arena::ScopedAlloc;
 
-/// Render CommonMark `src` to HTML.
+/// Render CommonMark `src` to HTML (full CommonMark 0.31.2).
 ///
-/// **Scaffold status:** parses blank-line-separated paragraphs only and
-/// HTML-escapes their text. No inline parsing, no other block types yet.
+/// For repeated rendering, prefer a reusable [`Renderer`] — it keeps the
+/// working buffers warm across calls.
 #[cfg(not(feature = "arena"))]
 pub fn to_html(src: &str) -> String {
     let tree = block::parse(src);
@@ -78,6 +78,59 @@ pub fn to_html(src: &str) -> String {
         owned
     } else {
         html // nested in an outer scope that owns the arena lifetime
+    }
+}
+
+/// A reusable rendering context that keeps the working buffers (node arena,
+/// text buffer, reference map, inline scratch, and output) warm across renders.
+///
+/// Use it instead of [`to_html`] for repeated rendering — a server, or a
+/// long-lived wasm instance handling many documents — to avoid re-allocating
+/// those buffers on every call.
+///
+/// ```
+/// let mut r = sparkdown::Renderer::new();
+/// assert_eq!(r.render("# a"), "<h1>a</h1>\n");
+/// assert_eq!(r.render("*b*"), "<p><em>b</em></p>\n"); // reuses the buffers
+/// ```
+pub struct Renderer {
+    scratch: inline::Scratch,
+    out: String,
+    nodes: Vec<block::Node>,
+    buf: String,
+    refmap: inline::RefMap,
+}
+
+impl Renderer {
+    /// Create an empty context; its buffers grow to fit the first render and
+    /// are reused thereafter.
+    pub fn new() -> Self {
+        Renderer {
+            scratch: inline::Scratch::new(),
+            out: String::new(),
+            nodes: Vec::new(),
+            buf: String::new(),
+            refmap: inline::RefMap::new(),
+        }
+    }
+
+    /// Render CommonMark `src` to HTML, reusing the held buffers. The returned
+    /// string borrows the context until the next call.
+    pub fn render(&mut self, src: &str) -> &str {
+        self.out.clear();
+        let nodes = core::mem::take(&mut self.nodes);
+        let buf = core::mem::take(&mut self.buf);
+        let refmap = core::mem::take(&mut self.refmap);
+        let tree = block::parse_with(src, nodes, buf, refmap);
+        render::render_with(&tree, &mut self.out, &mut self.scratch);
+        (self.nodes, self.buf, self.refmap) = tree.recycle();
+        &self.out
+    }
+}
+
+impl Default for Renderer {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

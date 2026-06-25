@@ -15,8 +15,14 @@ pub fn render(tree: &Tree) -> String {
     // write (measured slower) than absorbing the occasional grow.
     let mut out = String::with_capacity(tree.source_len + tree.source_len / 8 + 64);
     let mut scratch = Scratch::new();
-    children(tree, tree.root, &mut out, &mut scratch);
+    render_with(tree, &mut out, &mut scratch);
     out
+}
+
+/// Render `tree` into a caller-owned buffer with a caller-owned scratch — both
+/// reused across renders by [`crate::Renderer`]. The caller clears `out`.
+pub(crate) fn render_with(tree: &Tree, out: &mut String, scratch: &mut Scratch) {
+    children(tree, tree.root, out, scratch);
 }
 
 /// Emit a newline unless `out` is empty or already ends with one. One byte

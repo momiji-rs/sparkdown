@@ -39,6 +39,14 @@ pub unsafe extern "C" fn sparkdown_free(ptr: *mut u8, len: usize) {
     }
 }
 
+thread_local! {
+    // A persistent context: its buffers stay warm across calls, so a long-lived
+    // wasm instance rendering many documents avoids re-allocating them on
+    // dlmalloc each time.
+    static RENDERER: core::cell::RefCell<crate::Renderer> =
+        core::cell::RefCell::new(crate::Renderer::new());
+}
+
 /// Render `len` UTF-8 bytes at `ptr` to HTML. Returns a pointer to a buffer
 /// `[u32 little-endian length][HTML bytes]`; free it with
 /// [`sparkdown_free`]`(ret, 4 + length)`.
@@ -49,14 +57,15 @@ pub unsafe extern "C" fn sparkdown_free(ptr: *mut u8, len: usize) {
 pub unsafe extern "C" fn sparkdown_to_html(ptr: *const u8, len: usize) -> *mut u8 {
     let input = unsafe { core::slice::from_raw_parts(ptr, len) };
     let md = String::from_utf8_lossy(input);
-    let html = crate::to_html(&md);
-    let bytes = html.as_bytes();
-
-    // Length-prefixed output so the host learns the size from one return value.
-    let mut out = Vec::<u8>::with_capacity(4 + bytes.len());
-    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-    out.extend_from_slice(bytes);
-    let ret = out.as_mut_ptr();
-    core::mem::forget(out);
-    ret
+    RENDERER.with(|cell| {
+        let mut r = cell.borrow_mut();
+        let bytes = r.render(&md).as_bytes();
+        // Length-prefixed output so the host learns the size from one return value.
+        let mut out = Vec::<u8>::with_capacity(4 + bytes.len());
+        out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(bytes);
+        let ret = out.as_mut_ptr();
+        core::mem::forget(out);
+        ret
+    })
 }
