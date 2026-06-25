@@ -172,12 +172,18 @@ fn block(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> (Mdast
             if value.ends_with('\n') {
                 value.pop();
             }
-            // Fenced blocks already end at the closing fence; indented blocks end
-            // after the last content line (trailing blanks excluded).
+            // Fenced blocks span their full source (incl. the closing fence, or
+            // the trailing newline of an unclosed block); indented blocks trim
+            // trailing blank lines.
             let eb = if node.fenced { se } else { ctx.rtrim(sb, se) };
             (Mdast::Code { lang, meta, value }, sb, eb)
         }
-        Kind::HtmlBlock => (Mdast::Html(tree.html_value(idx).to_owned()), sb, ctx.rtrim_nl(se)),
+        Kind::HtmlBlock => {
+            // The position end matches where the `value` ends (type-1-at-EOF
+            // keeps its trailing newline; others drop one line ending) — not the
+            // node's raw `src_end`, which may run past trailing blank lines.
+            (Mdast::Html(tree.html_value(idx).to_owned()), sb, tree.html_ast_end(idx) as usize)
+        }
         Kind::Definition => {
             let d = tree.definition(idx);
             (

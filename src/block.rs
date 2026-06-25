@@ -267,6 +267,16 @@ impl Tree<'_> {
         let store = if n.content_src { self.source } else { &self.buf };
         &store[n.cstart as usize..n.html_ast_cend as usize]
     }
+
+    /// SPIKE (`ast` feature): the mdast `position.end` source offset of a
+    /// `Kind::HtmlBlock` — where its `value` ends, mapped from content space to
+    /// source (buffered when inside a blockquote/list). The block's `src_end`
+    /// may over-include trailing blank lines, so prefer this.
+    #[cfg(feature = "ast")]
+    pub fn html_ast_end(&self, idx: usize) -> u32 {
+        let n = &self.nodes[idx];
+        self.content_to_src(idx, n.html_ast_cend - n.cstart)
+    }
 }
 
 /// Parse `src` (CommonMark, no options) into a block tree plus its link
