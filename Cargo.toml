@@ -1,12 +1,12 @@
 [package]
 name = "sparkdown"
-description = "A fast, standards-first CommonMark parser in Rust — markdown, with a spark"
-version = "0.0.1"
+description = "Fast, zero-dependency CommonMark 0.31.2 parser — 100% conformant and byte-identical to cmark, with opt-in GFM extensions (the `gfm` feature)."
+version = "0.0.2"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
 repository = "https://github.com/momiji-rs/sparkdown"
-keywords = ["markdown", "commonmark", "html", "parser"]
+keywords = ["markdown", "commonmark", "gfm", "html", "parser"]
 categories = ["text-processing", "parser-implementations"]
 authors = ["rubyrs contributors"]
 

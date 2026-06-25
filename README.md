@@ -143,6 +143,15 @@ and edge runtimes with no `fetch`/`fs`/WASI setup. It ships two ways:
   (with SHA-256 sums) are attached to each tagged release, for non-JS hosts
   (wasmtime, wazero, Workers, Python, …) that want the bare module.
 
+Against the popular JS markdown libraries, in Node on the same 198 KB document,
+sparkdown's **wasm** still wins comfortably:
+
+| library          |    time | relative |
+| ---------------- | ------: | -------: |
+| **sparkdown (wasm)** | **0.90 ms** | 1.00× |
+| markdown-it      | 4.52 ms |    5.0× |
+| marked           | 5.20 ms |    5.7× |
+
 ```bash
 npm install @momiji-rs/sparkdown
 ```

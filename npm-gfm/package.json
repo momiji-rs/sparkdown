@@ -1,6 +1,6 @@
 {
   "name": "@momiji-rs/sparkdown-gfm",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "Fast CommonMark + GitHub Flavored Markdown → HTML (strikethrough, task lists, autolinks, tag filter, tables), as WASI-free WebAssembly. Zero dependencies; runs in Node, browsers, bundlers, Deno, and edge runtimes.",
   "type": "module",
   "main": "./sparkdown.mjs",
