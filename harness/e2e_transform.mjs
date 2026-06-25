@@ -18,7 +18,7 @@ import remarkRehype from 'remark-rehype';
 import rehypeStringify from 'rehype-stringify';
 import { toHast } from 'mdast-util-to-hast';
 import { toHtml } from 'hast-util-to-html';
-import { markdownToHtml, defineMdastPlugin } from 'satteri';
+import { markdownToHtml } from 'satteri';
 import { parseToMdastWire } from './sparkdown.mjs';
 
 const LARGE = readFileSync(new URL('../tests/fixtures/data.md', import.meta.url), 'utf8');
@@ -40,15 +40,17 @@ function transform(tree) {
   });
   return tree;
 }
-// Sätteri equivalent: an mdast visitor plugin in its own API (runs in-arena).
-const satTransform = defineMdastPlugin({
+// Sätteri equivalent, in ITS plugin API. NOTE the different mutation model:
+// the visited node is read-only and a change is expressed by RETURNING a
+// replacement node (Sätteri encodes it into a binary command buffer applied in
+// Rust) — you cannot mutate in place like a unist visitor. The visitor functions
+// are still JS, fired per subscribed node, so this is NOT free-in-Rust work.
+const satTransform = {
   name: 'transform',
-  createOnce: () => ({
-    heading(n) { n.data = { hProperties: { id: `h-${n.depth}` } }; },
-    link(n) { n.data = { hProperties: { rel: 'nofollow', target: '_blank' } }; },
-    text(n) { if (n.value.includes('--')) n.value = n.value.replace(/--/g, '—'); },
-  }),
-});
+  heading(n) { return { ...n, data: { ...(n.data || {}), hProperties: { id: `h-${n.depth}` } } }; },
+  link(n) { return { ...n, data: { ...(n.data || {}), hProperties: { rel: 'nofollow', target: '_blank' } } }; },
+  text(n) { if (n.value.includes('--')) return { ...n, value: n.value.replace(/--/g, '—') }; },
+};
 
 function best(fn, iters, trials = 12) {
   for (let i = 0; i < Math.min(20, iters); i++) fn();
@@ -107,12 +109,25 @@ r('1. parse      md -> mdast  (remark-parse)', tParseRemark, remarkTotal);
 r('   TOTAL (remark -> unified, same stages 2-4)', remarkTotal, remarkTotal);
 
 console.log('\nWHOLE TASK md -> HTML (with the same transformer):');
+const F = { features: { gfm: false, frontmatter: false } };
+// sanity: confirm Sätteri's transform actually applied (else the compare is unfair)
+const satOut = markdownToHtml(LARGE, { ...F, mdastPlugins: [satTransform] }).html;
+const satApplied = satOut !== markdownToHtml(LARGE, F).html;
 const fullWire = best(() => String(wireProc.processSync(LARGE)), 20);
 const fullRemark = best(() => String(remarkProc.processSync(LARGE)), 12);
-const fullSat = best(() => markdownToHtml(LARGE, { features: { gfm: false, frontmatter: false }, mdastPlugins: [satTransform] }).html, 50);
+const fullSatBase = best(() => markdownToHtml(LARGE, F).html, 50);
+const fullSat = best(() => markdownToHtml(LARGE, { ...F, mdastPlugins: [satTransform] }).html, 50);
+console.log(`  (sätteri transform applied: ${satApplied ? '✅' : '❌ NOT — unfair!'})`);
 const lo = Math.min(fullWire, fullRemark, fullSat);
-const w = (l, ms) => console.log(`  ${l.padEnd(40)} ${ms.toFixed(2).padStart(7)} ms   ${(ms / lo).toFixed(2)}x`);
-w('satteri (all-Rust pipeline)', fullSat);
+const w = (l, ms) => console.log(`  ${l.padEnd(42)} ${ms.toFixed(2).padStart(7)} ms   ${(ms / lo).toFixed(2)}x`);
+w('satteri (parse+transform+hast+render)', fullSat);
 w('sparkdown wire -> unified (parse in wasm)', fullWire);
 w('remark (pure JS)', fullRemark);
 console.log();
+// The decisive nuance: the TRANSFORM itself is JS on both sides and costs ~the
+// same. Sätteri's win is the tree never leaving Rust (no JS materialize / hast /
+// stringify) — NOT a faster transform.
+console.log(`  sätteri transform cost   (full - base):  ${(fullSat - fullSatBase).toFixed(2)} ms   (base, no plugin: ${fullSatBase.toFixed(2)} ms)`);
+console.log(`  sparkdown transform cost (stage 2)    :  ${tTransform.toFixed(2)} ms`);
+console.log('  → transform ≈ a tie (both run JS visitors); the gap is sparkdown doing');
+console.log('    materialize + mdast→hast + hast→html in JS (stages 1,3,4) vs Sätteri in Rust.');
