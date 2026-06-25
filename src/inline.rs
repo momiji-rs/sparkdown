@@ -1724,7 +1724,13 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                     }
                 } else {
                     // Soft break stays as text "\n"; in AST mode it is folded into
-                    // the surrounding text node.
+                    // the surrounding text node. When the segment is still empty,
+                    // any trailing spaces dropped here would otherwise become the
+                    // next text node's *leading* bytes — start it at the newline.
+                    #[cfg(feature = "ast")]
+                    if cur.len() == seg {
+                        cseg = i;
+                    }
                     cur.push_str(if hard || HW { "<br />\n" } else { "\n" });
                     i = skip_spaces(bytes, i + 1);
                 }
