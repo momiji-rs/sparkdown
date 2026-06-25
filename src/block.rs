@@ -346,6 +346,11 @@ struct Parser<'a> {
     /// source positions.
     #[cfg(feature = "ast")]
     buf_segs: Vec<(u32, u32)>,
+    /// SPIKE (`ast` feature): set during the end-of-document finalize sweep. An
+    /// unclosed fenced code block keeps its trailing newline only when it ends at
+    /// EOF; one ended mid-document (blank line / container exit) drops it.
+    #[cfg(feature = "ast")]
+    at_eof: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -381,6 +386,8 @@ impl<'a> Parser<'a> {
             defs: Vec::new(),
             #[cfg(feature = "ast")]
             buf_segs: Vec::new(),
+            #[cfg(feature = "ast")]
+            at_eof: false,
         }
     }
 
@@ -759,6 +766,21 @@ impl<'a> Parser<'a> {
                     self.nodes[idx].info_start = ts as u32;
                     self.nodes[idx].info_end = te as u32;
                     self.nodes[idx].cstart = (s + nl + 1).min(e) as u32;
+                    // SPIKE (`ast`): an unclosed fenced block ended mid-document
+                    // (blank line / container exit) drops its trailing newline;
+                    // one ended at EOF (or by its closing fence) keeps its span.
+                    #[cfg(feature = "ast")]
+                    if !self.at_eof {
+                        let se = self.nodes[idx].src_end as usize;
+                        let b = self.source.as_bytes();
+                        if se > 0 && b[se - 1] == b'\n' {
+                            let mut x = se - 1;
+                            if x > 0 && b[x - 1] == b'\r' {
+                                x -= 1;
+                            }
+                            self.nodes[idx].src_end = x as u32;
+                        }
+                    }
                 } else {
                     let keep = {
                         let store: &str = if csrc { self.source } else { &self.buf };
@@ -925,6 +947,10 @@ impl<'a> Parser<'a> {
             self.line_src_start = start;
             self.incorporate_line(&bytes[start..end]);
             start = end + 1;
+        }
+        #[cfg(feature = "ast")]
+        {
+            self.at_eof = true;
         }
         while self.tip != 0 {
             let t = self.tip;
