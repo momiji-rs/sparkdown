@@ -336,6 +336,41 @@ pub(crate) fn find_emph_gfm(hay: &[u8]) -> Option<usize> {
     find_in_set(hay, &EMPH_GFM_LO, &EMPH_GFM_HI)
 }
 
+/// Augment a nibble-set with the GFM extended-autolink trigger bytes `@ h H w
+/// W`, so the autolink scan can SIMD-skip to the next trigger or special instead
+/// of crawling byte-by-byte. The set stays exact: a byte's (lo, hi) nibble pair
+/// uniquely identifies it, and `hi_table[h]` only ever holds `1 << h`.
+const fn with_al_triggers(mut lo: [u8; 16], mut hi: [u8; 16]) -> ([u8; 16], [u8; 16]) {
+    let triggers = [b'@', b'h', b'H', b'w', b'W'];
+    let mut i = 0;
+    while i < triggers.len() {
+        let b = triggers[i];
+        lo[(b & 0x0f) as usize] |= 1u8 << (b >> 4);
+        hi[(b >> 4) as usize] |= 1u8 << (b >> 4);
+        i += 1;
+    }
+    (lo, hi)
+}
+
+const STREAM_AL: ([u8; 16], [u8; 16]) = with_al_triggers(STREAM_LO, STREAM_HI);
+const INLINE_AL: ([u8; 16], [u8; 16]) = with_al_triggers(INLINE_LO, INLINE_HI);
+const INLINE_GFM_AL: ([u8; 16], [u8; 16]) = with_al_triggers(INLINE_GFM_LO, INLINE_GFM_HI);
+
+#[inline]
+pub(crate) fn find_stream_al(hay: &[u8]) -> Option<usize> {
+    find_in_set(hay, &STREAM_AL.0, &STREAM_AL.1)
+}
+
+#[inline]
+pub(crate) fn find_inline_al(hay: &[u8]) -> Option<usize> {
+    find_in_set(hay, &INLINE_AL.0, &INLINE_AL.1)
+}
+
+#[inline]
+pub(crate) fn find_inline_gfm_al(hay: &[u8]) -> Option<usize> {
+    find_in_set(hay, &INLINE_GFM_AL.0, &INLINE_GFM_AL.1)
+}
+
 #[inline]
 fn in_set(b: u8, lo: &[u8; 16], hi: &[u8; 16]) -> bool {
     lo[(b & 0x0F) as usize] & hi[(b >> 4) as usize] != 0
@@ -657,6 +692,19 @@ mod tests {
             h.iter()
                 .position(|&b| matches!(b, b'*' | b'_' | b'[' | b'~'))
         };
+        let trig = |b: u8| matches!(b, b'@' | b'h' | b'H' | b'w' | b'W');
+        let stream_al_scalar = |h: &[u8]| {
+            h.iter()
+                .position(|&b| stream_scalar(&[b]) == Some(0) || trig(b))
+        };
+        let inline_al_scalar = |h: &[u8]| {
+            h.iter()
+                .position(|&b| inline_scalar(&[b]) == Some(0) || trig(b))
+        };
+        let inline_gfm_al_scalar = |h: &[u8]| {
+            h.iter()
+                .position(|&b| inline_gfm_scalar(&[b]) == Some(0) || trig(b))
+        };
         let bytes: Vec<u8> = (0u8..=255).cycle().take(400).collect();
         for len in 0..bytes.len() {
             let hay = &bytes[..len];
@@ -672,6 +720,21 @@ mod tests {
                 find_emph_gfm(hay),
                 emph_gfm_scalar(hay),
                 "emph_gfm len={len}"
+            );
+            assert_eq!(
+                find_stream_al(hay),
+                stream_al_scalar(hay),
+                "stream_al {len}"
+            );
+            assert_eq!(
+                find_inline_al(hay),
+                inline_al_scalar(hay),
+                "inline_al {len}"
+            );
+            assert_eq!(
+                find_inline_gfm_al(hay),
+                inline_gfm_al_scalar(hay),
+                "inline_gfm_al {len}"
             );
         }
         // Each member at every position; and no false positives for neighbours.

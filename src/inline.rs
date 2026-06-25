@@ -11,7 +11,10 @@
 use crate::entities::{named, remap_numeric};
 use crate::options::Options;
 use crate::render::escape_html;
-use crate::scan::{find_emph, find_emph_gfm, find_inline, find_inline_gfm, find_stream};
+use crate::scan::{
+    find_emph, find_emph_gfm, find_inline, find_inline_al, find_inline_gfm, find_inline_gfm_al,
+    find_stream, find_stream_al,
+};
 use std::borrow::Cow;
 use std::collections::HashMap;
 
@@ -993,7 +996,8 @@ fn stream_autolink(src: &str, out: &mut String, hw: bool, tf: bool) {
                     i += 1;
                 }
             }
-            _ => i += 1,
+            // SIMD-skip to the next special or autolink trigger.
+            _ => i += 1 + find_stream_al(&bytes[i + 1..]).unwrap_or(bytes.len() - i - 1),
         }
     }
     escape_html(&src[run..], out);
@@ -1329,19 +1333,22 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                 }
             }
             // Skip plain text to the next significant byte in one SIMD pass —
-            // byte-by-byte when autolink is on so the triggers above are seen.
+            // SIMD-skip to the next special — when autolink is on, the set also
+            // includes the `w`/`h`/`@` triggers handled by the arms above.
             _ => {
-                if al {
-                    i += 1;
-                } else {
-                    let rest = &bytes[i + 1..];
-                    let skip = if ST {
-                        find_inline_gfm(rest)
+                let rest = &bytes[i + 1..];
+                let skip = if ST {
+                    if al {
+                        find_inline_gfm_al(rest)
                     } else {
-                        find_inline(rest)
-                    };
-                    i += 1 + skip.unwrap_or(bytes.len() - i - 1);
-                }
+                        find_inline_gfm(rest)
+                    }
+                } else if al {
+                    find_inline_al(rest)
+                } else {
+                    find_inline(rest)
+                };
+                i += 1 + skip.unwrap_or(bytes.len() - i - 1);
             }
         }
     }
