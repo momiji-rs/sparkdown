@@ -693,11 +693,13 @@ pub struct SpanTok {
 /// SPIKE: reverse [`escape_html`] (`&amp;`/`&lt;`/`&gt;`/`&quot;` only) to recover
 /// an mdast `text` value from a rendered span. escape_html escapes exactly these
 /// four, after entity/backslash resolution — so this is exact, not heuristic.
+/// Returns a borrow when the span needs no unescaping (the overwhelming common
+/// case), so the sink path can stream it to the wire with zero allocation.
 /// Unconditional (dead without `ast`) so AST branches compile in every build.
 #[allow(dead_code)]
-fn unescape_html_text(s: &str) -> String {
+fn unescape_html_text(s: &str) -> Cow<'_, str> {
     if !s.contains('&') {
-        return s.to_owned();
+        return Cow::Borrowed(s);
     }
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
@@ -722,7 +724,7 @@ fn unescape_html_text(s: &str) -> String {
         }
     }
     out.push_str(rest);
-    out
+    Cow::Owned(out)
 }
 
 /// SPIKE: convert the resolved slot list into the semantic [`InlineTok`] stream.
@@ -738,7 +740,7 @@ fn list_to_tokens(list: &List, cur: &str, sem: &[Sem], out: &mut Vec<SpanTok>) {
             Node::Span { start, end } => {
                 let t = unescape_html_text(&cur[*start..*end]);
                 if !t.is_empty() {
-                    push(InlineTok::Text(t));
+                    push(InlineTok::Text(t.into_owned()));
                 }
             }
             Node::Tag(t) => push(match *t {
@@ -787,6 +789,138 @@ fn list_to_tokens(list: &List, cur: &str, sem: &[Sem], out: &mut Vec<SpanTok>) {
         }
         node = list.slots[idx].next;
     }
+}
+
+/// SPIKE (`ast` feature): a streaming visitor for the resolved inline list — the
+/// allocation-free counterpart of [`list_to_tokens`]. Where `list_to_tokens`
+/// materializes an owned [`SpanTok`] vector (one `String` per text span, cloned
+/// payloads), [`emit_inline`] walks the same slot list and hands the consumer
+/// *borrowed* `&str` slices, so a wire emitter can copy straight to its output
+/// with no intermediate token vector and no per-span allocation.
+///
+/// Container nesting is expressed as `open`/`close` pairs (emphasis/strong/delete
+/// and links alike); the consumer reconstructs the tree with its own stack.
+/// Positions are the content byte range `[start, end)` (`start == u32::MAX` =
+/// unknown → fall back to the block span). Adjacent text is already coalesced by
+/// [`emit_inline`], so every [`text`](InlineSink::text) call is one whole run.
+#[cfg(feature = "ast")]
+pub trait InlineSink {
+    fn text(&mut self, value: &str, start: u32, end: u32);
+    fn open(&mut self, kind: &'static str, start: u32, end: u32);
+    fn close(&mut self, start: u32, end: u32);
+    fn code(&mut self, value: &str, start: u32, end: u32);
+    fn html(&mut self, value: &str, start: u32, end: u32);
+    fn brk(&mut self, start: u32, end: u32);
+    fn image(&mut self, url: &str, title: Option<&str>, alt: &str, start: u32, end: u32);
+    fn autolink(&mut self, url: &str, text: &str, start: u32, end: u32);
+    fn link_open(&mut self, url: &str, title: Option<&str>, start: u32, end: u32);
+    fn linkref_open(&mut self, identifier: &str, label: &str, reftype: &'static str, start: u32, end: u32);
+    fn imageref(
+        &mut self,
+        identifier: &str,
+        label: &str,
+        reftype: &'static str,
+        alt: &str,
+        start: u32,
+        end: u32,
+    );
+}
+
+/// SPIKE (`ast`): drive an [`InlineSink`] over the resolved slot list, coalescing
+/// runs of adjacent text into a single borrowed (or, only when ≥2 pieces must be
+/// joined, buffered) `&str` — mirroring [`list_to_tokens`] node-for-node but
+/// without owning anything.
+#[cfg(feature = "ast")]
+fn emit_inline<S: InlineSink>(list: &List, cur: &str, sem: &[Sem], sink: &mut S) {
+    // The in-flight text run: borrowed while it stays a single piece, promoted to
+    // an owned buffer (via `Cow::to_mut`) only when a second adjacent piece joins.
+    let mut run: Option<(Cow<'_, str>, u32, u32)> = None;
+    macro_rules! flush {
+        () => {
+            if let Some((s, st, en)) = run.take() {
+                sink.text(&s, st, en); // non-empty: empty pieces never start a run
+            }
+        };
+    }
+    macro_rules! add_text {
+        ($piece:expr, $st:expr, $en:expr) => {{
+            let piece: Cow<'_, str> = $piece;
+            if !piece.is_empty() {
+                if let Some((buf, _, pe)) = run.as_mut() {
+                    buf.to_mut().push_str(&piece);
+                    *pe = $en;
+                } else {
+                    run = Some((piece, $st, $en));
+                }
+            }
+        }};
+    }
+
+    let mut node = list.head;
+    while let Some(idx) = node {
+        let (s, e) = list.slots[idx].cspan;
+        match &list.slots[idx].node {
+            Node::Span { start, end } => add_text!(unescape_html_text(&cur[*start..*end]), s, e),
+            Node::Tag(t) => match *t {
+                "<em>" => {
+                    flush!();
+                    sink.open("emphasis", s, e);
+                }
+                "</em>" => {
+                    flush!();
+                    sink.close(s, e);
+                }
+                "<strong>" => {
+                    flush!();
+                    sink.open("strong", s, e);
+                }
+                "</strong>" => {
+                    flush!();
+                    sink.close(s, e);
+                }
+                "<del>" => {
+                    flush!();
+                    sink.open("delete", s, e);
+                }
+                "</del>" => {
+                    flush!();
+                    sink.close(s, e);
+                }
+                // Unconsumed literal brackets stay as text.
+                lit => add_text!(Cow::Borrowed(lit), s, e),
+            },
+            Node::Delim { ch, count, .. } => {
+                let mut tmp = String::with_capacity(*count);
+                for _ in 0..*count {
+                    tmp.push(*ch as char);
+                }
+                add_text!(Cow::Owned(tmp), s, e);
+            }
+            Node::Sem(i) => {
+                flush!();
+                match &sem[*i as usize] {
+                    Sem::Code(v) => sink.code(v, s, e),
+                    Sem::LinkOpen { url, title } => sink.link_open(url, title.as_deref(), s, e),
+                    Sem::Image { url, title, alt } => sink.image(url, title.as_deref(), alt, s, e),
+                    Sem::Autolink { url, text } => sink.autolink(url, text, s, e),
+                    Sem::Html(h) => sink.html(h, s, e),
+                    Sem::Break => sink.brk(s, e),
+                    Sem::LinkRef { identifier, label, reftype } => {
+                        sink.linkref_open(identifier, label, reftype, s, e)
+                    }
+                    Sem::ImageRef { identifier, label, reftype, alt } => {
+                        sink.imageref(identifier, label, reftype, alt, s, e)
+                    }
+                }
+            }
+            Node::LinkClose => {
+                flush!();
+                sink.close(s, e);
+            }
+        }
+        node = list.slots[idx].next;
+    }
+    flush!();
 }
 
 struct Slot {
@@ -992,6 +1126,12 @@ pub struct Scratch {
     /// compiled in `ast` builds.
     #[cfg(feature = "ast")]
     toks: Option<Vec<SpanTok>>,
+    /// SPIKE (`ast` feature): when `true`, `render_inline` resolves the inline
+    /// list as usual but emits nothing and *leaves* `list`/`cur`/`sem` populated,
+    /// so [`render_inline_to_sink`] can stream them through an [`InlineSink`] with
+    /// no intermediate [`SpanTok`] vector. Mutually exclusive with `toks`.
+    #[cfg(feature = "ast")]
+    resolve: bool,
 }
 
 impl Scratch {
@@ -1004,6 +1144,8 @@ impl Scratch {
             sem: Vec::new(),
             #[cfg(feature = "ast")]
             toks: None,
+            #[cfg(feature = "ast")]
+            resolve: false,
         }
     }
     fn reset(&mut self) {
@@ -1405,6 +1547,28 @@ pub fn render_inline_to_tokens(
     scratch.toks.take().unwrap_or_default()
 }
 
+/// SPIKE (`ast` feature): parse `src`'s inline content and stream it through
+/// `sink` with no intermediate [`SpanTok`] vector. Runs the same resolution as
+/// [`render_inline_to_tokens`], but instead of materializing owned tokens it
+/// leaves the resolved list in `scratch` and walks it with [`emit_inline`],
+/// handing the sink borrowed slices. This is the allocation-light path the binary
+/// wire emitter uses.
+#[cfg(feature = "ast")]
+pub fn render_inline_to_sink<S: InlineSink>(
+    src: &str,
+    refmap: &RefMap,
+    scratch: &mut Scratch,
+    opts: Options,
+    sink: &mut S,
+) {
+    scratch.resolve = true;
+    let mut unused = String::new(); // no HTML emitted in resolve mode
+    render_inline(src, &mut unused, refmap, scratch, opts);
+    scratch.resolve = false;
+    // `render_inline` left the resolved nodes in place; walk them into the sink.
+    emit_inline(&scratch.list, &scratch.cur, &scratch.sem, sink);
+}
+
 #[allow(unused_assignments)] // `seg` is updated at segment ends; the last is unused
 fn render_inline_impl<const HW: bool, const ST: bool>(
     src: &str,
@@ -1419,7 +1583,11 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
     // compile-time `false` without the `ast` feature, so every `if ast_mode {…}`
     // branch below is dead-code-eliminated and the fast path is untouched.
     #[cfg(feature = "ast")]
-    let ast_mode = scratch.toks.is_some();
+    let ast_mode = scratch.toks.is_some() || scratch.resolve;
+    // Captured before the `list`/`cur`/`sem` borrows below so it can be read at the
+    // emission tail without re-borrowing `scratch`.
+    #[cfg(feature = "ast")]
+    let resolve = scratch.resolve;
     #[cfg(not(feature = "ast"))]
     let ast_mode = false;
     // Fast path: no emphasis/link (or `~` when ST) delimiters → stream directly.
@@ -1797,11 +1965,18 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
     flush!(block_text_end);
 
     process_emphasis(list, stack, 0);
-    // SPIKE: materialize owned inline nodes instead of rendering to `out`. The
-    // `list`/`cur` borrows of `scratch` end at the `list_to_tokens` call, so the
-    // disjoint `scratch.toks` field can be assigned right after.
+    // SPIKE: in AST mode, capture semantic nodes instead of rendering to `out`.
     #[cfg(feature = "ast")]
     if ast_mode {
+        // Sink mode: leave `list`/`cur`/`sem` populated; the caller
+        // (`render_inline_to_sink`) streams them through an `InlineSink` with no
+        // owned token vector.
+        if resolve {
+            return;
+        }
+        // Token mode: materialize the owned `SpanTok` vector. The `list`/`cur`
+        // borrows end at the `list_to_tokens` call, so the disjoint `scratch.toks`
+        // field can be assigned right after.
         let mut v = Vec::new();
         list_to_tokens(list, cur, sem, &mut v);
         scratch.toks = Some(v);

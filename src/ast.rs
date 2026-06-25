@@ -17,7 +17,9 @@
 //! step). Enough for position-reading plugins like remark-lint.
 
 use crate::block::{Kind, Tree, parse};
-use crate::inline::{InlineTok, Scratch, SpanTok, render_inline_to_tokens};
+use crate::inline::{
+    InlineSink, InlineTok, Scratch, SpanTok, render_inline_to_sink, render_inline_to_tokens,
+};
 
 /// An owned mdast node. Field names mirror the mdast spec so a thin serializer
 /// (in the example) maps each to `{ type, ... }` verbatim.
@@ -489,6 +491,12 @@ fn w_opt(o: &Option<String>, out: &mut Vec<u8>) {
         None => w_u32(u32::MAX, out),
     }
 }
+fn w_opt_str(o: Option<&str>, out: &mut Vec<u8>) {
+    match o {
+        Some(s) => w_str(s, out),
+        None => w_u32(u32::MAX, out),
+    }
+}
 fn reftype_code(r: &str) -> u8 {
     match r {
         "shortcut" => 0,
@@ -668,8 +676,9 @@ fn bchildren(
 }
 
 /// Emit a text block's inline children straight to wire; return the child count.
-/// Streaming form of [`build_inline`]: an open container backpatches its end
-/// position and child count at its close; adjacent text coalesces into one run.
+/// Drives a [`WireSink`] over the resolved inline list via [`render_inline_to_sink`]
+/// — no intermediate [`SpanTok`] vector, no per-span `String`: the sink copies
+/// borrowed slices straight into `out`, backpatching container ends/counts at close.
 fn inline_wire(
     tree: &Tree,
     idx: usize,
@@ -679,176 +688,187 @@ fn inline_wire(
     eb: usize,
     out: &mut Vec<u8>,
 ) -> u32 {
-    let toks = render_inline_to_tokens(tree.content(idx), &tree.refmap, scratch, tree.opts);
-    let bpos = ctx.pos(sb, eb);
-    let map = |off: u32| tree.content_to_src(idx, off) as usize;
-    let mkpos = |s: u32, e: u32| -> Pos {
-        if s == u32::MAX {
-            bpos.clone()
-        } else {
-            let send = if e == 0 { map(0) } else { map(e - 1) + 1 };
-            ctx.pos(map(s), send)
-        }
+    let mut sink = WireSink {
+        out,
+        tree,
+        idx,
+        ctx,
+        bpos: ctx.pos(sb, eb),
+        stack: Vec::new(),
+        top: 0,
     };
-    // Open inline container: byte offsets to backpatch + opener span + child count.
-    struct Frame {
-        eoff: usize,
-        coff: usize,
-        os: u32,
-        oe: u32,
-        count: u32,
-    }
-    let mut stack: Vec<Frame> = Vec::new();
-    let mut top = 0u32;
-    let mut pend: Option<(String, u32, u32)> = None;
+    render_inline_to_sink(tree.content(idx), &tree.refmap, scratch, tree.opts, &mut sink);
+    sink.top
+}
 
-    macro_rules! bump {
-        () => {
-            match stack.last_mut() {
-                Some(f) => f.count += 1,
-                None => top += 1,
-            }
-        };
-    }
-    macro_rules! leaf_start {
-        ($s:expr) => {
-            if $s == u32::MAX { bpos.start } else { ctx.point(map($s)) }
-        };
-    }
+/// An open inline container: byte offsets to backpatch (end position + child
+/// count) plus the opener's content span and running child count.
+struct InlineFrame {
+    eoff: usize,
+    coff: usize,
+    os: u32,
+    oe: u32,
+    count: u32,
+}
 
-    for SpanTok { tok, start, end } in toks {
-        // Any non-text token first flushes the pending coalesced text run.
-        if !matches!(tok, InlineTok::Text(_))
-            && let Some((sx, ps, pe)) = pend.take()
-        {
-            let p = mkpos(ps, pe);
-            out.push(9);
-            w_point(out, p.start);
-            w_point(out, p.end);
-            w_str(&sx, out);
-            bump!();
-        }
-        match tok {
-            InlineTok::Text(s) => match &mut pend {
-                Some((buf, _, pe)) => {
-                    buf.push_str(&s);
-                    *pe = end;
-                }
-                None => pend = Some((s, start, end)),
-            },
-            InlineTok::Code(v) => {
-                let p = mkpos(start, end);
-                out.push(13);
-                w_point(out, p.start);
-                w_point(out, p.end);
-                w_str(&v, out);
-                bump!();
-            }
-            InlineTok::Html(h) => {
-                let p = mkpos(start, end);
-                out.push(8);
-                w_point(out, p.start);
-                w_point(out, p.end);
-                w_str(&h, out);
-                bump!();
-            }
-            InlineTok::Break => {
-                let p = mkpos(start, end);
-                out.push(14);
-                w_point(out, p.start);
-                w_point(out, p.end);
-                bump!();
-            }
-            InlineTok::Image { url, title, alt } => {
-                let p = mkpos(start, end);
-                out.push(16);
-                w_point(out, p.start);
-                w_point(out, p.end);
-                w_str(&url, out);
-                w_opt(&title, out);
-                w_str(&alt, out);
-                bump!();
-            }
-            InlineTok::ImageRef { identifier, label, reftype, alt } => {
-                let p = mkpos(start, end);
-                out.push(19);
-                w_point(out, p.start);
-                w_point(out, p.end);
-                w_str(&identifier, out);
-                w_str(&label, out);
-                out.push(reftype_code(reftype));
-                w_str(&alt, out);
-                bump!();
-            }
-            InlineTok::Autolink { url, text } => {
-                let p = mkpos(start, end);
-                out.push(15);
-                w_point(out, p.start);
-                w_point(out, p.end);
-                w_str(&url, out);
-                w_u32(u32::MAX, out); // title: None
-                w_u32(1, out); // one text child
-                let cp = mkpos(start.saturating_add(1), end.saturating_sub(1));
-                out.push(9);
-                w_point(out, cp.start);
-                w_point(out, cp.end);
-                w_str(&text, out);
-                bump!();
-            }
-            InlineTok::Open(kind) => {
-                bump!();
-                let tag = match kind {
-                    "strong" => 11,
-                    "delete" => 12,
-                    _ => 10,
-                };
-                out.push(tag);
-                w_point(out, leaf_start!(start));
-                let eoff = reserve(out, 12);
-                let coff = reserve(out, 4);
-                stack.push(Frame { eoff, coff, os: start, oe: end, count: 0 });
-            }
-            InlineTok::LinkOpen { url, title } => {
-                bump!();
-                out.push(15);
-                w_point(out, leaf_start!(start));
-                let eoff = reserve(out, 12);
-                w_str(&url, out);
-                w_opt(&title, out);
-                let coff = reserve(out, 4);
-                stack.push(Frame { eoff, coff, os: start, oe: end, count: 0 });
-            }
-            InlineTok::LinkRefOpen { identifier, label, reftype } => {
-                bump!();
-                out.push(18);
-                w_point(out, leaf_start!(start));
-                let eoff = reserve(out, 12);
-                w_str(&identifier, out);
-                w_str(&label, out);
-                out.push(reftype_code(reftype));
-                let coff = reserve(out, 4);
-                stack.push(Frame { eoff, coff, os: start, oe: end, count: 0 });
-            }
-            InlineTok::Close(_) | InlineTok::LinkClose => {
-                if let Some(f) = stack.pop() {
-                    let cend = if end > f.oe { end } else { f.oe };
-                    let p = mkpos(f.os, cend);
-                    patch_point(out, f.eoff, p.end);
-                    w_u32_at(out, f.coff, f.count);
-                }
-            }
+/// [`InlineSink`] that writes the binary wire form directly. Container nesting
+/// from the sink's `open`/`close` pairs is reconstructed with `stack`; each open
+/// reserves its end-position + child-count slots, patched when it closes.
+struct WireSink<'a> {
+    out: &'a mut Vec<u8>,
+    tree: &'a Tree<'a>,
+    idx: usize,
+    ctx: &'a PosCtx,
+    bpos: Pos,
+    stack: Vec<InlineFrame>,
+    top: u32,
+}
+
+impl WireSink<'_> {
+    #[inline]
+    fn map(&self, off: u32) -> usize {
+        self.tree.content_to_src(self.idx, off) as usize
+    }
+    /// Position for a content span `[s, e)`; `s == u32::MAX` falls back to the
+    /// block span (mirrors `inline_wire`'s former `mkpos` closure exactly).
+    fn mkpos(&self, s: u32, e: u32) -> Pos {
+        if s == u32::MAX {
+            self.bpos.clone()
+        } else {
+            let send = if e == 0 { self.map(0) } else { self.map(e - 1) + 1 };
+            self.ctx.pos(self.map(s), send)
         }
     }
-    // Flush any trailing text run at the top level.
-    if let Some((sx, ps, pe)) = pend.take() {
-        let p = mkpos(ps, pe);
-        out.push(9);
-        w_point(out, p.start);
-        w_point(out, p.end);
-        w_str(&sx, out);
-        bump!();
+    fn leaf_start(&self, s: u32) -> (u32, u32, u32) {
+        if s == u32::MAX {
+            self.bpos.start
+        } else {
+            self.ctx.point(self.map(s))
+        }
     }
-    top
+    #[inline]
+    fn bump(&mut self) {
+        match self.stack.last_mut() {
+            Some(f) => f.count += 1,
+            None => self.top += 1,
+        }
+    }
+    /// Common leaf prologue: tag byte + full position.
+    fn leaf(&mut self, tag: u8, start: u32, end: u32) {
+        let p = self.mkpos(start, end);
+        self.out.push(tag);
+        w_point(self.out, p.start);
+        w_point(self.out, p.end);
+    }
+}
+
+impl InlineSink for WireSink<'_> {
+    fn text(&mut self, value: &str, start: u32, end: u32) {
+        self.leaf(9, start, end);
+        w_str(value, self.out);
+        self.bump();
+    }
+    fn code(&mut self, value: &str, start: u32, end: u32) {
+        self.leaf(13, start, end);
+        w_str(value, self.out);
+        self.bump();
+    }
+    fn html(&mut self, value: &str, start: u32, end: u32) {
+        self.leaf(8, start, end);
+        w_str(value, self.out);
+        self.bump();
+    }
+    fn brk(&mut self, start: u32, end: u32) {
+        self.leaf(14, start, end);
+        self.bump();
+    }
+    fn image(&mut self, url: &str, title: Option<&str>, alt: &str, start: u32, end: u32) {
+        self.leaf(16, start, end);
+        w_str(url, self.out);
+        w_opt_str(title, self.out);
+        w_str(alt, self.out);
+        self.bump();
+    }
+    fn imageref(
+        &mut self,
+        identifier: &str,
+        label: &str,
+        reftype: &'static str,
+        alt: &str,
+        start: u32,
+        end: u32,
+    ) {
+        self.leaf(19, start, end);
+        w_str(identifier, self.out);
+        w_str(label, self.out);
+        self.out.push(reftype_code(reftype));
+        w_str(alt, self.out);
+        self.bump();
+    }
+    fn autolink(&mut self, url: &str, text: &str, start: u32, end: u32) {
+        self.leaf(15, start, end);
+        w_str(url, self.out);
+        w_u32(u32::MAX, self.out); // title: None
+        w_u32(1, self.out); // one text child
+        let cp = self.mkpos(start.saturating_add(1), end.saturating_sub(1));
+        self.out.push(9);
+        w_point(self.out, cp.start);
+        w_point(self.out, cp.end);
+        w_str(text, self.out);
+        self.bump();
+    }
+    fn open(&mut self, kind: &'static str, start: u32, end: u32) {
+        self.bump();
+        let tag = match kind {
+            "strong" => 11,
+            "delete" => 12,
+            _ => 10,
+        };
+        let ls = self.leaf_start(start);
+        self.out.push(tag);
+        w_point(self.out, ls);
+        let eoff = reserve(self.out, 12);
+        let coff = reserve(self.out, 4);
+        self.stack.push(InlineFrame { eoff, coff, os: start, oe: end, count: 0 });
+    }
+    fn link_open(&mut self, url: &str, title: Option<&str>, start: u32, end: u32) {
+        self.bump();
+        let ls = self.leaf_start(start);
+        self.out.push(15);
+        w_point(self.out, ls);
+        let eoff = reserve(self.out, 12);
+        w_str(url, self.out);
+        w_opt_str(title, self.out);
+        let coff = reserve(self.out, 4);
+        self.stack.push(InlineFrame { eoff, coff, os: start, oe: end, count: 0 });
+    }
+    fn linkref_open(
+        &mut self,
+        identifier: &str,
+        label: &str,
+        reftype: &'static str,
+        start: u32,
+        end: u32,
+    ) {
+        self.bump();
+        let ls = self.leaf_start(start);
+        self.out.push(18);
+        w_point(self.out, ls);
+        let eoff = reserve(self.out, 12);
+        w_str(identifier, self.out);
+        w_str(label, self.out);
+        self.out.push(reftype_code(reftype));
+        let coff = reserve(self.out, 4);
+        self.stack.push(InlineFrame { eoff, coff, os: start, oe: end, count: 0 });
+    }
+    fn close(&mut self, _start: u32, end: u32) {
+        if let Some(f) = self.stack.pop() {
+            let cend = if end > f.oe { end } else { f.oe };
+            let p = self.mkpos(f.os, cend);
+            patch_point(self.out, f.eoff, p.end);
+            w_u32_at(self.out, f.coff, f.count);
+        }
+    }
 }
 
 /// Append a JSON string literal (RFC 8259 escaping).
