@@ -47,6 +47,18 @@ thread_local! {
         core::cell::RefCell::new(crate::Renderer::new());
 }
 
+/// Box `bytes` as a freshly-allocated `[u32 little-endian length][bytes]` buffer
+/// and leak it; the host reads the length then the bytes, and frees with
+/// [`sparkdown_free`]`(ret, 4 + length)`.
+fn box_html(bytes: &[u8]) -> *mut u8 {
+    let mut out = Vec::<u8>::with_capacity(4 + bytes.len());
+    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(bytes);
+    let ret = out.as_mut_ptr();
+    core::mem::forget(out);
+    ret
+}
+
 /// Render `len` UTF-8 bytes at `ptr` to HTML. Returns a pointer to a buffer
 /// `[u32 little-endian length][HTML bytes]`; free it with
 /// [`sparkdown_free`]`(ret, 4 + length)`.
@@ -57,15 +69,31 @@ thread_local! {
 pub unsafe extern "C" fn sparkdown_to_html(ptr: *const u8, len: usize) -> *mut u8 {
     let input = unsafe { core::slice::from_raw_parts(ptr, len) };
     let md = String::from_utf8_lossy(input);
+    RENDERER.with(|cell| box_html(cell.borrow_mut().render(&md).as_bytes()))
+}
+
+/// Like [`sparkdown_to_html`] but applies GFM options from a bitmask: bit 0
+/// strikethrough, 1 task lists, 2 autolinks, 3 tag filter, 4 tables, 5 hard
+/// wraps. Only built with the `gfm` feature.
+///
+/// # Safety
+/// `ptr` must point to `len` readable, initialized bytes.
+#[cfg(feature = "gfm")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sparkdown_to_html_opts(ptr: *const u8, len: usize, flags: u32) -> *mut u8 {
+    let input = unsafe { core::slice::from_raw_parts(ptr, len) };
+    let md = String::from_utf8_lossy(input);
+    let opts = crate::Options {
+        strikethrough: flags & 1 != 0,
+        tasklist: flags & 2 != 0,
+        autolink: flags & 4 != 0,
+        tagfilter: flags & 8 != 0,
+        tables: flags & 16 != 0,
+        hard_wraps: flags & 32 != 0,
+    };
     RENDERER.with(|cell| {
         let mut r = cell.borrow_mut();
-        let bytes = r.render(&md).as_bytes();
-        // Length-prefixed output so the host learns the size from one return value.
-        let mut out = Vec::<u8>::with_capacity(4 + bytes.len());
-        out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-        out.extend_from_slice(bytes);
-        let ret = out.as_mut_ptr();
-        core::mem::forget(out);
-        ret
+        r.set_options(opts);
+        box_html(r.render(&md).as_bytes())
     })
 }
