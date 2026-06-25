@@ -54,7 +54,16 @@ fn render_node(tree: &Tree, idx: usize, out: &mut String, scratch: &mut Scratch)
                 cr(out);
                 out.push_str("<p>");
             }
-            render_inline(tree.content(idx), out, &tree.refmap, scratch, tree.opts);
+            // GFM task list: a list item's first paragraph led by `[ ]`/`[x]`
+            // emits a checkbox and drops the marker. Gated — off keeps the exact
+            // original path (no slice); on defers to the out-of-line `task_input`.
+            let content = tree.content(idx);
+            let content = if tree.opts.tasklist {
+                &content[task_input(tree, idx, out)..]
+            } else {
+                content
+            };
+            render_inline(content, out, &tree.refmap, scratch, tree.opts);
             if !tight {
                 out.push_str("</p>");
                 cr(out);
@@ -131,6 +140,38 @@ fn render_node(tree: &Tree, idx: usize, out: &mut String, scratch: &mut Scratch)
             cr(out);
         }
     }
+}
+
+/// GFM task list: if `para` is the first child of a list item and begins with a
+/// `[ ]`/`[x]`/`[X]` marker (followed by whitespace or end), append the disabled
+/// checkbox `<input>` and return the byte count to strip from the content;
+/// otherwise return 0. Out-of-line and touching no recursive function, so it
+/// never perturbs the hot `render_node`'s codegen (a marker-handling branch
+/// inlined there cost ~0.5% on the default path).
+#[inline(never)]
+fn task_input(tree: &Tree, para: usize, out: &mut String) -> usize {
+    let item = tree.nodes[para].parent;
+    if tree.nodes[item].kind != Kind::Item || tree.first_child(item) != Some(para) {
+        return 0;
+    }
+    let s = tree.content(para).as_bytes();
+    if s.len() < 3 || s[0] != b'[' || s[2] != b']' {
+        return 0;
+    }
+    let checked = match s[1] {
+        b' ' => false,
+        b'x' | b'X' => true,
+        _ => return 0,
+    };
+    if !(s.len() == 3 || matches!(s[3], b' ' | b'\t' | b'\n')) {
+        return 0;
+    }
+    out.push_str(if checked {
+        "<input checked=\"\" disabled=\"\" type=\"checkbox\">"
+    } else {
+        "<input disabled=\"\" type=\"checkbox\">"
+    });
+    3
 }
 
 /// A paragraph is rendered bare (no `<p>`) when it is a direct child of an item

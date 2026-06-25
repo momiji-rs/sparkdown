@@ -72,3 +72,32 @@ fn strikethrough() {
     // Off by default.
     assert_eq!(to_html("~~foo~~"), "<p>~~foo~~</p>\n");
 }
+
+#[test]
+fn tasklist() {
+    let tl = Options {
+        tasklist: true,
+        ..Options::default()
+    };
+    let go = |s: &str| to_html_with(s, &tl);
+    // Tight list: bare <li>, checkbox replaces the marker (GFM §5.3).
+    assert_eq!(
+        go("- [ ] foo\n- [x] bar\n"),
+        "<ul>\n<li><input disabled=\"\" type=\"checkbox\"> foo</li>\n\
+         <li><input checked=\"\" disabled=\"\" type=\"checkbox\"> bar</li>\n</ul>\n"
+    );
+    // Loose list: checkbox sits at the start of the wrapped <p>.
+    assert_eq!(
+        go("- [ ] a\n\n- [x] b\n"),
+        "<ul>\n<li>\n<p><input disabled=\"\" type=\"checkbox\"> a</p>\n</li>\n\
+         <li>\n<p><input checked=\"\" disabled=\"\" type=\"checkbox\"> b</p>\n</li>\n</ul>\n"
+    );
+    // `[X]` and `*` bullets work; a marker not followed by space is not a task.
+    assert_eq!(
+        go("* [X] up\n"),
+        "<ul>\n<li><input checked=\"\" disabled=\"\" type=\"checkbox\"> up</li>\n</ul>\n"
+    );
+    assert_eq!(go("- [ ]x\n"), "<ul>\n<li>[ ]x</li>\n</ul>\n");
+    // Off by default.
+    assert_eq!(to_html("- [ ] foo\n"), "<ul>\n<li>[ ] foo</li>\n</ul>\n");
+}

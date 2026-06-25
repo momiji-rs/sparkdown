@@ -849,6 +849,11 @@ fn stream_inline<const HW: bool>(src: &str, out: &mut String) {
 /// the monomorphized inline renderer once per call so per-byte options
 /// (`hard_wraps`, `strikethrough`) resolved at this boundary cost nothing in the
 /// byte loop — disabled flags fold the gfm tables and the `~` arm away.
+///
+/// `inline`: this dispatcher is tiny (one match → a monomorphized impl); keeping
+/// it inlined at every call site keeps a new caller (e.g. the task-list renderer)
+/// from flipping the heuristic and adding a call per paragraph (~0.5%).
+#[inline]
 pub fn render_inline(
     src: &str,
     out: &mut String,
