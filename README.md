@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/momiji-rs/sparkdown/actions/workflows/ci.yml/badge.svg)](https://github.com/momiji-rs/sparkdown/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/sparkdown.svg)](https://crates.io/crates/sparkdown)
+[![npm](https://img.shields.io/npm/v/@momiji-rs/sparkdown.svg)](https://www.npmjs.com/package/@momiji-rs/sparkdown)
 [![docs.rs](https://img.shields.io/docsrs/sparkdown)](https://docs.rs/sparkdown)
 [![CommonMark 0.31.2](https://img.shields.io/badge/CommonMark-0.31.2%20100%25-brightgreen.svg)](https://spec.commonmark.org/0.31.2/)
 [![MSRV](https://img.shields.io/badge/MSRV-1.95%2B-blue.svg)](Cargo.toml)
@@ -63,6 +64,12 @@ portable part — absolute times are machine-specific. cmark was compared
 CLI-to-CLI on a 16 MB document (3.2× sparkdown's wall time and 3.1× its retired
 instructions); goldmark (Go) benches in comrak's tier.
 
+**As WebAssembly** — the npm package [`@momiji-rs/sparkdown`](#webassembly-npm)
+renders the same spec in **~1.33 ms** (`+simd128`, `+bulk-memory`; 652/652
+through the wasm), *still ahead of rushdown's native build*. The wasm tax over
+the 0.58 ms native is mostly the VM/bounds-check/`dlmalloc` floor — the lost
+SIMD and `memory.copy` are recovered by the wasm `v128` kernels and bulk-memory.
+
 The speed is from the default build alone — zero dependencies, no feature flags:
 
 - **Zero-copy** source borrowing for paragraph / code / HTML-block text, link
@@ -77,6 +84,33 @@ The speed is from the default build alone — zero dependencies, no feature flag
 <sub>rushdown's published benchmark lists pulldown-cmark at ~6 ms; that figure is
 inflated by a copy-paste bug in its harness — the pulldown timing closure also
 runs comrak. Measured correctly on the same fixture, pulldown-cmark is ~0.67 ms.</sub>
+
+## WebAssembly (npm)
+
+A **WASI-free** WebAssembly build ships on npm as
+[`@momiji-rs/sparkdown`](https://www.npmjs.com/package/@momiji-rs/sparkdown) —
+zero dependencies, self-contained (the wasm is base64-inlined), and runs in
+Node, browsers, bundlers, Deno, Bun, and edge runtimes with no `fetch`/`fs`/WASI
+setup.
+
+```bash
+npm install @momiji-rs/sparkdown
+```
+
+```js
+import { toHtml } from "@momiji-rs/sparkdown";
+const html = await toHtml("# Hello *world*");
+```
+
+Under the hood it's a `wasm32-unknown-unknown` build behind a tiny raw C-ABI
+(`sparkdown_alloc` / `sparkdown_free` / `sparkdown_to_html`) — no `wasm-bindgen`
+— so the same `.wasm` drives from any host. Enable the Rust side with the
+`wasm` feature:
+
+```bash
+RUSTFLAGS="-C target-feature=+simd128,+bulk-memory" \
+  cargo build --release --features wasm --target wasm32-unknown-unknown
+```
 
 ## What was reused from rostdown (and what wasn't)
 
