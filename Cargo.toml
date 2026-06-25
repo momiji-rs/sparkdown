@@ -57,6 +57,14 @@ criterion = { version = "5.0.0", package = "codspeed-criterion-compat" }
 name = "vs_pulldown"
 harness = false
 
+# Feature-tax: compare code paths (CommonMark / GFM / AST) on one corpus, and
+# the base `to_html` row across builds (does enabling a feature tax the hot
+# path?). Builds under any feature combo; gates each path internally.
+# Run: `cargo bench --bench feature_tax [--features "gfm ast"]`.
+[[bench]]
+name = "feature_tax"
+harness = false
+
 # SPIKE: AST-path tax (build + render an owned MDAST vs the direct fast path).
 # Run: `cargo bench --features ast --bench ast_tax`.
 [[bench]]
