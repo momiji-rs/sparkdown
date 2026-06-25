@@ -50,25 +50,28 @@ On the CommonMark spec itself (`tests/fixtures/data.md`, ~200 KB — the same
 fixture `cmark` and rushdown benchmark on), default build, Apple Mac Studio,
 measured in process:
 
-| engine                 |     time | relative |
-| ---------------------- | -------: | -------: |
-| **sparkdown**          | **0.58 ms** | **1.00×** |
-| pulldown-cmark         |  0.67 ms |    1.16× |
-| rushdown (cached)      |  1.36 ms |    2.35× |
-| cmark (C, reference)   |  ~1.9 ms |   ~3.2×  |
-| comrak                 |  2.00 ms |    3.45× |
-| markdown-rs            |  33.5 ms |      58× |
+| engine                    |        time | relative |
+| ------------------------- | ----------: | -------: |
+| **sparkdown**             | **0.58 ms** |   1.00×  |
+| pulldown-cmark            |     0.67 ms |    1.16× |
+| **sparkdown (wasm)** ¹    |     1.33 ms |    2.29× |
+| rushdown (cached)         |     1.36 ms |    2.35× |
+| cmark (C, reference)      |     ~1.9 ms |   ~3.2×  |
+| comrak                    |     2.00 ms |    3.45× |
+| markdown-rs               |     33.5 ms |      58× |
+
+¹ WebAssembly (`@momiji-rs/sparkdown`, `+simd128 +bulk-memory`); every other row
+is a native build. Even as wasm, sparkdown edges out rushdown's *native* build.
 
 `cargo bench` reproduces the sparkdown-vs-pulldown pair in-repo. Ratios are the
 portable part — absolute times are machine-specific. cmark was compared
 CLI-to-CLI on a 16 MB document (3.2× sparkdown's wall time and 3.1× its retired
 instructions); goldmark (Go) benches in comrak's tier.
 
-**As WebAssembly** — the npm package [`@momiji-rs/sparkdown`](#webassembly-npm)
-renders the same spec in **~1.33 ms** (`+simd128`, `+bulk-memory`; 652/652
-through the wasm), *still ahead of rushdown's native build*. The wasm tax over
-the 0.58 ms native is mostly the VM/bounds-check/`dlmalloc` floor — the lost
-SIMD and `memory.copy` are recovered by the wasm `v128` kernels and bulk-memory.
+The wasm row's tax over the 0.58 ms native is mostly the VM / bounds-check /
+`dlmalloc` floor: the *lost SIMD* and *byte-loop memcpy* are recovered by the
+wasm `v128` kernels and `+bulk-memory` (`memory.copy`), leaving ~2.3×. See
+[WebAssembly (npm)](#webassembly-npm).
 
 The speed is from the default build alone — zero dependencies, no feature flags:
 
