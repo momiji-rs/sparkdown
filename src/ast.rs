@@ -61,9 +61,12 @@ pub struct Pos {
     pub end: (u32, u32, u32),
 }
 
-/// Source position context: byte offset of each line start, + source length.
+/// Source position context: maps a source byte offset to a unist point. unist
+/// `offset`/`column` are **UTF-16** units (JS string indices), so we precompute a
+/// byte→UTF-16 prefix table alongside the line-start table.
 struct PosCtx {
-    line_off: Vec<usize>,
+    line_off: Vec<usize>, // byte offset of each line start
+    u16: Vec<u32>,        // u16[b] = UTF-16 units in src[0..b] (exact at char boundaries)
     src_len: usize,
     src: Vec<u8>,
 }
@@ -71,128 +74,170 @@ struct PosCtx {
 impl PosCtx {
     fn new(src: &str) -> Self {
         let mut line_off = vec![0usize];
-        for (i, &b) in src.as_bytes().iter().enumerate() {
-            if b == b'\n' {
-                line_off.push(i + 1);
+        let mut u16 = Vec::with_capacity(src.len() + 1);
+        let mut acc = 0u32;
+        for ch in src.chars() {
+            for _ in 0..ch.len_utf8() {
+                u16.push(acc); // every byte of `ch` maps to the pre-`ch` count
+            }
+            if ch == '\n' {
+                line_off.push(u16.len());
+            }
+            acc += ch.len_utf16() as u32;
+        }
+        u16.push(acc); // sentinel for `src_len`
+        PosCtx { line_off, u16, src_len: src.len(), src: src.as_bytes().to_vec() }
+    }
+
+    /// A `(line, column, offset)` point at a byte offset — column/offset in UTF-16.
+    fn point(&self, off: usize) -> (u32, u32, u32) {
+        let line = self.line_off.partition_point(|&s| s <= off).max(1);
+        let off16 = self.u16[off];
+        let col = off16 - self.u16[self.line_off[line - 1]] + 1;
+        (line as u32, col, off16)
+    }
+
+    fn pos(&self, start: usize, end: usize) -> Pos {
+        Pos { start: self.point(start), end: self.point(end) }
+    }
+
+    /// Drop trailing whitespace (spaces/tabs/line endings) from a byte range end.
+    fn rtrim(&self, start: usize, mut end: usize) -> usize {
+        while end > start && matches!(self.src[end - 1], b' ' | b'\t' | b'\n' | b'\r') {
+            end -= 1;
+        }
+        end
+    }
+
+    /// Drop a single trailing line ending.
+    fn rtrim_nl(&self, mut end: usize) -> usize {
+        if end > 0 && self.src[end - 1] == b'\n' {
+            end -= 1;
+            if end > 0 && self.src[end - 1] == b'\r' {
+                end -= 1;
             }
         }
-        PosCtx { line_off, src_len: src.len(), src: src.as_bytes().to_vec() }
-    }
-    /// A `(line, column, offset)` point at a byte offset.
-    fn point(&self, off: usize) -> (u32, u32, u32) {
-        // Line = last line_off ≤ off.
-        let line = self.line_off.partition_point(|&s| s <= off).max(1);
-        let col = off - self.line_off[line - 1] + 1;
-        (line as u32, col as u32, off as u32)
-    }
-    /// Block position from its 1-based start line. `end` covers the start line
-    /// only (accurate for single-line blocks; an approximation for multi-line —
-    /// documented in PLUGIN_FINDINGS.md). The whole-document root spans to EOF.
-    fn block_pos(&self, start_line: u32, is_root: bool) -> Pos {
-        if is_root {
-            return Pos { start: (1, 1, 0), end: self.point(self.src_len) };
-        }
-        let l = start_line.max(1) as usize;
-        let start_off = self.line_off[l - 1];
-        let mut end_off = *self.line_off.get(l).unwrap_or(&self.src_len);
-        if end_off > start_off && self.src.get(end_off - 1) == Some(&b'\n') {
-            end_off -= 1;
-        }
-        Pos { start: self.point(start_off), end: self.point(end_off) }
+        end
     }
 }
 
-/// Parse `src` and build the nested mdast tree (CommonMark), with unist
-/// `position` on block nodes.
+/// Parse `src` and build the nested mdast tree (CommonMark), with accurate unist
+/// `position` (UTF-16 line/column/offset) on every node.
 pub fn to_mdast(src: &str) -> Mdast {
     let tree = parse(src);
     let mut scratch = Scratch::new();
     let ctx = PosCtx::new(src);
-    block(&tree, tree.root, &mut scratch, &ctx)
+    block(&tree, tree.root, &mut scratch, &ctx).0
 }
 
-fn block(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> Mdast {
+/// Build a block node and return it plus its source byte end (for parent
+/// containers, whose end is their last child's end).
+fn block(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> (Mdast, usize) {
     let node = &tree.nodes[idx];
-    let inner = match node.kind {
-        Kind::Document => Mdast::Root(block_children(tree, idx, scratch, ctx)),
-        Kind::Paragraph => Mdast::Paragraph(inline(tree, idx, scratch, ctx)),
-        Kind::Heading => Mdast::Heading {
-            depth: node.level,
-            children: inline(tree, idx, scratch, ctx),
-        },
-        Kind::BlockQuote => Mdast::Blockquote(block_children(tree, idx, scratch, ctx)),
-        Kind::ThematicBreak => Mdast::ThematicBreak,
+    let (s, e) = tree.src_span(idx);
+    let (sb, se) = (s as usize, e as usize);
+    let (inner, start_b, end_b) = match node.kind {
+        Kind::Document => {
+            let (kids, _) = block_children(tree, idx, scratch, ctx);
+            (Mdast::Root(kids), 0, ctx.src_len)
+        }
+        Kind::Paragraph => {
+            let eb = ctx.rtrim(sb, se);
+            (Mdast::Paragraph(inline(tree, idx, scratch, ctx, sb, eb)), sb, eb)
+        }
+        Kind::Heading => {
+            // atx/setext span the whole line(s); the text child is trimmed.
+            let eb = ctx.rtrim_nl(se);
+            let depth = node.level;
+            (
+                Mdast::Heading { depth, children: inline(tree, idx, scratch, ctx, sb, eb) },
+                sb,
+                eb,
+            )
+        }
+        Kind::BlockQuote => {
+            let (kids, last) = block_children(tree, idx, scratch, ctx);
+            (Mdast::Blockquote(kids), sb, last.unwrap_or(se))
+        }
+        Kind::ThematicBreak => (Mdast::ThematicBreak, sb, ctx.rtrim_nl(se)),
         Kind::CodeBlock => {
             let (lang, meta) = code_info(tree.info(idx));
-            // mdast `code.value` excludes the terminating newline.
             let mut value = tree.content(idx).to_owned();
             if value.ends_with('\n') {
                 value.pop();
             }
-            Mdast::Code { lang, meta, value }
+            // Fenced blocks already end at the closing fence; indented blocks end
+            // after the last content line (trailing blanks excluded).
+            let eb = if node.fenced { se } else { ctx.rtrim(sb, se) };
+            (Mdast::Code { lang, meta, value }, sb, eb)
         }
-        // mdast keeps the html block's raw value (trailing-newline rule applied
-        // in the block parser; differs from the HTML-render content).
-        Kind::HtmlBlock => Mdast::Html(tree.html_value(idx).to_owned()),
+        Kind::HtmlBlock => (Mdast::Html(tree.html_value(idx).to_owned()), sb, ctx.rtrim_nl(se)),
         Kind::Definition => {
             let d = tree.definition(idx);
-            Mdast::Definition {
-                identifier: d.identifier.clone(),
-                label: d.label.clone(),
-                url: d.url.clone(),
-                title: d.title.clone(),
-            }
+            (
+                Mdast::Definition {
+                    identifier: d.identifier.clone(),
+                    label: d.label.clone(),
+                    url: d.url.clone(),
+                    title: d.title.clone(),
+                },
+                sb,
+                ctx.rtrim(sb, se),
+            )
         }
         Kind::List => {
             let ld = node.list.as_ref().unwrap();
-            Mdast::List {
+            let (kids, last) = block_children(tree, idx, scratch, ctx);
+            let m = Mdast::List {
                 ordered: ld.ordered,
                 start: ld.ordered.then_some(ld.start),
-                // mdast `list.spread`: a blank line occurs *between items*.
                 spread: ld.spread,
-                children: block_children(tree, idx, scratch, ctx),
-            }
+                children: kids,
+            };
+            (m, sb, last.unwrap_or(se))
         }
         Kind::Item => {
-            // mdast `listItem.spread`: a blank line occurs *between this item's
-            // own block children* (computed in the block parser's
-            // `compute_spread`).
-            Mdast::ListItem {
-                spread: node.item_spread,
-                children: block_children(tree, idx, scratch, ctx),
-            }
+            let (kids, last) = block_children(tree, idx, scratch, ctx);
+            (Mdast::ListItem { spread: node.item_spread, children: kids }, sb, last.unwrap_or(se))
         }
-        // SPIKE scope is pure-CommonMark mdast. GFM tables would need
-        // `table`/`tableRow`/`tableCell` nodes (remark-gfm's mdast extension) —
-        // future work; for now degrade to a raw node so `ast,gfm` still builds.
         #[cfg(feature = "gfm")]
-        Kind::Table => Mdast::Html(tree.content(idx).to_owned()),
+        Kind::Table => (Mdast::Html(tree.content(idx).to_owned()), sb, ctx.rtrim(sb, se)),
     };
-    let pos = ctx.block_pos(tree.start_line(idx), matches!(node.kind, Kind::Document));
-    Mdast::Positioned(pos, Box::new(inner))
+    (Mdast::Positioned(ctx.pos(start_b, end_b), Box::new(inner)), end_b)
 }
 
-fn block_children(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> Vec<Mdast> {
+/// Build a container's children; also report the last child's source byte end.
+fn block_children(
+    tree: &Tree,
+    idx: usize,
+    scratch: &mut Scratch,
+    ctx: &PosCtx,
+) -> (Vec<Mdast>, Option<usize>) {
     let mut v = Vec::new();
+    let mut last = None;
     let mut c = tree.first_child(idx);
     while let Some(ci) = c {
-        v.push(block(tree, ci, scratch, ctx));
+        let (m, eb) = block(tree, ci, scratch, ctx);
+        v.push(m);
+        last = Some(eb);
         c = tree.next_sibling(ci);
     }
-    v
+    (v, last)
 }
 
-/// Build a text-bearing block's inline children: capture the semantic token
-/// stream, then fold `Open`/`Close`/`LinkOpen`/`LinkClose` into a nested tree.
-///
-/// Inline nodes get **block-granular** positions (the owning block's span):
-/// coarse but valid, and enough for position-reading plugins (e.g. remark-lint,
-/// which require *some* position on every node). Accurate per-inline offsets need
-/// source spans threaded through the inline tokenizer — a documented next step.
-fn inline(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> Vec<Mdast> {
+/// Build a text-bearing block's inline children with **block-granular** positions
+/// (the `[sb, eb)` source span). Per-inline source spans are Phase 2.
+fn inline(
+    tree: &Tree,
+    idx: usize,
+    scratch: &mut Scratch,
+    ctx: &PosCtx,
+    sb: usize,
+    eb: usize,
+) -> Vec<Mdast> {
     let toks = render_inline_to_tokens(tree.content(idx), &tree.refmap, scratch, tree.opts);
     let mut nodes = build_inline(toks);
-    let bpos = ctx.block_pos(tree.start_line(idx), false);
+    let bpos = ctx.pos(sb, eb);
     position_inline(&mut nodes, &bpos);
     nodes
 }

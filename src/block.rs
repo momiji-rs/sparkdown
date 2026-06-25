@@ -228,6 +228,14 @@ impl Tree<'_> {
         &self.defs[self.nodes[idx].def as usize]
     }
 
+    /// SPIKE (`ast` feature): a node's raw source byte span `(start, end)`.
+    /// `start == u32::MAX` means unset (e.g. a synthesized container before its
+    /// children resolve it). `end` may include a trailing newline (callers trim).
+    #[cfg(feature = "ast")]
+    pub fn src_span(&self, idx: usize) -> (u32, u32) {
+        (self.nodes[idx].src_start, self.nodes[idx].src_end)
+    }
+
     /// SPIKE (`ast` feature): the mdast `value` of a `Kind::HtmlBlock` (keeps the
     /// trailing newline per mdast's rule, unlike the HTML-render [`content`]).
     #[cfg(feature = "ast")]
@@ -415,6 +423,12 @@ impl<'a> Parser<'a> {
         node.content_src = matches!(kind, Kind::Paragraph | Kind::CodeBlock | Kind::HtmlBlock);
         node.cstart = self.buf.len() as u32;
         node.cend = node.cstart;
+        // SPIKE (`ast`): the block's mdast `position.start` is its first non-space
+        // (marker for containers/atx/fences, first char for paragraphs).
+        #[cfg(feature = "ast")]
+        {
+            node.src_start = (self.line_src_start + self.next_nonspace) as u32;
+        }
         self.nodes.push(node);
         // Append to the parent's intrusive child list.
         let last = self.nodes[parent].last_child;
@@ -492,6 +506,9 @@ impl<'a> Parser<'a> {
             });
             let dn = self.insert_before(before, Kind::Definition);
             self.nodes[dn].def = di;
+            // Approximate span = the owning paragraph's (exact for a single def).
+            self.nodes[dn].src_start = self.nodes[before].src_start;
+            self.nodes[dn].src_end = self.nodes[before].src_end;
             self.refmap.entry(identifier).or_insert((dest, title));
         }
     }
@@ -1015,6 +1032,13 @@ impl<'a> Parser<'a> {
                     let fo = self.nodes[c].fence_offset;
                     if !self.indented && is_closing_fence(self.line, self.next_nonspace, fc, fl) {
                         let cur = c;
+                        // SPIKE (`ast`): a fenced block spans through its closing
+                        // fence line (mdast includes the closing fence).
+                        #[cfg(feature = "ast")]
+                        {
+                            self.nodes[cur].src_end =
+                                (self.line_src_start + self.line.len()) as u32;
+                        }
                         self.finalize(cur);
                         return 2;
                     }
@@ -1109,6 +1133,11 @@ impl<'a> Parser<'a> {
         self.buf.push_str(content);
         self.nodes[h].cstart = start;
         self.nodes[h].cend = self.buf.len() as u32;
+        // SPIKE (`ast`): atx heading spans the whole line (markers included).
+        #[cfg(feature = "ast")]
+        {
+            self.nodes[h].src_end = (self.line_src_start + self.line.len()) as u32;
+        }
         self.advance_offset(self.line.len() - self.offset, false);
         2
     }
@@ -1144,6 +1173,11 @@ impl<'a> Parser<'a> {
         self.close_unmatched_blocks();
         let h = self.add_child(Kind::HtmlBlock);
         self.nodes[h].html_kind = kind;
+        // mdast html block starts at the line content region (incl. leading indent).
+        #[cfg(feature = "ast")]
+        {
+            self.nodes[h].src_start = (self.line_src_start + self.offset) as u32;
+        }
         2
     }
 
@@ -1188,6 +1222,11 @@ impl<'a> Parser<'a> {
         self.nodes[container].kind = Kind::Heading;
         self.nodes[container].level = level;
         self.nodes[container].cstart = (s + lead + off) as u32;
+        // SPIKE (`ast`): a setext heading spans through its underline line.
+        #[cfg(feature = "ast")]
+        {
+            self.nodes[container].src_end = (self.line_src_start + self.line.len()) as u32;
+        }
         self.advance_offset(self.line.len() - self.offset, false);
         2
     }
@@ -1224,7 +1263,12 @@ impl<'a> Parser<'a> {
         }
         if is_thematic_break(&self.line[self.next_nonspace..]) {
             self.close_unmatched_blocks();
-            self.add_child(Kind::ThematicBreak);
+            let tb = self.add_child(Kind::ThematicBreak);
+            #[cfg(feature = "ast")]
+            {
+                self.nodes[tb].src_end = (self.line_src_start + self.line.len()) as u32;
+            }
+            let _ = tb;
             self.advance_offset(self.line.len() - self.offset, false);
             2
         } else {
@@ -1258,10 +1302,17 @@ impl<'a> Parser<'a> {
 
     fn start_indented_code(&mut self) -> u8 {
         if self.indented && self.nodes[self.tip].kind != Kind::Paragraph && !self.blank {
+            // mdast indented code starts at the line content region (incl. indent).
+            #[cfg(feature = "ast")]
+            let content_start = self.line_src_start + self.offset;
             self.advance_offset(CODE_INDENT, true);
             self.close_unmatched_blocks();
             let cb = self.add_child(Kind::CodeBlock);
             self.nodes[cb].fenced = false;
+            #[cfg(feature = "ast")]
+            {
+                self.nodes[cb].src_start = content_start as u32;
+            }
             2
         } else {
             0
