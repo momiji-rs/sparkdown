@@ -142,7 +142,9 @@ fn block(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> (Mdast
             (Mdast::Root(kids), 0, ctx.src_len)
         }
         Kind::Paragraph => {
-            let eb = ctx.rtrim(sb, se);
+            // mdast keeps trailing spaces on the last line (only the newline is
+            // dropped); the text node's value trims them separately.
+            let eb = ctx.rtrim_nl(se);
             (Mdast::Paragraph(inline(tree, idx, scratch, ctx, sb, eb)), sb, eb)
         }
         Kind::Heading => {
@@ -263,7 +265,10 @@ fn build_inline(
         if s == u32::MAX {
             bpos.clone()
         } else {
-            ctx.pos(map(s), map(e))
+            // Map the END via the last contained byte (`e-1`) so a span ending
+            // exactly at a buf→source segment boundary stays in its own segment.
+            let send = if e == 0 { map(0) } else { map(e - 1) + 1 };
+            ctx.pos(map(s), send)
         }
     };
     // (frame, children, open_start, open_end).
