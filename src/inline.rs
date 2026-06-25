@@ -1784,9 +1784,11 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
         }
     }
     // Trailing spaces at the very end of a block are dropped (no following line
-    // to form a hard break).
-    escape_html(src[run..].trim_end_matches(' '), cur);
-    flush!(i);
+    // to form a hard break). The last text node ends before them (mdast trims
+    // trailing spaces from the final text node's value *and* position).
+    let block_text_end = run + src[run..].trim_end_matches(' ').len();
+    escape_html(&src[run..block_text_end], cur);
+    flush!(block_text_end);
 
     process_emphasis(list, stack, 0);
     // SPIKE: materialize owned inline nodes instead of rendering to `out`. The
