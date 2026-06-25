@@ -846,6 +846,26 @@ fn gfm_scan_url(b: &[u8], start: usize) -> Option<usize> {
     (end > scan && b[scan..end].contains(&b'.')).then_some(end)
 }
 
+/// At a `:` opening `://`, if a preceding `http`/`https` scheme sits at an
+/// autolink boundary, return the URL `(start, end)`. Lets the scan trigger on the
+/// rare `:` instead of every `h`.
+fn gfm_scan_url_at_colon(b: &[u8], i: usize) -> Option<(usize, usize)> {
+    if b.get(i + 1) != Some(&b'/') || b.get(i + 2) != Some(&b'/') {
+        return None;
+    }
+    let start = if i >= 5 && &b[i - 5..i] == b"https" {
+        i - 5
+    } else if i >= 4 && &b[i - 4..i] == b"http" {
+        i - 4
+    } else {
+        return None;
+    };
+    if !al_boundary(b, start) {
+        return None;
+    }
+    gfm_scan_url(b, start).map(|end| (start, end))
+}
+
 /// If a bare email autolink ends at the `@` `b[at]`, return `(localpart start,
 /// end)`. The local part must sit at an autolink boundary.
 fn gfm_scan_email(b: &[u8], at: usize) -> Option<(usize, usize)> {
@@ -986,11 +1006,21 @@ fn stream_autolink(src: &str, out: &mut String, hw: bool, tf: bool) {
                     i += 1;
                 }
             }
-            b'w' | b'W' | b'h' | b'H' if al_boundary(bytes, i) => {
+            b'w' | b'W' if al_boundary(bytes, i) => {
                 if let Some(end) = gfm_scan_url(bytes, i) {
                     escape_html(&src[run..i], out);
                     emit_url(src, i, end, out);
                     i = end;
+                    run = i;
+                } else {
+                    i += 1;
+                }
+            }
+            b':' => {
+                if let Some((s, e)) = gfm_scan_url_at_colon(bytes, i) {
+                    escape_html(&src[run..s], out);
+                    emit_url(src, s, e, out);
+                    i = e;
                     run = i;
                 } else {
                     i += 1;
@@ -1322,11 +1352,21 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                     i += 1;
                 }
             }
-            b'w' | b'W' | b'h' | b'H' if al && al_boundary(bytes, i) => {
+            b'w' | b'W' if al && al_boundary(bytes, i) => {
                 if let Some(end) = gfm_scan_url(bytes, i) {
                     escape_html(&src[run..i], cur);
                     emit_url(src, i, end, cur);
                     i = end;
+                    run = i;
+                } else {
+                    i += 1;
+                }
+            }
+            b':' if al => {
+                if let Some((s, e)) = gfm_scan_url_at_colon(bytes, i) {
+                    escape_html(&src[run..s], cur);
+                    emit_url(src, s, e, cur);
+                    i = e;
                     run = i;
                 } else {
                     i += 1;

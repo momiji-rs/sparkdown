@@ -336,12 +336,13 @@ pub(crate) fn find_emph_gfm(hay: &[u8]) -> Option<usize> {
     find_in_set(hay, &EMPH_GFM_LO, &EMPH_GFM_HI)
 }
 
-/// Augment a nibble-set with the GFM extended-autolink trigger bytes `@ h H w
-/// W`, so the autolink scan can SIMD-skip to the next trigger or special instead
-/// of crawling byte-by-byte. The set stays exact: a byte's (lo, hi) nibble pair
+/// Augment a nibble-set with the GFM extended-autolink trigger bytes `@ w W :`,
+/// so the autolink scan can SIMD-skip to the next trigger or special instead of
+/// crawling byte-by-byte. `:` (rare) catches `http(s)://` — far cheaper than
+/// stopping at every `h`. The set stays exact: a byte's (lo, hi) nibble pair
 /// uniquely identifies it, and `hi_table[h]` only ever holds `1 << h`.
 const fn with_al_triggers(mut lo: [u8; 16], mut hi: [u8; 16]) -> ([u8; 16], [u8; 16]) {
-    let triggers = [b'@', b'h', b'H', b'w', b'W'];
+    let triggers = [b'@', b'w', b'W', b':'];
     let mut i = 0;
     while i < triggers.len() {
         let b = triggers[i];
@@ -692,7 +693,7 @@ mod tests {
             h.iter()
                 .position(|&b| matches!(b, b'*' | b'_' | b'[' | b'~'))
         };
-        let trig = |b: u8| matches!(b, b'@' | b'h' | b'H' | b'w' | b'W');
+        let trig = |b: u8| matches!(b, b'@' | b'w' | b'W' | b':');
         let stream_al_scalar = |h: &[u8]| {
             h.iter()
                 .position(|&b| stream_scalar(&[b]) == Some(0) || trig(b))
