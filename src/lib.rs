@@ -37,6 +37,7 @@ mod arena;
 mod block;
 mod bump;
 mod entities;
+mod ext;
 mod inline;
 mod options;
 mod render;

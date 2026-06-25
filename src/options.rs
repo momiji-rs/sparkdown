@@ -23,6 +23,9 @@ pub struct Options {
     pub tables: bool,
     /// Render every soft line break as `<br />` (goldmark's `WithHardWraps`).
     pub hard_wraps: bool,
+    /// Diagram extension: render `mermaid` fenced code blocks as a client-side
+    /// `<pre class="mermaid">` wrapper. Effective only with the `diagram` feature.
+    pub diagram: bool,
 }
 
 impl Options {
@@ -35,6 +38,15 @@ impl Options {
     #[cfg(not(feature = "gfm"))]
     pub(crate) const GFM: bool = false;
 
+    /// `true` iff the `diagram` Cargo feature is compiled in. Used as
+    /// `Options::DIAGRAM && opts.diagram` so that, without the feature, the check
+    /// folds to `false` and the diagram code is eliminated — the default build is
+    /// byte-for-byte the pure-CommonMark fast path. (The per-extension template.)
+    #[cfg(feature = "diagram")]
+    pub(crate) const DIAGRAM: bool = true;
+    #[cfg(not(feature = "diagram"))]
+    pub(crate) const DIAGRAM: bool = false;
+
     /// GitHub Flavored Markdown: every GFM extension enabled. (Effective only
     /// when the crate is built with the `gfm` feature.)
     pub const fn gfm() -> Self {
@@ -45,6 +57,7 @@ impl Options {
             tagfilter: true,
             tables: true,
             hard_wraps: false,
+            diagram: false,
         }
     }
 }

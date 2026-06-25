@@ -26,6 +26,11 @@ crate-type = ["cdylib", "rlib"]
 # autolinks, tag filter, and pipe tables. Off, none of this code is compiled —
 # the parser is byte-for-byte the pure-CommonMark fast path.
 gfm = []
+# Diagram extension (opt-in, OFF by default): a fenced code block tagged with a
+# client-side diagram language (currently `mermaid`) renders as a bare wrapper
+# element (`<pre class="mermaid">`) for a browser library to pick up, instead of
+# `<pre><code>`. Render-only, zero-dependency. The template for `src/ext/*`.
+diagram = []
 # Mirrors rostdown: opt-in scoped global bump allocator (src/arena.rs). An
 # embedder that enables it must install `sparkdown::ScopedAlloc` as its
 # `#[global_allocator]`. The local bump (src/bump.rs) is always on.
