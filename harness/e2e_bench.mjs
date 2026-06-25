@@ -45,6 +45,9 @@ function sparkdownToHtml(md) {
 }
 
 const satteriFeat = { features: { gfm: false, frontmatter: false } };
+// Sätteri backend: native napi by default, or its wasm (wasi) fallback when
+// NAPI_RS_FORCE_WASI=1 — the apples-to-apples comparison vs sparkdown's wasm.
+const sat = process.env.NAPI_RS_FORCE_WASI ? 'satteri (wasi/wasm)' : 'satteri (Rust napi)';
 
 // --- plugins: a read-only visitor that touches every node (noop) ------------
 // remark/unified flavour: walk the whole mdast.
@@ -127,21 +130,39 @@ function suite(title, md) {
 
   table('A. markdown -> HTML (no plugins)', bytes, [
     row('remark (pure JS)', () => String(remarkHtml.processSync(md)), kb),
-    row('satteri (Rust napi)', () => markdownToHtml(md, satteriFeat).html, kb),
+    row(sat, () => markdownToHtml(md, satteriFeat).html, kb),
     row('sparkdown -> unified (wasm+JS)', () => String(sparkHtml.processSync(md)), kb),
     row('sparkdown to_html (wasm)', () => sparkdownToHtml(md), kb),
   ]);
 
   table('B. markdown -> HTML (with a per-node plugin)', bytes, [
     row('remark + noop visitor', () => String(remarkHtmlP.processSync(md)), kb),
-    row('satteri + noop hast plugin', () => markdownToHtml(md, { ...satteriFeat, hastPlugins: [satteriNoop] }).html, kb),
+    row(`${sat} + noop plugin`, () => markdownToHtml(md, { ...satteriFeat, hastPlugins: [satteriNoop] }).html, kb),
     row('sparkdown -> unified + noop', () => String(sparkHtmlP.processSync(md)), kb),
   ]);
 
-  table('C. markdown -> mdast tree in JS', bytes, [
-    row('remark-parse (native JS tree)', () => remarkParseOnly.parse(md), nodes),
-    row('satteri markdownToMdast (arena->JS)', () => markdownToMdast(md, satteriFeat.features ? { features: satteriFeat.features } : {}), nodes),
-    row('sparkdown wasm -> JSON -> JS', () => parseToMdast(md), nodes),
+  // C: a *fully usable* JS tree — every node reachable (what any visitor/plugin
+  // or stringify needs). Force a full walk so lazy trees pay their real cost;
+  // eager trees (JSON.parse) just pay a cheap extra traversal. Apples to apples.
+  const full = (parse) => {
+    const fn = () => countNodes(parse(md));
+    const n = fn();
+    return { ms: measure(fn), n };
+  };
+  const remarkFull = full((m) => remarkParseOnly.parse(m));
+  const satFull = full((m) => markdownToMdast(m, { features: satteriFeat.features }));
+  const sparkFull = full((m) => parseToMdast(m));
+  table('C. markdown -> FULLY MATERIALIZED mdast in JS (every node reachable)', bytes, [
+    { name: 'remark-parse (native JS tree)', ms: remarkFull.ms, size: `${remarkFull.n} nodes` },
+    { name: `${sat} markdownToMdast`, ms: satFull.ms, size: `${satFull.n} nodes` },
+    { name: 'sparkdown wasm -> JSON -> JS', ms: sparkFull.ms, size: `${sparkFull.n} nodes` },
+  ]);
+
+  // C': the lazy advantage — Sätteri's tree before anything walks it. sparkdown's
+  // JSON path can't do partial: it always materializes the whole tree.
+  table("C'. markdown -> mdast HANDLE / shell (before touching nodes)", bytes, [
+    { name: `${sat} markdownToMdast (lazy shell)`, ms: measure(() => markdownToMdast(md, { features: satteriFeat.features })), size: 'lazy' },
+    { name: 'sparkdown wasm -> JSON -> JS (eager)', ms: measure(() => parseToMdast(md)), size: 'full' },
   ]);
 }
 
