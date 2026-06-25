@@ -1044,11 +1044,11 @@ fn look_for_link_or_image(
         // Build the <img> tag into the shared buffer (no per-image allocation).
         let start = cur.len();
         cur.push_str("<img src=\"");
-        escape_href(unescape_string(&dest_raw).as_ref(), cur);
+        escape_href(unescape_string(dest_raw).as_ref(), cur);
         cur.push_str("\" alt=\"");
         cur.push_str(&alt);
         cur.push('"');
-        if let Some(t) = &title_raw {
+        if let Some(t) = title_raw {
             cur.push_str(" title=\"");
             escape_attr(unescape_string(t).as_ref(), cur);
             cur.push('"');
@@ -1071,9 +1071,9 @@ fn look_for_link_or_image(
         // Build the <a> open tag into the shared buffer (no per-link allocation).
         let start = cur.len();
         cur.push_str("<a href=\"");
-        escape_href(unescape_string(&dest_raw).as_ref(), cur);
+        escape_href(unescape_string(dest_raw).as_ref(), cur);
         cur.push('"');
-        if let Some(t) = &title_raw {
+        if let Some(t) = title_raw {
             cur.push_str(" title=\"");
             escape_attr(unescape_string(t).as_ref(), cur);
             cur.push('"');
@@ -1132,13 +1132,13 @@ fn strip_tags(s: &str) -> String {
 /// full/collapsed/shortcut reference resolved against `refmap`. `text` is the
 /// raw link-text source (the shortcut/collapsed label). Returns
 /// `(raw dest, raw title, index past the target)`.
-fn parse_link_target(
-    src: &str,
+fn parse_link_target<'a>(
+    src: &'a str,
     bytes: &[u8],
     i: usize,
-    refmap: &RefMap,
-    text: &str,
-) -> Option<(String, Option<String>, usize)> {
+    refmap: &'a RefMap,
+    text: &'a str,
+) -> Option<(&'a str, Option<&'a str>, usize)> {
     if bytes.get(i) == Some(&b'(')
         && let Some(r) = parse_inline_paren(src, bytes, i)
     {
@@ -1150,26 +1150,26 @@ fn parse_link_target(
             let key = if label.trim().is_empty() {
                 normalize_label(text) // collapsed [] uses the link text
             } else {
-                normalize_label(&label)
+                normalize_label(label)
             };
             let (d, t) = refmap.get(key.as_ref())?;
-            return Some((d.clone(), t.clone(), end));
+            return Some((d.as_str(), t.as_deref(), end));
         }
         return None;
     }
     // Shortcut reference: the link text itself is the label.
     let (d, t) = refmap.get(normalize_label(text).as_ref())?;
-    Some((d.clone(), t.clone(), i))
+    Some((d.as_str(), t.as_deref(), i))
 }
 
 /// Read a `[label]` starting at `bytes[i]` (`[`). Returns `(label, index past
 /// the `]`)`. Nested unescaped brackets are disallowed.
-fn read_bracket_label(src: &str, bytes: &[u8], i: usize) -> Option<(String, usize)> {
+fn read_bracket_label<'a>(src: &'a str, bytes: &[u8], i: usize) -> Option<(&'a str, usize)> {
     let mut j = i + 1;
     while j < bytes.len() {
         match bytes[j] {
             b'\\' if j + 1 < bytes.len() => j += 2,
-            b']' => return Some((src[i + 1..j].to_string(), j + 1)),
+            b']' => return Some((&src[i + 1..j], j + 1)),
             b'[' => return None,
             _ => j += 1,
         }
@@ -1181,11 +1181,11 @@ fn read_bracket_label(src: &str, bytes: &[u8], i: usize) -> Option<(String, usiz
 }
 
 /// Parse an inline link tail `(dest "title")` starting at `bytes[i]` (`(`).
-fn parse_inline_paren(
-    src: &str,
+fn parse_inline_paren<'a>(
+    src: &'a str,
     bytes: &[u8],
     i: usize,
-) -> Option<(String, Option<String>, usize)> {
+) -> Option<(&'a str, Option<&'a str>, usize)> {
     let mut j = skip_ws(bytes, i + 1);
     let (dest, dj, _) = parse_dest(src, bytes, j)?;
     let before = dj;
@@ -1223,7 +1223,7 @@ fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
 /// Parse a link destination at `bytes[j]`. Returns `(raw dest, end index, was
 /// angle-bracketed)`. Empty bare destinations are allowed (valid inline, but
 /// rejected by the ref-def caller).
-fn parse_dest(text: &str, bytes: &[u8], j: usize) -> Option<(String, usize, bool)> {
+fn parse_dest<'a>(text: &'a str, bytes: &[u8], j: usize) -> Option<(&'a str, usize, bool)> {
     if bytes.get(j) == Some(&b'<') {
         let s = j + 1;
         let mut k = s;
@@ -1235,7 +1235,7 @@ fn parse_dest(text: &str, bytes: &[u8], j: usize) -> Option<(String, usize, bool
                 _ => k += 1,
             }
         }
-        Some((text[s..k].to_string(), k + 1, true))
+        Some((&text[s..k], k + 1, true))
     } else {
         let s = j;
         let mut k = j;
@@ -1261,13 +1261,13 @@ fn parse_dest(text: &str, bytes: &[u8], j: usize) -> Option<(String, usize, bool
         if depth != 0 {
             return None;
         }
-        Some((text[s..k].to_string(), k, false))
+        Some((&text[s..k], k, false))
     }
 }
 
 /// Parse a link title at `bytes[j]` (`"`, `'`, or `(`). Returns `(raw title,
 /// end index)`.
-fn parse_title(text: &str, bytes: &[u8], j: usize) -> Option<(String, usize)> {
+fn parse_title<'a>(text: &'a str, bytes: &[u8], j: usize) -> Option<(&'a str, usize)> {
     let q = *bytes.get(j)?;
     if q != b'"' && q != b'\'' && q != b'(' {
         return None;
@@ -1283,7 +1283,7 @@ fn parse_title(text: &str, bytes: &[u8], j: usize) -> Option<(String, usize)> {
             _ => k += 1,
         }
     }
-    Some((text[s..k].to_string(), k + 1))
+    Some((&text[s..k], k + 1))
 }
 
 /// Extract leading link reference definitions from a paragraph's text. Returns
@@ -1315,7 +1315,7 @@ fn parse_ref_def(
         return None;
     }
     let (label, after) = read_bracket_label(text, bytes, j)?;
-    if bytes.get(after) != Some(&b':') || normalize_label(&label).is_empty() {
+    if bytes.get(after) != Some(&b':') || normalize_label(label).is_empty() {
         return None;
     }
     j = ref_spnl(bytes, after + 1);
@@ -1329,13 +1329,19 @@ fn parse_ref_def(
         _ => (None, dj),
     };
     if let Some(end) = ref_line_end(bytes, after_title) {
-        return Some((end, label, dest, title));
+        // The RefMap owns its entries (it outlives the borrowed source).
+        return Some((
+            end,
+            label.to_string(),
+            dest.to_string(),
+            title.map(String::from),
+        ));
     }
     // A trailing-junk title invalidates only the title, not the whole def.
     if title.is_some()
         && let Some(end) = ref_line_end(bytes, dj)
     {
-        return Some((end, label, dest, None));
+        return Some((end, label.to_string(), dest.to_string(), None));
     }
     None
 }
