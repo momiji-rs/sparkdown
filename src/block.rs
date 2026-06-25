@@ -1421,8 +1421,11 @@ impl<'a> Parser<'a> {
     fn start_indented_code(&mut self) -> u8 {
         if self.indented && self.nodes[self.tip].kind != Kind::Paragraph && !self.blank {
             // mdast indented code starts at the line content region (incl. indent).
+            // If a container marker left a tab partially consumed, the start
+            // rounds up past that tab byte (a position can't sit inside a byte).
             #[cfg(feature = "ast")]
-            let content_start = self.line_src_start + self.offset;
+            let content_start =
+                self.line_src_start + self.offset + self.partially_consumed_tab as usize;
             self.advance_offset(CODE_INDENT, true);
             self.close_unmatched_blocks();
             let cb = self.add_child(Kind::CodeBlock);
