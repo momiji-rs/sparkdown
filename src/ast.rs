@@ -159,8 +159,11 @@ fn block(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> (Mdast
             )
         }
         Kind::BlockQuote => {
+            // A blockquote ends at its last `>`-marked line (tracked as `se`),
+            // which extends past the last child for trailing blank `>` lines.
             let (kids, last) = block_children(tree, idx, scratch, ctx);
-            (Mdast::Blockquote(kids), sb, last.unwrap_or(se))
+            let end = last.map_or(se, |l| l.max(se));
+            (Mdast::Blockquote(kids), sb, end)
         }
         Kind::ThematicBreak => (Mdast::ThematicBreak, sb, ctx.rtrim_nl(se)),
         Kind::CodeBlock => {

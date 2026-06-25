@@ -1077,6 +1077,12 @@ impl<'a> Parser<'a> {
                     if is_space_or_tab(peek(self.line, self.offset)) {
                         self.advance_offset(1, true);
                     }
+                    // SPIKE (`ast`): the blockquote spans through its last
+                    // `>`-marked line (incl. trailing blank `>` lines).
+                    #[cfg(feature = "ast")]
+                    {
+                        self.nodes[c].src_end = (self.line_src_start + self.line.len()) as u32;
+                    }
                     0
                 } else {
                     1
@@ -1188,7 +1194,12 @@ impl<'a> Parser<'a> {
                 self.advance_offset(1, true);
             }
             self.close_unmatched_blocks();
-            self.add_child(Kind::BlockQuote);
+            let bq = self.add_child(Kind::BlockQuote);
+            #[cfg(feature = "ast")]
+            {
+                self.nodes[bq].src_end = (self.line_src_start + self.line.len()) as u32;
+            }
+            let _ = bq;
             1
         } else {
             0
