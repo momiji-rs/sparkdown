@@ -13,12 +13,13 @@ A fast, **standards-first** CommonMark parser in Rust.
 
 *markdown, with a spark.*
 
-Where [rostdown](https://github.com/momiji-rs/rostdown) renders a kramdown
-**subset** and cleanly declines everything outside it, sparkdown's contract is
-the inverse: parse the **whole** [CommonMark 0.31.2](https://spec.commonmark.org/0.31.2/)
-grammar and aim for byte-identical output with the reference `cmark`. It's
-built first for ourselves — a fast, dependency-free CommonMark engine that's
-pleasant to embed — not to chase any particular competitor.
+sparkdown parses the **whole** [CommonMark 0.31.2](https://spec.commonmark.org/0.31.2/)
+grammar — all 652 conformance examples — and matches the reference `cmark`
+byte-for-byte. It's a **zero-dependency** engine built to be pleasant to embed,
+with a default build tuned to be the fastest CommonMark parser we know of and
+[GitHub Flavored Markdown](#gfm-extensions-opt-in) available as opt-in extensions
+the default build doesn't even compile. The speed is a means — a clean, embeddable
+engine — not a scoreboard.
 
 ## Status — ✅ 100% CommonMark 0.31.2
 
@@ -34,7 +35,8 @@ Passes all **652/652** examples of the official conformance suite.
 
 The block layer is a faithful port of the reference incremental algorithm
 (open-block tree + per-line continuation); the renderer matches cmark's
-whitespace byte-for-byte.
+whitespace byte-for-byte. [GitHub Flavored Markdown](#gfm-extensions-opt-in) is
+available as an opt-in feature on top.
 
 ```bash
 # Live CommonMark conformance number (652 official examples):
@@ -50,28 +52,36 @@ On the CommonMark spec itself (`tests/fixtures/data.md`, ~200 KB — the same
 fixture `cmark` and rushdown benchmark on), default build, Apple Mac Studio,
 measured in process:
 
-| engine                    |        time | relative |
-| ------------------------- | ----------: | -------: |
-| **sparkdown**             | **0.58 ms** |   1.00×  |
-| pulldown-cmark            |     0.67 ms |    1.16× |
-| **sparkdown (wasm)** ¹    |     1.33 ms |    2.29× |
-| rushdown (cached)         |     1.36 ms |    2.35× |
-| cmark (C, reference)      |     ~1.9 ms |   ~3.2×  |
-| comrak                    |     2.00 ms |    3.45× |
-| markdown-rs               |     33.5 ms |      58× |
+| engine                       |        time | relative |
+| ---------------------------- | ----------: | -------: |
+| **sparkdown**                | **0.59 ms** |   1.00×  |
+| **sparkdown — GFM, all on** ¹ | **0.63 ms** |    1.07× |
+| pulldown-cmark               |     0.68 ms |    1.16× |
+| **sparkdown (wasm)** ²       |     0.93 ms |    1.58× |
+| **sparkdown (wasm, GFM all)** ² | 0.98 ms |    1.66× |
+| rushdown (cached)            |     1.36 ms |    2.31× |
+| cmark (C, reference)         |     ~1.9 ms |   ~3.2×  |
+| comrak                       |     2.00 ms |    3.45× |
+| markdown-rs                  |     33.5 ms |      58× |
 
-¹ WebAssembly (`@momiji-rs/sparkdown`, `+simd128 +bulk-memory`); every other row
-is a native build. Even as wasm, sparkdown edges out rushdown's *native* build.
+¹ The opt-in [`gfm`](#gfm-extensions-opt-in) build with **every** extension
+active (strikethrough, task lists, extended autolinks, tag filter, tables) —
+still faster than pulldown, which has none of them on.
+
+² WebAssembly (`+simd128 +bulk-memory`, warm reusable context), measured in Node;
+every non-wasm row is a native build. Both wasm builds — pure and full-GFM —
+still beat rushdown's *native* build.
 
 `cargo bench` reproduces the sparkdown-vs-pulldown pair in-repo. Ratios are the
 portable part — absolute times are machine-specific. cmark was compared
 CLI-to-CLI on a 16 MB document (3.2× sparkdown's wall time and 3.1× its retired
 instructions); goldmark (Go) benches in comrak's tier.
 
-The wasm row's tax over the 0.58 ms native is mostly the VM / bounds-check /
+The wasm row's tax over the 0.59 ms native is mostly the VM / bounds-check /
 `dlmalloc` floor: the *lost SIMD* and *byte-loop memcpy* are recovered by the
-wasm `v128` kernels and `+bulk-memory` (`memory.copy`), leaving ~2.3×. See
-[WebAssembly (npm)](#webassembly-npm).
+wasm `v128` kernels and `+bulk-memory` (`memory.copy`), and a **warm reusable
+context** (buffers held across renders) keeps it to ~1.6×. See
+[WebAssembly](#webassembly).
 
 The speed is from the default build alone — zero dependencies, no feature flags:
 
@@ -88,13 +98,50 @@ The speed is from the default build alone — zero dependencies, no feature flag
 inflated by a copy-paste bug in its harness — the pulldown timing closure also
 runs comrak. Measured correctly on the same fixture, pulldown-cmark is ~0.67 ms.</sub>
 
-## WebAssembly (npm)
+## GFM extensions (opt-in)
 
-A **WASI-free** WebAssembly build ships on npm as
-[`@momiji-rs/sparkdown`](https://www.npmjs.com/package/@momiji-rs/sparkdown) —
-zero dependencies, self-contained (the wasm is base64-inlined), and runs in
-Node, browsers, bundlers, Deno, Bun, and edge runtimes with no `fetch`/`fs`/WASI
-setup.
+[GitHub Flavored Markdown](https://github.github.com/gfm/) is a **compile-time
+opt-in**. The default build contains *no* GFM code — the parser stays the
+byte-for-byte pure-CommonMark fast path above. Enable the `gfm` Cargo feature to
+unlock the runtime `Options` API:
+
+```toml
+[dependencies]
+sparkdown = { version = "0", features = ["gfm"] }
+```
+
+```rust
+use sparkdown::{to_html_with, Options};
+
+// Options::gfm() turns on every extension; or set individual flags.
+let html = to_html_with("~~done~~ and www.example.com", &Options::gfm());
+```
+
+| flag            | extension                                   |
+| --------------- | ------------------------------------------- |
+| `strikethrough` | `~~text~~` → `<del>`                         |
+| `tasklist`      | `- [ ]` / `- [x]` checkbox list items       |
+| `autolink`      | bare `www.` / `http(s)://` / email links    |
+| `tagfilter`     | neutralize unsafe raw-HTML tags (`<script>…`) |
+| `tables`        | pipe tables with column alignment           |
+| `hard_wraps`    | every soft line break → `<br />`            |
+
+Each flag is gated at a block- or inline-*type* boundary, and profiled so that
+even with **all** extensions active the parser still beats pulldown-cmark (the
+0.63 ms row above). For a warm, reusable context use
+`Renderer::with_options(opts)`.
+
+## WebAssembly
+
+A **WASI-free** WebAssembly build runs in Node, browsers, bundlers, Deno, Bun,
+and edge runtimes with no `fetch`/`fs`/WASI setup. It ships two ways:
+
+- **npm** — [`@momiji-rs/sparkdown`](https://www.npmjs.com/package/@momiji-rs/sparkdown)
+  (pure CommonMark) and `@momiji-rs/sparkdown-gfm` (with GFM). Zero dependencies,
+  self-contained (the wasm is base64-inlined). Also on jsDelivr/unpkg for free.
+- **GitHub Releases** — the raw `sparkdown.wasm` / `sparkdown-gfm.wasm` modules
+  (with SHA-256 sums) are attached to each tagged release, for non-JS hosts
+  (wasmtime, wazero, Workers, Python, …) that want the bare module.
 
 ```bash
 npm install @momiji-rs/sparkdown
@@ -106,9 +153,10 @@ const html = await toHtml("# Hello *world*");
 ```
 
 Under the hood it's a `wasm32-unknown-unknown` build behind a tiny raw C-ABI
-(`sparkdown_alloc` / `sparkdown_free` / `sparkdown_to_html`) — no `wasm-bindgen`
-— so the same `.wasm` drives from any host. Enable the Rust side with the
-`wasm` feature:
+(`sparkdown_alloc` / `sparkdown_free` / `sparkdown_to_html`, plus
+`sparkdown_to_html_opts(ptr, len, flags)` in the GFM build) — no `wasm-bindgen`,
+so the same `.wasm` drives from any host. Build it yourself with the `wasm`
+feature (add `,gfm` for the GFM build):
 
 ```bash
 RUSTFLAGS="-C target-feature=+simd128,+bulk-memory" \
