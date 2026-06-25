@@ -33,16 +33,50 @@ Passes all **652/652** examples of the official conformance suite.
 
 The block layer is a faithful port of the reference incremental algorithm
 (open-block tree + per-line continuation); the renderer matches cmark's
-whitespace byte-for-byte. Ongoing work is performance — trimming allocations
-and wiring it onto rostdown's perf substrate (arena + SWAR scan).
+whitespace byte-for-byte.
 
 ```bash
 # Live CommonMark conformance number (652 official examples):
 cargo test --test spec -- --nocapture
 
-# Throughput on the 198 KB CommonMark spec fixture:
+# Throughput on the 200 KB CommonMark spec fixture (vs pulldown-cmark):
 cargo bench
 ```
+
+## Performance
+
+On the CommonMark spec itself (`tests/fixtures/data.md`, ~200 KB — the same
+fixture `cmark` and rushdown benchmark on), default build, Apple Mac Studio,
+measured in process:
+
+| engine                 |     time | relative |
+| ---------------------- | -------: | -------: |
+| **sparkdown**          | **0.58 ms** | **1.00×** |
+| pulldown-cmark         |  0.67 ms |    1.16× |
+| rushdown (cached)      |  1.36 ms |    2.35× |
+| cmark (C, reference)   |  ~1.9 ms |   ~3.2×  |
+| comrak                 |  2.00 ms |    3.45× |
+| markdown-rs            |  33.5 ms |      58× |
+
+`cargo bench` reproduces the sparkdown-vs-pulldown pair in-repo. Ratios are the
+portable part — absolute times are machine-specific. cmark was compared
+CLI-to-CLI on a 16 MB document (3.2× sparkdown's wall time and 3.1× its retired
+instructions); goldmark (Go) benches in comrak's tier.
+
+The speed is from the default build alone — zero dependencies, no feature flags:
+
+- **Zero-copy** source borrowing for paragraph / code / HTML-block text, link
+  destinations and titles, and reference-lookup keys.
+- **SIMD** byte-set matchers (the simdjson nibble-lookup, NEON / SSE) skip plain
+  text to the next significant byte, and a fused SIMD `escape_html` emits a whole
+  16-byte block per compare.
+- **Lean structures** — an intrusive first-child / next-sibling node tree, a
+  reused inline scratch buffer, and on-the-fly line iteration (no materialized
+  line vector).
+
+<sub>rushdown's published benchmark lists pulldown-cmark at ~6 ms; that figure is
+inflated by a copy-paste bug in its harness — the pulldown timing closure also
+runs comrak. Measured correctly on the same fixture, pulldown-cmark is ~0.67 ms.</sub>
 
 ## What was reused from rostdown (and what wasn't)
 

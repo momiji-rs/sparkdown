@@ -1,13 +1,9 @@
-//! sparkdown vs pulldown-cmark — the speed bar to beat.
+//! sparkdown vs pulldown-cmark.
 //!
-//! Throughput on the CommonMark spec (`data.md`, ~198 KB), the same fixture
-//! yuin/rushdown benchmarks. Run: `cargo bench`.
-//!
-//! NOTE (scaffold): until conformance is high the sparkdown number is
-//! **meaningless for comparison** — the parser currently emits only
-//! paragraphs and skips most of the document, so it looks artificially fast.
-//! The harness exists so the speed gap is measurable from the first real
-//! feature onward.
+//! Throughput on the CommonMark spec (`data.md`, ~200 KB), the same fixture
+//! `cmark` and yuin/rushdown benchmark. Run: `cargo bench`. Both engines parse
+//! the full document (sparkdown is 100% conformant), so the comparison is fair;
+//! the wider cross-engine field is in the project README.
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 
