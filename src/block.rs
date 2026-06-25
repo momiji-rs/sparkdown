@@ -346,10 +346,6 @@ struct Parser<'a> {
     /// source positions.
     #[cfg(feature = "ast")]
     buf_segs: Vec<(u32, u32)>,
-    /// SPIKE (`ast` feature): source offset just past the most recent list
-    /// marker (for an empty list item's `position.end`).
-    #[cfg(feature = "ast")]
-    marker_src_end: u32,
 }
 
 impl<'a> Parser<'a> {
@@ -385,8 +381,6 @@ impl<'a> Parser<'a> {
             defs: Vec::new(),
             #[cfg(feature = "ast")]
             buf_segs: Vec::new(),
-            #[cfg(feature = "ast")]
-            marker_src_end: 0,
         }
     }
 
@@ -1414,12 +1408,12 @@ impl<'a> Parser<'a> {
         }
         let item = self.add_child(Kind::Item);
         self.nodes[item].list = Some(data);
-        // SPIKE (`ast`): default an item's end to just past its marker, so an
-        // empty item (no block children) gets `[marker, after-marker]`. Non-empty
-        // items override this with their last child's end.
+        // SPIKE (`ast`): default an empty item's end to the end of its marker
+        // line (mdast keeps trailing spaces after the marker, e.g. "-   ").
+        // Non-empty items override this with their last child's end.
         #[cfg(feature = "ast")]
         {
-            self.nodes[item].src_end = self.marker_src_end;
+            self.nodes[item].src_end = (self.line_src_start + self.line.len()) as u32;
         }
         1
     }
@@ -1505,11 +1499,6 @@ impl<'a> Parser<'a> {
 
         self.advance_next_nonspace();
         self.advance_offset(marker_width, true);
-        // SPIKE (`ast`): source offset just past the marker (empty item's end).
-        #[cfg(feature = "ast")]
-        {
-            self.marker_src_end = (self.line_src_start + self.offset) as u32;
-        }
         let spaces_start_col = self.column;
         let spaces_start_offset = self.offset;
         loop {
