@@ -22,6 +22,10 @@ crate-type = ["cdylib", "rlib"]
 [workspace]
 
 [features]
+# GFM extensions (opt-in, OFF by default): strikethrough, task lists, extended
+# autolinks, tag filter, and pipe tables. Off, none of this code is compiled —
+# the parser is byte-for-byte the pure-CommonMark fast path.
+gfm = []
 # Mirrors rostdown: opt-in scoped global bump allocator (src/arena.rs). An
 # embedder that enables it must install `sparkdown::ScopedAlloc` as its
 # `#[global_allocator]`. The local bump (src/bump.rs) is always on.

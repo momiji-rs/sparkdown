@@ -45,6 +45,7 @@ fn gfm_preset_is_all_on() {
     assert!(g.strikethrough && g.tasklist && g.autolink && g.tagfilter && g.tables);
 }
 
+#[cfg(feature = "gfm")]
 #[test]
 fn strikethrough() {
     let st = Options {
@@ -73,6 +74,7 @@ fn strikethrough() {
     assert_eq!(to_html("~~foo~~"), "<p>~~foo~~</p>\n");
 }
 
+#[cfg(feature = "gfm")]
 #[test]
 fn tasklist() {
     let tl = Options {
@@ -102,6 +104,7 @@ fn tasklist() {
     assert_eq!(to_html("- [ ] foo\n"), "<ul>\n<li>[ ] foo</li>\n</ul>\n");
 }
 
+#[cfg(feature = "gfm")]
 #[test]
 fn tagfilter() {
     let tf = Options {
@@ -128,6 +131,7 @@ fn tagfilter() {
     assert_eq!(to_html("a <title> b\n"), "<p>a <title> b</p>\n");
 }
 
+#[cfg(feature = "gfm")]
 #[test]
 fn tables() {
     let t = Options {
@@ -169,6 +173,7 @@ fn tables() {
     );
 }
 
+#[cfg(feature = "gfm")]
 #[test]
 fn autolink() {
     let a = Options {

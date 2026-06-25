@@ -6,7 +6,9 @@
 
 use crate::block::{Kind, Tree};
 use crate::inline::{Scratch, render_inline};
+use crate::options::Options;
 use crate::scan::{escape_block_mask, memchr1};
+#[cfg(feature = "gfm")]
 use std::borrow::Cow;
 
 /// Render a parsed [`Tree`] to an HTML string.
@@ -59,7 +61,7 @@ fn render_node(tree: &Tree, idx: usize, out: &mut String, scratch: &mut Scratch)
             // emits a checkbox and drops the marker. Gated — off keeps the exact
             // original path (no slice); on defers to the out-of-line `task_input`.
             let content = tree.content(idx);
-            let content = if tree.opts.tasklist {
+            let content = if Options::GFM && tree.opts.tasklist {
                 &content[task_input(tree, idx, out)..]
             } else {
                 content
@@ -102,7 +104,7 @@ fn render_node(tree: &Tree, idx: usize, out: &mut String, scratch: &mut Scratch)
         }
         Kind::HtmlBlock => {
             cr(out);
-            if tree.opts.tagfilter {
+            if Options::GFM && tree.opts.tagfilter {
                 filter_html(tree.content(idx), out);
             } else {
                 out.push_str(tree.content(idx));
@@ -144,10 +146,12 @@ fn render_node(tree: &Tree, idx: usize, out: &mut String, scratch: &mut Scratch)
             out.push_str("</li>");
             cr(out);
         }
+        #[cfg(feature = "gfm")]
         Kind::Table => render_table(tree, idx, out, scratch),
     }
 }
 
+#[cfg(feature = "gfm")]
 /// Per-column GFM table alignment.
 #[derive(Clone, Copy)]
 enum Align {
@@ -157,6 +161,7 @@ enum Align {
     Right,
 }
 
+#[cfg(feature = "gfm")]
 /// Split a table row into raw cell slices, honoring `\|` escapes and dropping a
 /// single optional leading/trailing pipe.
 fn split_row_cells(line: &str) -> Vec<&str> {
@@ -185,6 +190,7 @@ fn split_row_cells(line: &str) -> Vec<&str> {
     cells
 }
 
+#[cfg(feature = "gfm")]
 /// Parse the delimiter row into per-column alignments.
 fn parse_aligns(delim: &str) -> Vec<Align> {
     split_row_cells(delim)
@@ -201,6 +207,7 @@ fn parse_aligns(delim: &str) -> Vec<Align> {
         .collect()
 }
 
+#[cfg(feature = "gfm")]
 /// Emit one table row's cells as `<th>`/`<td>` (`tag`), padded/truncated to the
 /// column count and tagged with alignment.
 fn emit_row(
@@ -237,6 +244,7 @@ fn emit_row(
     }
 }
 
+#[cfg(feature = "gfm")]
 /// Render a GFM pipe table. Content is `header\ndelimiter\n[data rows…]`.
 fn render_table(tree: &Tree, idx: usize, out: &mut String, scratch: &mut Scratch) {
     let content = tree.content(idx);

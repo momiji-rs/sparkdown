@@ -1094,9 +1094,12 @@ pub fn render_inline(
     scratch: &mut Scratch,
     opts: Options,
 ) {
-    let tf = opts.tagfilter;
-    let al = opts.autolink;
-    match (opts.hard_wraps, opts.strikethrough) {
+    // `Options::GFM &&` folds these to `false` when the `gfm` feature is off, so
+    // the gfm scan tables, the `~`/autolink arms, and the tagfilter call are all
+    // eliminated and the default build streams pure CommonMark.
+    let tf = Options::GFM && opts.tagfilter;
+    let al = Options::GFM && opts.autolink;
+    match (opts.hard_wraps, Options::GFM && opts.strikethrough) {
         (false, false) => render_inline_impl::<false, false>(src, out, refmap, scratch, tf, al),
         (false, true) => render_inline_impl::<false, true>(src, out, refmap, scratch, tf, al),
         (true, false) => render_inline_impl::<true, false>(src, out, refmap, scratch, tf, al),
@@ -1754,7 +1757,7 @@ fn process_emphasis(list: &mut List, stack: &mut Vec<StackItem>, start: usize) {
             ci += 1;
             continue;
         }
-        let strike = cch == b'~';
+        let strike = Options::GFM && cch == b'~';
         let char_idx = if strike {
             2
         } else if cch == b'*' {

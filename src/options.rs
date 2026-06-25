@@ -26,7 +26,17 @@ pub struct Options {
 }
 
 impl Options {
-    /// GitHub Flavored Markdown: every GFM extension enabled.
+    /// `true` iff the `gfm` Cargo feature is enabled (GFM code is compiled in).
+    /// Used as `Options::GFM && opts.flag` so that, without the feature, every
+    /// GFM check folds to `false` and its code is eliminated — the default build
+    /// is byte-for-byte the pure-CommonMark fast path.
+    #[cfg(feature = "gfm")]
+    pub(crate) const GFM: bool = true;
+    #[cfg(not(feature = "gfm"))]
+    pub(crate) const GFM: bool = false;
+
+    /// GitHub Flavored Markdown: every GFM extension enabled. (Effective only
+    /// when the crate is built with the `gfm` feature.)
     pub const fn gfm() -> Self {
         Options {
             strikethrough: true,

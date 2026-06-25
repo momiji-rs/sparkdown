@@ -28,6 +28,7 @@ pub enum Kind {
     HtmlBlock,
     /// GFM pipe table (opt-in). Content holds the raw rows (header, delimiter,
     /// then data rows), each `\n`-terminated; cells are parsed at render time.
+    #[cfg(feature = "gfm")]
     Table,
 }
 
@@ -638,13 +639,13 @@ impl<'a> Parser<'a> {
             self.find_next_nonspace();
             // Fast skip: a non-indented line whose first non-space char can't
             // begin any block is plain paragraph text — bypass all matchers.
+            let fast_skip = !self.indented && !maybe_special(peek(self.line, self.next_nonspace));
             // A GFM table delimiter row can start with `|`/`:` (not in
             // `maybe_special`); with tables on, route every line through the
-            // matchers so `start_table` sees it. One bool load when off.
-            if !self.indented
-                && !maybe_special(peek(self.line, self.next_nonspace))
-                && !self.opts.tables
-            {
+            // matchers so `start_table` sees it. Compiled out when `gfm` is off.
+            #[cfg(feature = "gfm")]
+            let fast_skip = fast_skip && !self.opts.tables;
+            if fast_skip {
                 self.advance_next_nonspace();
                 break;
             }
@@ -794,6 +795,7 @@ impl<'a> Parser<'a> {
             }
             // A table continues while rows keep coming: non-blank lines that
             // still look like a row (contain a pipe). Anything else closes it.
+            #[cfg(feature = "gfm")]
             Kind::Table => u8::from(self.blank || !self.line[self.next_nonspace..].contains(&b'|')),
         }
     }
@@ -810,6 +812,7 @@ impl<'a> Parser<'a> {
             5 => self.start_thematic_break(),
             6 => self.start_list_item(container),
             7 => self.start_indented_code(),
+            #[cfg(feature = "gfm")]
             8 => self.start_table(container),
             _ => 0,
         }
@@ -929,6 +932,7 @@ impl<'a> Parser<'a> {
         2
     }
 
+    #[cfg(feature = "gfm")]
     /// GFM pipe table: the current line is a delimiter row and the open
     /// paragraph is a single-line header with a matching column count. Reuse the
     /// paragraph node as the table; the delimiter line (and later data rows)
@@ -1111,7 +1115,7 @@ impl<'a> Parser<'a> {
     }
 }
 
-const NUM_STARTS: usize = 9;
+const NUM_STARTS: usize = if cfg!(feature = "gfm") { 9 } else { 8 };
 
 /// Could a line whose first non-space byte is `c` begin a block other than a
 /// paragraph? (`#` ATX, `>` quote, `` ` ``/`~` fence, `*+-_` thematic/list,
@@ -1133,12 +1137,17 @@ fn can_contain(parent: Kind, child: Kind) -> bool {
 }
 
 fn accepts_lines(kind: Kind) -> bool {
-    matches!(
-        kind,
-        Kind::Paragraph | Kind::CodeBlock | Kind::HtmlBlock | Kind::Table
-    )
+    if matches!(kind, Kind::Paragraph | Kind::CodeBlock | Kind::HtmlBlock) {
+        return true;
+    }
+    #[cfg(feature = "gfm")]
+    if kind == Kind::Table {
+        return true;
+    }
+    false
 }
 
+#[cfg(feature = "gfm")]
 /// Trim ASCII spaces and tabs from both ends of a byte slice.
 fn trim_sp(mut s: &[u8]) -> &[u8] {
     while let [b' ' | b'\t', rest @ ..] = s {
@@ -1150,6 +1159,7 @@ fn trim_sp(mut s: &[u8]) -> &[u8] {
     s
 }
 
+#[cfg(feature = "gfm")]
 /// Number of cells in a GFM table row: pipe-separated, honoring `\|` escapes and
 /// dropping a single optional leading/trailing pipe.
 fn count_cells(line: &[u8]) -> usize {
@@ -1174,6 +1184,7 @@ fn count_cells(line: &[u8]) -> usize {
     parts
 }
 
+#[cfg(feature = "gfm")]
 /// If `line` is a valid GFM delimiter row (cells of `:?-+:?`, with at least one
 /// pipe to disambiguate it from a setext underline), return the column count.
 fn delim_row_cols(line: &[u8]) -> Option<usize> {
