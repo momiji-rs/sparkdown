@@ -449,6 +449,176 @@ pub fn to_mdast_json(src: &str) -> String {
     out
 }
 
+/// SPIKE (route A): serialize the mdast to a compact little-endian **binary wire
+/// format**, read directly out of wasm linear memory into plain JS objects with
+/// no JSON string in between. This removes the JSON serialize (Rust) + whole-
+/// buffer UTF-8 decode + `JSON.parse` (JS) tax that the `to_mdast_json` boundary
+/// pays — the JS reader walks the bytes and builds the same remark-shaped tree.
+///
+/// Layout, preorder DFS, every value little-endian:
+///   per node: `u8 tag`, then position `6×u32` (start line,col,offset; end
+///   line,col,offset), then the tag's payload. Container payloads end with
+///   `u32 childCount` followed by that many child nodes. Strings: `u32 len` then
+///   `len` UTF-8 bytes; an optional string uses `len == 0xFFFF_FFFF` for `None`.
+pub fn to_mdast_wire(src: &str) -> Vec<u8> {
+    let tree = to_mdast(src);
+    // The binary is denser than JSON; ~1.5× source is a safe initial reserve.
+    let mut out = Vec::<u8>::with_capacity(src.len() * 2 + 64);
+    write_wire(&tree, &mut out);
+    out
+}
+
+#[inline]
+fn w_u32(v: u32, out: &mut Vec<u8>) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+fn w_str(s: &str, out: &mut Vec<u8>) {
+    w_u32(s.len() as u32, out);
+    out.extend_from_slice(s.as_bytes());
+}
+fn w_opt(o: &Option<String>, out: &mut Vec<u8>) {
+    match o {
+        Some(s) => w_str(s, out),
+        None => w_u32(u32::MAX, out),
+    }
+}
+fn reftype_code(r: &str) -> u8 {
+    match r {
+        "shortcut" => 0,
+        "collapsed" => 1,
+        _ => 2, // "full"
+    }
+}
+fn w_children(c: &[Mdast], out: &mut Vec<u8>) {
+    w_u32(c.len() as u32, out);
+    for child in c {
+        write_wire(child, out);
+    }
+}
+
+fn write_wire(node: &Mdast, out: &mut Vec<u8>) {
+    // Every node carries a wrapping position; unwrap it.
+    let (pos, inner) = match node {
+        Mdast::Positioned(p, inner) => (Some(p), inner.as_ref()),
+        other => (None, other),
+    };
+    macro_rules! head {
+        ($tag:expr) => {{
+            out.push($tag);
+            match pos {
+                Some(p) => {
+                    w_u32(p.start.0, out);
+                    w_u32(p.start.1, out);
+                    w_u32(p.start.2, out);
+                    w_u32(p.end.0, out);
+                    w_u32(p.end.1, out);
+                    w_u32(p.end.2, out);
+                }
+                // Unreachable for our trees (all nodes are Positioned); keep the
+                // layout fixed-width so the reader can always read 6 words.
+                None => out.extend_from_slice(&[0u8; 24]),
+            }
+        }};
+    }
+    match inner {
+        Mdast::Positioned(..) => unreachable!("nested Positioned"),
+        Mdast::Root(c) => {
+            head!(0);
+            w_children(c, out);
+        }
+        Mdast::Paragraph(c) => {
+            head!(1);
+            w_children(c, out);
+        }
+        Mdast::Heading { depth, children } => {
+            head!(2);
+            out.push(*depth);
+            w_children(children, out);
+        }
+        Mdast::Blockquote(c) => {
+            head!(3);
+            w_children(c, out);
+        }
+        Mdast::List { ordered, start, spread, children } => {
+            head!(4);
+            let flags = (*ordered as u8) | ((*spread as u8) << 1);
+            out.push(flags);
+            w_u32(start.map(|s| s as u32).unwrap_or(u32::MAX), out);
+            w_children(children, out);
+        }
+        Mdast::ListItem { spread, children } => {
+            head!(5);
+            out.push(*spread as u8);
+            w_children(children, out);
+        }
+        Mdast::ThematicBreak => head!(6),
+        Mdast::Code { lang, meta, value } => {
+            head!(7);
+            w_opt(lang, out);
+            w_opt(meta, out);
+            w_str(value, out);
+        }
+        Mdast::Html(v) => {
+            head!(8);
+            w_str(v, out);
+        }
+        Mdast::Text(v) => {
+            head!(9);
+            w_str(v, out);
+        }
+        Mdast::Emphasis(c) => {
+            head!(10);
+            w_children(c, out);
+        }
+        Mdast::Strong(c) => {
+            head!(11);
+            w_children(c, out);
+        }
+        Mdast::Delete(c) => {
+            head!(12);
+            w_children(c, out);
+        }
+        Mdast::InlineCode(v) => {
+            head!(13);
+            w_str(v, out);
+        }
+        Mdast::Break => head!(14),
+        Mdast::Link { url, title, children } => {
+            head!(15);
+            w_str(url, out);
+            w_opt(title, out);
+            w_children(children, out);
+        }
+        Mdast::Image { url, title, alt } => {
+            head!(16);
+            w_str(url, out);
+            w_opt(title, out);
+            w_str(alt, out);
+        }
+        Mdast::Definition { identifier, label, url, title } => {
+            head!(17);
+            w_str(identifier, out);
+            w_str(label, out);
+            w_str(url, out);
+            w_opt(title, out);
+        }
+        Mdast::LinkReference { identifier, label, reftype, children } => {
+            head!(18);
+            w_str(identifier, out);
+            w_str(label, out);
+            out.push(reftype_code(reftype));
+            w_children(children, out);
+        }
+        Mdast::ImageReference { identifier, label, reftype, alt } => {
+            head!(19);
+            w_str(identifier, out);
+            w_str(label, out);
+            out.push(reftype_code(reftype));
+            w_str(alt, out);
+        }
+    }
+}
+
 /// Append a JSON string literal (RFC 8259 escaping).
 fn json_str(s: &str, out: &mut String) {
     out.push('"');

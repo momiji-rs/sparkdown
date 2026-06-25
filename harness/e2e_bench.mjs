@@ -25,7 +25,7 @@ import remarkParse from 'remark-parse';
 import remarkRehype from 'remark-rehype';
 import rehypeStringify from 'rehype-stringify';
 import { markdownToHtml, markdownToMdast, defineHastPlugin } from 'satteri';
-import sparkdown, { parseToMdast } from './sparkdown.mjs';
+import sparkdown, { parseToMdast, parseToMdastWire } from './sparkdown.mjs';
 
 // --- sparkdown direct wasm to_html (no mdast) -------------------------------
 const wasmBytes = readFileSync(new URL('./sparkdown.wasm', import.meta.url));
@@ -151,18 +151,21 @@ function suite(title, md) {
   };
   const remarkFull = full((m) => remarkParseOnly.parse(m));
   const satFull = full((m) => markdownToMdast(m, { features: satteriFeat.features }));
-  const sparkFull = full((m) => parseToMdast(m));
+  const sparkJsonFull = full((m) => parseToMdast(m));
+  const sparkWireFull = full((m) => parseToMdastWire(m));
   table('C. markdown -> FULLY MATERIALIZED mdast in JS (every node reachable)', bytes, [
     { name: 'remark-parse (native JS tree)', ms: remarkFull.ms, size: `${remarkFull.n} nodes` },
     { name: `${sat} markdownToMdast`, ms: satFull.ms, size: `${satFull.n} nodes` },
-    { name: 'sparkdown wasm -> JSON -> JS', ms: sparkFull.ms, size: `${sparkFull.n} nodes` },
+    { name: 'sparkdown wasm -> JSON -> JS', ms: sparkJsonFull.ms, size: `${sparkJsonFull.n} nodes` },
+    { name: 'sparkdown wasm -> WIRE -> JS  ★', ms: sparkWireFull.ms, size: `${sparkWireFull.n} nodes` },
   ]);
 
   // C': the lazy advantage — Sätteri's tree before anything walks it. sparkdown's
-  // JSON path can't do partial: it always materializes the whole tree.
+  // boundary can't do partial: it always materializes the whole tree.
   table("C'. markdown -> mdast HANDLE / shell (before touching nodes)", bytes, [
     { name: `${sat} markdownToMdast (lazy shell)`, ms: measure(() => markdownToMdast(md, { features: satteriFeat.features })), size: 'lazy' },
     { name: 'sparkdown wasm -> JSON -> JS (eager)', ms: measure(() => parseToMdast(md)), size: 'full' },
+    { name: 'sparkdown wasm -> WIRE -> JS (eager) ★', ms: measure(() => parseToMdastWire(md)), size: 'full' },
   ]);
 }
 
