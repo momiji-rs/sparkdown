@@ -10,6 +10,9 @@ use crate::inline::{RefMap, take_ref_defs};
 
 const CODE_INDENT: usize = 4;
 
+/// Sentinel for "no node" in the first-child/next-sibling links.
+const NO_NODE: u32 = u32::MAX;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
     Document,
@@ -36,7 +39,12 @@ pub struct ListData {
 
 pub struct Node {
     pub kind: Kind,
-    pub children: Vec<usize>,
+    /// Children as an intrusive first-child/next-sibling list (indices into the
+    /// nodes arena, `NO_NODE` for none) — no per-node `Vec` allocation, and the
+    /// walk stays inside the arena for cache locality.
+    first_child: u32,
+    last_child: u32,
+    next_sibling: u32,
     pub parent: usize,
     open: bool,
     last_line_blank: bool,
@@ -64,7 +72,9 @@ impl Node {
     fn new(kind: Kind, parent: usize, line: u32) -> Self {
         Node {
             kind,
-            children: Vec::new(),
+            first_child: NO_NODE,
+            last_child: NO_NODE,
+            next_sibling: NO_NODE,
             parent,
             open: true,
             last_line_blank: false,
@@ -106,6 +116,18 @@ impl Tree<'_> {
             &self.buf
         };
         &store[n.cstart as usize..n.cend as usize]
+    }
+
+    /// First child of node `idx` in the intrusive child list, if any.
+    pub fn first_child(&self, idx: usize) -> Option<usize> {
+        let c = self.nodes[idx].first_child;
+        (c != NO_NODE).then_some(c as usize)
+    }
+
+    /// Next sibling of node `idx`, if any.
+    pub fn next_sibling(&self, idx: usize) -> Option<usize> {
+        let s = self.nodes[idx].next_sibling;
+        (s != NO_NODE).then_some(s as usize)
     }
 
     /// The fenced-code info string of node `idx` (raw; unescape at render).
@@ -186,7 +208,8 @@ impl<'a> Parser<'a> {
     }
 
     fn last_child(&self, n: usize) -> Option<usize> {
-        self.nodes[n].children.last().copied()
+        let lc = self.nodes[n].last_child;
+        (lc != NO_NODE).then_some(lc as usize)
     }
 
     // ---- line position helpers ------------------------------------------
@@ -266,7 +289,14 @@ impl<'a> Parser<'a> {
         node.cstart = self.buf.len() as u32;
         node.cend = node.cstart;
         self.nodes.push(node);
-        self.nodes[parent].children.push(idx);
+        // Append to the parent's intrusive child list.
+        let last = self.nodes[parent].last_child;
+        if last == NO_NODE {
+            self.nodes[parent].first_child = idx as u32;
+        } else {
+            self.nodes[last as usize].next_sibling = idx as u32;
+        }
+        self.nodes[parent].last_child = idx as u32;
         self.tip = idx;
         idx
     }
@@ -438,23 +468,42 @@ impl<'a> Parser<'a> {
 
     fn unlink(&mut self, idx: usize) {
         let parent = self.nodes[idx].parent;
-        self.nodes[parent].children.retain(|&c| c != idx);
+        let idx32 = idx as u32;
+        let next = self.nodes[idx].next_sibling;
+        if self.nodes[parent].first_child == idx32 {
+            self.nodes[parent].first_child = next;
+            if self.nodes[parent].last_child == idx32 {
+                self.nodes[parent].last_child = NO_NODE;
+            }
+        } else {
+            let mut prev = self.nodes[parent].first_child;
+            while self.nodes[prev as usize].next_sibling != idx32 {
+                prev = self.nodes[prev as usize].next_sibling;
+            }
+            self.nodes[prev as usize].next_sibling = next;
+            if self.nodes[parent].last_child == idx32 {
+                self.nodes[parent].last_child = prev;
+            }
+        }
     }
 
     fn compute_tight(&self, list: usize) -> bool {
-        let items = &self.nodes[list].children;
-        for (ii, &item) in items.iter().enumerate() {
+        let mut item = self.nodes[list].first_child;
+        while item != NO_NODE {
+            let item_last = self.nodes[item as usize].next_sibling == NO_NODE;
             // blank line at end of an item that is not the last → loose
-            if self.ends_with_blank_line(item) && ii + 1 < items.len() {
+            if !item_last && self.ends_with_blank_line(item as usize) {
                 return false;
             }
-            let subs = &self.nodes[item].children;
-            for (si, &sub) in subs.iter().enumerate() {
-                let last_in_item = si + 1 == subs.len();
-                if self.ends_with_blank_line(sub) && !(ii + 1 == items.len() && last_in_item) {
+            let mut sub = self.nodes[item as usize].first_child;
+            while sub != NO_NODE {
+                let sub_last = self.nodes[sub as usize].next_sibling == NO_NODE;
+                if self.ends_with_blank_line(sub as usize) && !(item_last && sub_last) {
                     return false;
                 }
+                sub = self.nodes[sub as usize].next_sibling;
             }
+            item = self.nodes[item as usize].next_sibling;
         }
         true
     }
@@ -465,10 +514,11 @@ impl<'a> Parser<'a> {
                 return true;
             }
             if matches!(self.nodes[idx].kind, Kind::List | Kind::Item) {
-                match self.nodes[idx].children.last() {
-                    Some(&c) => idx = c,
-                    None => return false,
+                let last = self.nodes[idx].last_child;
+                if last == NO_NODE {
+                    return false;
                 }
+                idx = last as usize;
             } else {
                 return false;
             }
@@ -589,7 +639,7 @@ impl<'a> Parser<'a> {
                 && !(t == Kind::BlockQuote
                     || (t == Kind::CodeBlock && self.nodes[container].fenced)
                     || (t == Kind::Item
-                        && self.nodes[container].children.is_empty()
+                        && self.nodes[container].first_child == NO_NODE
                         && self.nodes[container].start_line == self.line_number));
             let mut c = container;
             loop {
@@ -638,7 +688,7 @@ impl<'a> Parser<'a> {
                     (ld.marker_offset, ld.padding)
                 };
                 if self.blank {
-                    if self.nodes[c].children.is_empty() {
+                    if self.nodes[c].first_child == NO_NODE {
                         1
                     } else {
                         self.advance_next_nonspace();

@@ -15,24 +15,26 @@ pub fn render(tree: &Tree) -> String {
     // write (measured slower) than absorbing the occasional grow.
     let mut out = String::with_capacity(tree.source_len + tree.source_len / 8 + 64);
     let mut scratch = Scratch::new();
-    for &c in &tree.nodes[tree.root].children {
-        render_node(tree, c, &mut out, &mut scratch);
-    }
+    children(tree, tree.root, &mut out, &mut scratch);
     out
 }
 
-/// Emit a newline unless `out` already ends with one.
+/// Emit a newline unless `out` is empty or already ends with one. One byte
+/// check (the last byte) instead of `is_empty()` + the `ends_with` machinery —
+/// `cr` runs several times per node.
 fn cr(out: &mut String) {
-    if !out.is_empty() && !out.ends_with('\n') {
-        out.push('\n');
+    match out.as_bytes().last() {
+        None | Some(b'\n') => {}
+        _ => out.push('\n'),
     }
 }
 
 fn children(tree: &Tree, idx: usize, out: &mut String, scratch: &mut Scratch) {
-    // `tree` is a shared borrow; iterating its children while recursing needs
-    // no clone (both are shared borrows).
-    for &c in &tree.nodes[idx].children {
-        render_node(tree, c, out, scratch);
+    // Walk the intrusive first-child/next-sibling list.
+    let mut c = tree.first_child(idx);
+    while let Some(ci) = c {
+        render_node(tree, ci, out, scratch);
+        c = tree.next_sibling(ci);
     }
 }
 
