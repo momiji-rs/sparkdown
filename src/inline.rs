@@ -10,7 +10,7 @@
 
 use crate::entities::{named, remap_numeric};
 use crate::render::escape_html;
-use crate::scan::{find_inline, find_stream, memchr3};
+use crate::scan::{find_emph, find_inline, find_stream};
 use std::borrow::Cow;
 use std::collections::HashMap;
 
@@ -824,7 +824,7 @@ fn stream_inline(src: &str, out: &mut String) {
 pub fn render_inline(src: &str, out: &mut String, refmap: &RefMap, scratch: &mut Scratch) {
     let bytes = src.as_bytes();
     // Fast path: no emphasis/link delimiters → stream directly, no allocation.
-    if memchr3(bytes, b'*', b'_', b'[').is_none() {
+    if find_emph(bytes).is_none() {
         stream_inline(src, out);
         return;
     }

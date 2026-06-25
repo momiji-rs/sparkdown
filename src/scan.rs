@@ -222,6 +222,16 @@ pub(crate) fn find_stream(hay: &[u8]) -> Option<usize> {
     find_in_set(hay, &STREAM_LO, &STREAM_HI)
 }
 
+/// The emphasis/link openers `*` `_` `[` — the fast-path gate: their absence
+/// means a paragraph can stream without the delimiter-stack machinery.
+const EMPH_LO: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x04, 0x20, 0, 0, 0, 0x20];
+const EMPH_HI: [u8; 16] = [0, 0, 0x04, 0, 0, 0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+#[inline]
+pub(crate) fn find_emph(hay: &[u8]) -> Option<usize> {
+    find_in_set(hay, &EMPH_LO, &EMPH_HI)
+}
+
 #[inline]
 fn in_set(b: u8, lo: &[u8; 16], hi: &[u8; 16]) -> bool {
     lo[(b & 0x0F) as usize] & hi[(b >> 4) as usize] != 0
@@ -438,11 +448,13 @@ mod tests {
             h.iter()
                 .position(|&b| matches!(b, b'\\' | b'`' | b'&' | b'<' | b'\n'))
         };
+        let emph_scalar = |h: &[u8]| h.iter().position(|&b| matches!(b, b'*' | b'_' | b'['));
         let bytes: Vec<u8> = (0u8..=255).cycle().take(400).collect();
         for len in 0..bytes.len() {
             let hay = &bytes[..len];
             assert_eq!(find_inline(hay), inline_scalar(hay), "inline len={len}");
             assert_eq!(find_stream(hay), stream_scalar(hay), "stream len={len}");
+            assert_eq!(find_emph(hay), emph_scalar(hay), "emph len={len}");
         }
         // Each member at every position; and no false positives for neighbours.
         for pos in 0..40 {
