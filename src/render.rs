@@ -61,7 +61,12 @@ fn render_node(tree: &Tree, idx: usize, out: &mut String, scratch: &mut Scratch)
             // emits a checkbox and drops the marker. Gated — off keeps the exact
             // original path (no slice); on defers to the out-of-line `task_input`.
             let content = tree.content(idx);
-            let content = if Options::GFM && tree.opts.tasklist {
+            // Cheap inline gate (parent is a list item) keeps the out-of-line
+            // `task_input` off the vast majority of paragraphs.
+            let content = if Options::GFM
+                && tree.opts.tasklist
+                && tree.nodes[tree.nodes[idx].parent].kind == Kind::Item
+            {
                 &content[task_input(tree, idx, out)..]
             } else {
                 content
