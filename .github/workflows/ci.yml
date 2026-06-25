@@ -31,6 +31,8 @@ jobs:
         run: cargo test --test spec -- --nocapture
       - name: Test (arena feature)
         run: cargo test --features arena --verbose
+      - name: Test (gfm feature) — GFM extensions + 652 conformance
+        run: cargo test --features gfm --verbose
 
   fmt:
     name: rustfmt

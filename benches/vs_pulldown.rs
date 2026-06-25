@@ -17,6 +17,13 @@ fn bench(c: &mut Criterion) {
         b.iter(|| criterion::black_box(sparkdown::to_html(DATA)))
     });
 
+    // The full-GFM build rendering with every extension active (`--features gfm`).
+    #[cfg(feature = "gfm")]
+    g.bench_function("sparkdown-gfm", |b| {
+        let opts = sparkdown::Options::gfm();
+        b.iter(|| criterion::black_box(sparkdown::to_html_with(DATA, &opts)))
+    });
+
     g.bench_function("pulldown-cmark", |b| {
         b.iter(|| {
             let parser = pulldown_cmark::Parser::new(DATA);
