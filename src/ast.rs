@@ -237,9 +237,9 @@ fn inline(
     eb: usize,
 ) -> Vec<Mdast> {
     let toks = render_inline_to_tokens(tree.content(idx), &tree.refmap, scratch, tree.opts);
-    let base = tree.inline_src_base(idx);
     let bpos = ctx.pos(sb, eb);
-    build_inline(toks, ctx, base, &bpos)
+    let map = |off: u32| tree.content_to_src(idx, off) as usize;
+    build_inline(toks, ctx, &map, &bpos)
 }
 
 /// An open inline container awaiting its close.
@@ -253,11 +253,17 @@ enum Frame {
 /// source byte offset of the inline content (so a content offset `o` maps to
 /// source `base + o`); when `None` (buffered content) or a token span is unset,
 /// the block-granular `bpos` is used.
-fn build_inline(toks: Vec<SpanTok>, ctx: &PosCtx, base: Option<u32>, bpos: &Pos) -> Vec<Mdast> {
+fn build_inline(
+    toks: Vec<SpanTok>,
+    ctx: &PosCtx,
+    map: &dyn Fn(u32) -> usize,
+    bpos: &Pos,
+) -> Vec<Mdast> {
     let mkpos = |s: u32, e: u32| -> Pos {
-        match base {
-            Some(b) if s != u32::MAX => ctx.pos((b + s) as usize, (b + e) as usize),
-            _ => bpos.clone(),
+        if s == u32::MAX {
+            bpos.clone()
+        } else {
+            ctx.pos(map(s), map(e))
         }
     };
     // (frame, children, open_start, open_end).

@@ -173,6 +173,9 @@ pub struct Tree<'a> {
     /// [`Node::def`].
     #[cfg(feature = "ast")]
     pub defs: Vec<DefData>,
+    /// SPIKE (`ast` feature): piecewise `buf`→source map (see the parser field).
+    #[cfg(feature = "ast")]
+    pub buf_segs: Vec<(u32, u32)>,
 }
 
 impl Tree<'_> {
@@ -228,14 +231,24 @@ impl Tree<'_> {
         &self.defs[self.nodes[idx].def as usize]
     }
 
-    /// SPIKE (`ast` feature): for a text-bearing block whose content is borrowed
-    /// directly from the source (`content_src`), the source byte offset of its
-    /// content start — so inline content offsets map straight to source. `None`
-    /// for buffered content (blockquote/list), where no direct map exists.
+    /// SPIKE (`ast` feature): map a content byte offset (relative to node `idx`'s
+    /// content) to a source byte offset. For source-borrowed content this is just
+    /// `cstart + off`; for buffered content (blockquote/list) it walks the
+    /// `buf`→source segment map.
     #[cfg(feature = "ast")]
-    pub fn inline_src_base(&self, idx: usize) -> Option<u32> {
+    pub fn content_to_src(&self, idx: usize, off: u32) -> u32 {
         let n = &self.nodes[idx];
-        n.content_src.then_some(n.cstart)
+        let buf_off = n.cstart + off;
+        if n.content_src {
+            return buf_off;
+        }
+        // Largest segment whose buf_off <= buf_off; source advances 1:1 within it.
+        let i = self.buf_segs.partition_point(|&(b, _)| b <= buf_off);
+        if i == 0 {
+            return buf_off; // before any segment (shouldn't happen)
+        }
+        let (b, s) = self.buf_segs[i - 1];
+        s + (buf_off - b)
     }
 
     /// SPIKE (`ast` feature): a node's raw source byte span `(start, end)`.
@@ -316,6 +329,13 @@ struct Parser<'a> {
     /// order; a node's [`Node::def`] indexes here.
     #[cfg(feature = "ast")]
     defs: Vec<DefData>,
+    /// SPIKE (`ast` feature): piecewise `buf`→source map for buffered content
+    /// (blockquote/list, where prefixes are stripped). Each `(buf_off, src_off)`
+    /// means buf bytes from `buf_off` onward map 1:1 to source from `src_off`
+    /// (until the next entry). Lets inline nodes in buffered blocks recover exact
+    /// source positions.
+    #[cfg(feature = "ast")]
+    buf_segs: Vec<(u32, u32)>,
 }
 
 impl<'a> Parser<'a> {
@@ -349,6 +369,8 @@ impl<'a> Parser<'a> {
             opts,
             #[cfg(feature = "ast")]
             defs: Vec::new(),
+            #[cfg(feature = "ast")]
+            buf_segs: Vec::new(),
         }
     }
 
@@ -568,6 +590,12 @@ impl<'a> Parser<'a> {
                 self.buf.push(' ');
             }
         }
+        // SPIKE (`ast`): `rest` (after prefix stripping) maps 1:1 to source from
+        // `line_src_start + offset` — record the breakpoint so inline nodes in
+        // buffered blocks recover source positions.
+        #[cfg(feature = "ast")]
+        self.buf_segs
+            .push((self.buf.len() as u32, (self.line_src_start + self.offset) as u32));
         let rest = &self.line[self.offset..];
         // line never contains an embedded NUL; push as UTF-8.
         self.buf.push_str(std::str::from_utf8(rest).unwrap_or(""));
@@ -585,6 +613,9 @@ impl<'a> Parser<'a> {
         );
         let start = self.buf.len();
         if s != e {
+            // SPIKE (`ast`): the copied prefix maps 1:1 to source `[s, e)`.
+            #[cfg(feature = "ast")]
+            self.buf_segs.push((start as u32, s as u32));
             self.buf.push_str(&self.source[s..e]);
         }
         self.nodes[tip].content_src = false;
@@ -861,6 +892,8 @@ impl<'a> Parser<'a> {
             buf: self.buf,
             #[cfg(feature = "ast")]
             defs: self.defs,
+            #[cfg(feature = "ast")]
+            buf_segs: self.buf_segs,
         }
     }
 
@@ -1140,6 +1173,14 @@ impl<'a> Parser<'a> {
         let after = std::str::from_utf8(&self.line[self.offset..]).unwrap_or("");
         let content = atx_content(after);
         let start = self.buf.len() as u32;
+        // SPIKE (`ast`): the heading text maps 1:1 to its source slice; record the
+        // breakpoint (content is a subslice of `self.line`).
+        #[cfg(feature = "ast")]
+        if !content.is_empty() {
+            let coff = content.as_ptr() as usize - self.line.as_ptr() as usize;
+            self.buf_segs
+                .push((start, (self.line_src_start + coff) as u32));
+        }
         self.buf.push_str(content);
         self.nodes[h].cstart = start;
         self.nodes[h].cend = self.buf.len() as u32;
