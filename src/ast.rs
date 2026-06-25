@@ -110,6 +110,30 @@ impl PosCtx {
         end
     }
 
+    /// Indented-code `position.end`: mdast keeps trailing spaces on the last
+    /// content line and even a trailing *spaces-only* line, but drops trailing
+    /// *zero-width* (empty) lines and the final newline. Drop newlines and the
+    /// empty lines they terminate, stopping at the first line that has content.
+    fn rtrim_code_end(&self, start: usize, mut end: usize) -> usize {
+        loop {
+            // Drop one trailing line ending; stop if there is none.
+            if end > start && self.src[end - 1] == b'\n' {
+                end -= 1;
+                if end > start && self.src[end - 1] == b'\r' {
+                    end -= 1;
+                }
+            } else {
+                break;
+            }
+            // If the line we just exposed is zero-width (its end is the buffer
+            // start or another newline), it is an empty line — drop it too.
+            if end > start && self.src[end - 1] != b'\n' {
+                break;
+            }
+        }
+        end
+    }
+
     /// Drop a single trailing line ending.
     fn rtrim_nl(&self, mut end: usize) -> usize {
         if end > 0 && self.src[end - 1] == b'\n' {
@@ -175,7 +199,7 @@ fn block(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> (Mdast
             // Fenced blocks span their full source (incl. the closing fence, or
             // the trailing newline of an unclosed block); indented blocks trim
             // trailing blank lines.
-            let eb = if node.fenced { se } else { ctx.rtrim(sb, se) };
+            let eb = if node.fenced { se } else { ctx.rtrim_code_end(sb, se) };
             (Mdast::Code { lang, meta, value }, sb, eb)
         }
         Kind::HtmlBlock => {
