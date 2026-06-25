@@ -19,15 +19,17 @@ Run: `node harness/gate.mjs` (exits non-zero unless Gate 1 = 100%; CI-ready).
 
 ```
 Gate 1  deep-equal IGNORING position : 652/652  (100.0%)  ← was 83.0%   ✅
-Gate 2  deep-equal INCLUDING position: 146/652  (22.4%)   ← was 19.9%
+Gate 2  deep-equal INCLUDING position: 652/652  (100.0%)  ← was 19.9%   ✅
 ```
 
-**Gate 1 is 100%.** `node harness/gate.mjs` exits 0. Independently corroborated:
-`verify.mjs` shape 652/652, the unified drop-in (`usage_demo.mjs`) and the
-real-plugin pipeline (`plugin_demo.mjs`) both produce **byte-identical HTML to
-remark-parse on all 652**. CommonMark conformance stays 652/652; default/gfm/ast
-builds all green; everything is behind the `ast` Cargo feature (default build
-byte-identical).
+**Both gates are 100%.** `node harness/gate.mjs` exits 0. Our mdast is now
+byte-for-byte **position-identical** to `mdast-util-from-markdown` across the
+whole CommonMark suite — every `position` (line/column/offset, UTF-16) matches.
+Independently corroborated: `verify.mjs` shape 652/652, the unified drop-in
+(`usage_demo.mjs`) and the real-plugin pipeline (`plugin_demo.mjs`) both produce
+**byte-identical HTML to remark-parse on all 652**. CommonMark conformance stays
+652/652; default/gfm/ast builds all green; everything is behind the `ast` Cargo
+feature (default build byte-identical).
 
 ## What got fixed (this session): reference-model + spread
 
@@ -62,21 +64,41 @@ disjunction provably equals `!tight`, so HTML looseness is untouched.
 (Earlier this session the gate also drove out inlineCode line-ending
 normalization — mdast keeps raw line endings — clearing #335/#337/#640/#641.)
 
-## Gate 2 (position) is the bigger lift
+## Gate 2 (position) — also closed to 100%
 
-22.4% with position, because inline nodes currently carry **block-granular**
-positions and block column/offset assume column 1. Reaching Gate 2 needs:
-1. indent-aware block column/offset (parser already tracks `next_nonspace`),
-2. per-inline source spans threaded through the inline tokenizer,
-3. UTF-16 offset conversion (unist offsets are JS string indices; ours are bytes).
+Started at 19.9%. Three foundations got it most of the way: indent-aware block
+column/offset (the parser tracks `next_nonspace`), per-inline source spans
+threaded through the inline tokenizer (`cspan` per slot), and UTF-16
+offset/column conversion (unist offsets are JS string indices, not bytes). The
+long tail was a sequence of small, exact source-mapping rules, each landed as an
+atomic commit with the gate measured after every step:
+
+- **emphasis/strong marker spans** — the open/close `Tag` spans consume exactly
+  `use_delims` markers off the current run bounds (fixed an underflow + nesting).
+- **block edges** — blockquote spans to its last `>` line; atx/setext span the
+  whole line; thematic-break/setext/fenced-close ends tracked.
+- **trailing whitespace** — the final text node drops trailing spaces (value
+  *and* position); a soft break's trailing spaces don't leak into the next text
+  node's start; indented-code keeps trailing spaces but drops empty lines
+  (`rtrim_code_end`); a definition extends over trailing spaces to its line end.
+- **HtmlBlock end** follows its `value` (type-1-at-EOF keeps the newline), mapped
+  through `content_to_src` for buffered (blockquote/list) blocks.
+- **tabs** — indented code after a container marker rounds its start past a
+  partially-consumed tab byte (a unist point can't sit inside a byte).
+- **list/item edges** — an empty item spans its whole marker line; an unclosed
+  fenced code drops its trailing newline unless it ends at EOF (fixes
+  blockquote-wrapped fences); a list absorbs a blockquote-marker blank line.
 
 ## What this answers
 
-"Do we need 652/652?" — **For Gate 1 (the product claim): yes, and we hit it.**
-Reference nodes + spread took it 83.0% → 99.5%; the final 3 razor-edge cases
-(#173/#574/#541) closed it to **100.0%**. Gate 1 = 100% is the honest,
-single-number way to claim "drop-in compatible with remark"; Gate 2 = 100%
-(position) remains the gold standard for position-precise tooling.
+"Do we need 652/652?" — **For both gates: yes, and we hit both.** Reference
+nodes + spread took Gate 1 from 83.0% → 99.5%; the final 3 razor-edge cases
+(#173/#574/#541) closed it to **100.0%**. Gate 2 then went 19.9% → **100.0%**
+through the source-mapping rules above. Gate 1 = 100% is the honest
+single-number "drop-in compatible with remark" claim; **Gate 2 = 100% is the
+gold standard — our trees are indistinguishable from remark's, positions and
+all**, exactly what source-mapping / position-precise plugins (remark-lint,
+etc.) need.
 
 Caveat on the corpus: the 652 are CommonMark *conformance* cases (edge-heavy).
 Before claiming 100% compatibility, widen the gate to remark's own fixtures + a
