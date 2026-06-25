@@ -74,24 +74,17 @@ function parseToMdastWire(md) {
     p += 4;
     return v;
   };
-  // String reader: ASCII fast path (most markdown text/urls/identifiers are
-  // ASCII) avoids TextDecoder's per-call overhead; fall back for UTF-8.
+  // String reader: the length's high bit (set by Rust) flags an ASCII string,
+  // so we take the fast `fromCharCode` path with no scan; fall back to
+  // TextDecoder for UTF-8 (and for long ASCII, to avoid apply's arg limit).
   const str = () => {
-    const n = u32();
+    const hdr = u32();
+    const n = hdr & 0x7fffffff;
     const end = p + n;
-    let ascii = true;
-    for (let i = p; i < end; i++) {
-      if (u8[i] & 0x80) {
-        ascii = false;
-        break;
-      }
-    }
-    let s;
-    if (ascii && n <= 512) {
-      s = String.fromCharCode.apply(null, u8.subarray(p, end));
-    } else {
-      s = dec.decode(u8.subarray(p, end));
-    }
+    const s =
+      hdr >>> 31 && n <= 512
+        ? String.fromCharCode.apply(null, u8.subarray(p, end))
+        : dec.decode(u8.subarray(p, end));
     p = end;
     return s;
   };

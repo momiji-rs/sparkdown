@@ -461,10 +461,13 @@ pub fn to_mdast_json(src: &str) -> String {
 ///   `u32 childCount` followed by that many child nodes. Strings: `u32 len` then
 ///   `len` UTF-8 bytes; an optional string uses `len == 0xFFFF_FFFF` for `None`.
 pub fn to_mdast_wire(src: &str) -> Vec<u8> {
-    let tree = to_mdast(src);
-    // The binary is denser than JSON; ~1.5× source is a safe initial reserve.
+    // Emit wire bytes *directly* during the parse walk — no intermediate owned
+    // `Mdast` tree (its construction was ~0.95 ms / the dominant boundary cost).
+    let tree = parse(src);
+    let mut scratch = Scratch::new();
+    let ctx = PosCtx::new(src);
     let mut out = Vec::<u8>::with_capacity(src.len() * 2 + 64);
-    write_wire(&tree, &mut out);
+    bwire(&tree, tree.root, &mut scratch, &ctx, &mut out);
     out
 }
 
@@ -473,7 +476,11 @@ fn w_u32(v: u32, out: &mut Vec<u8>) {
     out.extend_from_slice(&v.to_le_bytes());
 }
 fn w_str(s: &str, out: &mut Vec<u8>) {
-    w_u32(s.len() as u32, out);
+    // Encode the ASCII-ness in the length's high bit so the JS reader can pick
+    // the fast `String.fromCharCode` path without re-scanning the bytes itself
+    // (Rust's `is_ascii` is a cheap vectorized scan). Lengths are « 2^31.
+    let hdr = (s.len() as u32) | if s.is_ascii() { 0x8000_0000 } else { 0 };
+    w_u32(hdr, out);
     out.extend_from_slice(s.as_bytes());
 }
 fn w_opt(o: &Option<String>, out: &mut Vec<u8>) {
@@ -489,134 +496,359 @@ fn reftype_code(r: &str) -> u8 {
         _ => 2, // "full"
     }
 }
-fn w_children(c: &[Mdast], out: &mut Vec<u8>) {
-    w_u32(c.len() as u32, out);
-    for child in c {
-        write_wire(child, out);
+#[inline]
+fn w_u32_at(out: &mut [u8], off: usize, v: u32) {
+    out[off..off + 4].copy_from_slice(&v.to_le_bytes());
+}
+#[inline]
+fn reserve(out: &mut Vec<u8>, n: usize) -> usize {
+    let off = out.len();
+    out.resize(off + n, 0);
+    off
+}
+fn w_point(out: &mut Vec<u8>, pt: (u32, u32, u32)) {
+    w_u32(pt.0, out);
+    w_u32(pt.1, out);
+    w_u32(pt.2, out);
+}
+fn patch_point(out: &mut [u8], off: usize, pt: (u32, u32, u32)) {
+    w_u32_at(out, off, pt.0);
+    w_u32_at(out, off + 4, pt.1);
+    w_u32_at(out, off + 8, pt.2);
+}
+
+/// Emit one block node's wire bytes; return its source byte end (parents whose
+/// end depends on the last child use it). Mirrors [`block`] byte-for-byte; ends
+/// and child counts that depend on children are backpatched.
+fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut Vec<u8>) -> usize {
+    let node = &tree.nodes[idx];
+    let (s, e) = tree.src_span(idx);
+    let (sb, se) = (s as usize, e as usize);
+    match node.kind {
+        Kind::Document => {
+            let eb = ctx.src_len;
+            out.push(0);
+            w_point(out, ctx.point(0));
+            w_point(out, ctx.point(eb));
+            let coff = reserve(out, 4);
+            let n = bchildren(tree, idx, scratch, ctx, out).0;
+            w_u32_at(out, coff, n);
+            eb
+        }
+        Kind::Paragraph => {
+            let eb = ctx.rtrim_nl(se);
+            out.push(1);
+            w_point(out, ctx.point(sb));
+            w_point(out, ctx.point(eb));
+            let coff = reserve(out, 4);
+            let n = inline_wire(tree, idx, scratch, ctx, sb, eb, out);
+            w_u32_at(out, coff, n);
+            eb
+        }
+        Kind::Heading => {
+            let eb = ctx.rtrim_nl(se);
+            out.push(2);
+            w_point(out, ctx.point(sb));
+            w_point(out, ctx.point(eb));
+            out.push(node.level);
+            let coff = reserve(out, 4);
+            let n = inline_wire(tree, idx, scratch, ctx, sb, eb, out);
+            w_u32_at(out, coff, n);
+            eb
+        }
+        Kind::BlockQuote => {
+            out.push(3);
+            w_point(out, ctx.point(sb));
+            let eoff = reserve(out, 12);
+            let coff = reserve(out, 4);
+            let (n, last) = bchildren(tree, idx, scratch, ctx, out);
+            let end = last.map_or(se, |l| l.max(se));
+            patch_point(out, eoff, ctx.point(end));
+            w_u32_at(out, coff, n);
+            end
+        }
+        Kind::List => {
+            let ld = node.list.as_ref().unwrap();
+            out.push(4);
+            w_point(out, ctx.point(sb));
+            let eoff = reserve(out, 12);
+            out.push((ld.ordered as u8) | ((ld.spread as u8) << 1));
+            w_u32(if ld.ordered { ld.start as u32 } else { u32::MAX }, out);
+            let coff = reserve(out, 4);
+            let (n, last) = bchildren(tree, idx, scratch, ctx, out);
+            // Matches block(): a list can extend past its last item (it absorbs a
+            // trailing blockquote-marker blank line, tracked in `se`).
+            let end = last.map_or(se, |l| l.max(se));
+            patch_point(out, eoff, ctx.point(end));
+            w_u32_at(out, coff, n);
+            end
+        }
+        Kind::Item => {
+            out.push(5);
+            w_point(out, ctx.point(sb));
+            let eoff = reserve(out, 12);
+            out.push(node.item_spread as u8);
+            let coff = reserve(out, 4);
+            let (n, last) = bchildren(tree, idx, scratch, ctx, out);
+            let end = last.unwrap_or(se);
+            patch_point(out, eoff, ctx.point(end));
+            w_u32_at(out, coff, n);
+            end
+        }
+        Kind::ThematicBreak => {
+            let eb = ctx.rtrim_nl(se);
+            out.push(6);
+            w_point(out, ctx.point(sb));
+            w_point(out, ctx.point(eb));
+            eb
+        }
+        Kind::CodeBlock => {
+            let (lang, meta) = code_info(tree.info(idx));
+            let mut value = tree.content(idx).to_owned();
+            if value.ends_with('\n') {
+                value.pop();
+            }
+            let eb = if node.fenced { se } else { ctx.rtrim_code_end(sb, se) };
+            out.push(7);
+            w_point(out, ctx.point(sb));
+            w_point(out, ctx.point(eb));
+            w_opt(&lang, out);
+            w_opt(&meta, out);
+            w_str(&value, out);
+            eb
+        }
+        Kind::HtmlBlock => {
+            let eb = tree.html_ast_end(idx) as usize;
+            out.push(8);
+            w_point(out, ctx.point(sb));
+            w_point(out, ctx.point(eb));
+            w_str(tree.html_value(idx), out);
+            eb
+        }
+        Kind::Definition => {
+            let d = tree.definition(idx);
+            let eb = ctx.line_content_end(ctx.rtrim(sb, se));
+            out.push(17);
+            w_point(out, ctx.point(sb));
+            w_point(out, ctx.point(eb));
+            w_str(&d.identifier, out);
+            w_str(&d.label, out);
+            w_str(&d.url, out);
+            w_opt(&d.title, out);
+            eb
+        }
+        #[cfg(feature = "gfm")]
+        Kind::Table => {
+            let eb = ctx.rtrim(sb, se);
+            out.push(8);
+            w_point(out, ctx.point(sb));
+            w_point(out, ctx.point(eb));
+            w_str(tree.content(idx), out);
+            eb
+        }
     }
 }
 
-fn write_wire(node: &Mdast, out: &mut Vec<u8>) {
-    // Every node carries a wrapping position; unwrap it.
-    let (pos, inner) = match node {
-        Mdast::Positioned(p, inner) => (Some(p), inner.as_ref()),
-        other => (None, other),
+fn bchildren(
+    tree: &Tree,
+    idx: usize,
+    scratch: &mut Scratch,
+    ctx: &PosCtx,
+    out: &mut Vec<u8>,
+) -> (u32, Option<usize>) {
+    let mut n = 0u32;
+    let mut last = None;
+    let mut c = tree.first_child(idx);
+    while let Some(ci) = c {
+        last = Some(bwire(tree, ci, scratch, ctx, out));
+        n += 1;
+        c = tree.next_sibling(ci);
+    }
+    (n, last)
+}
+
+/// Emit a text block's inline children straight to wire; return the child count.
+/// Streaming form of [`build_inline`]: an open container backpatches its end
+/// position and child count at its close; adjacent text coalesces into one run.
+fn inline_wire(
+    tree: &Tree,
+    idx: usize,
+    scratch: &mut Scratch,
+    ctx: &PosCtx,
+    sb: usize,
+    eb: usize,
+    out: &mut Vec<u8>,
+) -> u32 {
+    let toks = render_inline_to_tokens(tree.content(idx), &tree.refmap, scratch, tree.opts);
+    let bpos = ctx.pos(sb, eb);
+    let map = |off: u32| tree.content_to_src(idx, off) as usize;
+    let mkpos = |s: u32, e: u32| -> Pos {
+        if s == u32::MAX {
+            bpos.clone()
+        } else {
+            let send = if e == 0 { map(0) } else { map(e - 1) + 1 };
+            ctx.pos(map(s), send)
+        }
     };
-    macro_rules! head {
-        ($tag:expr) => {{
-            out.push($tag);
-            match pos {
-                Some(p) => {
-                    w_u32(p.start.0, out);
-                    w_u32(p.start.1, out);
-                    w_u32(p.start.2, out);
-                    w_u32(p.end.0, out);
-                    w_u32(p.end.1, out);
-                    w_u32(p.end.2, out);
-                }
-                // Unreachable for our trees (all nodes are Positioned); keep the
-                // layout fixed-width so the reader can always read 6 words.
-                None => out.extend_from_slice(&[0u8; 24]),
+    // Open inline container: byte offsets to backpatch + opener span + child count.
+    struct Frame {
+        eoff: usize,
+        coff: usize,
+        os: u32,
+        oe: u32,
+        count: u32,
+    }
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut top = 0u32;
+    let mut pend: Option<(String, u32, u32)> = None;
+
+    macro_rules! bump {
+        () => {
+            match stack.last_mut() {
+                Some(f) => f.count += 1,
+                None => top += 1,
             }
-        }};
+        };
     }
-    match inner {
-        Mdast::Positioned(..) => unreachable!("nested Positioned"),
-        Mdast::Root(c) => {
-            head!(0);
-            w_children(c, out);
+    macro_rules! leaf_start {
+        ($s:expr) => {
+            if $s == u32::MAX { bpos.start } else { ctx.point(map($s)) }
+        };
+    }
+
+    for SpanTok { tok, start, end } in toks {
+        // Any non-text token first flushes the pending coalesced text run.
+        if !matches!(tok, InlineTok::Text(_))
+            && let Some((sx, ps, pe)) = pend.take()
+        {
+            let p = mkpos(ps, pe);
+            out.push(9);
+            w_point(out, p.start);
+            w_point(out, p.end);
+            w_str(&sx, out);
+            bump!();
         }
-        Mdast::Paragraph(c) => {
-            head!(1);
-            w_children(c, out);
-        }
-        Mdast::Heading { depth, children } => {
-            head!(2);
-            out.push(*depth);
-            w_children(children, out);
-        }
-        Mdast::Blockquote(c) => {
-            head!(3);
-            w_children(c, out);
-        }
-        Mdast::List { ordered, start, spread, children } => {
-            head!(4);
-            let flags = (*ordered as u8) | ((*spread as u8) << 1);
-            out.push(flags);
-            w_u32(start.map(|s| s as u32).unwrap_or(u32::MAX), out);
-            w_children(children, out);
-        }
-        Mdast::ListItem { spread, children } => {
-            head!(5);
-            out.push(*spread as u8);
-            w_children(children, out);
-        }
-        Mdast::ThematicBreak => head!(6),
-        Mdast::Code { lang, meta, value } => {
-            head!(7);
-            w_opt(lang, out);
-            w_opt(meta, out);
-            w_str(value, out);
-        }
-        Mdast::Html(v) => {
-            head!(8);
-            w_str(v, out);
-        }
-        Mdast::Text(v) => {
-            head!(9);
-            w_str(v, out);
-        }
-        Mdast::Emphasis(c) => {
-            head!(10);
-            w_children(c, out);
-        }
-        Mdast::Strong(c) => {
-            head!(11);
-            w_children(c, out);
-        }
-        Mdast::Delete(c) => {
-            head!(12);
-            w_children(c, out);
-        }
-        Mdast::InlineCode(v) => {
-            head!(13);
-            w_str(v, out);
-        }
-        Mdast::Break => head!(14),
-        Mdast::Link { url, title, children } => {
-            head!(15);
-            w_str(url, out);
-            w_opt(title, out);
-            w_children(children, out);
-        }
-        Mdast::Image { url, title, alt } => {
-            head!(16);
-            w_str(url, out);
-            w_opt(title, out);
-            w_str(alt, out);
-        }
-        Mdast::Definition { identifier, label, url, title } => {
-            head!(17);
-            w_str(identifier, out);
-            w_str(label, out);
-            w_str(url, out);
-            w_opt(title, out);
-        }
-        Mdast::LinkReference { identifier, label, reftype, children } => {
-            head!(18);
-            w_str(identifier, out);
-            w_str(label, out);
-            out.push(reftype_code(reftype));
-            w_children(children, out);
-        }
-        Mdast::ImageReference { identifier, label, reftype, alt } => {
-            head!(19);
-            w_str(identifier, out);
-            w_str(label, out);
-            out.push(reftype_code(reftype));
-            w_str(alt, out);
+        match tok {
+            InlineTok::Text(s) => match &mut pend {
+                Some((buf, _, pe)) => {
+                    buf.push_str(&s);
+                    *pe = end;
+                }
+                None => pend = Some((s, start, end)),
+            },
+            InlineTok::Code(v) => {
+                let p = mkpos(start, end);
+                out.push(13);
+                w_point(out, p.start);
+                w_point(out, p.end);
+                w_str(&v, out);
+                bump!();
+            }
+            InlineTok::Html(h) => {
+                let p = mkpos(start, end);
+                out.push(8);
+                w_point(out, p.start);
+                w_point(out, p.end);
+                w_str(&h, out);
+                bump!();
+            }
+            InlineTok::Break => {
+                let p = mkpos(start, end);
+                out.push(14);
+                w_point(out, p.start);
+                w_point(out, p.end);
+                bump!();
+            }
+            InlineTok::Image { url, title, alt } => {
+                let p = mkpos(start, end);
+                out.push(16);
+                w_point(out, p.start);
+                w_point(out, p.end);
+                w_str(&url, out);
+                w_opt(&title, out);
+                w_str(&alt, out);
+                bump!();
+            }
+            InlineTok::ImageRef { identifier, label, reftype, alt } => {
+                let p = mkpos(start, end);
+                out.push(19);
+                w_point(out, p.start);
+                w_point(out, p.end);
+                w_str(&identifier, out);
+                w_str(&label, out);
+                out.push(reftype_code(reftype));
+                w_str(&alt, out);
+                bump!();
+            }
+            InlineTok::Autolink { url, text } => {
+                let p = mkpos(start, end);
+                out.push(15);
+                w_point(out, p.start);
+                w_point(out, p.end);
+                w_str(&url, out);
+                w_u32(u32::MAX, out); // title: None
+                w_u32(1, out); // one text child
+                let cp = mkpos(start.saturating_add(1), end.saturating_sub(1));
+                out.push(9);
+                w_point(out, cp.start);
+                w_point(out, cp.end);
+                w_str(&text, out);
+                bump!();
+            }
+            InlineTok::Open(kind) => {
+                bump!();
+                let tag = match kind {
+                    "strong" => 11,
+                    "delete" => 12,
+                    _ => 10,
+                };
+                out.push(tag);
+                w_point(out, leaf_start!(start));
+                let eoff = reserve(out, 12);
+                let coff = reserve(out, 4);
+                stack.push(Frame { eoff, coff, os: start, oe: end, count: 0 });
+            }
+            InlineTok::LinkOpen { url, title } => {
+                bump!();
+                out.push(15);
+                w_point(out, leaf_start!(start));
+                let eoff = reserve(out, 12);
+                w_str(&url, out);
+                w_opt(&title, out);
+                let coff = reserve(out, 4);
+                stack.push(Frame { eoff, coff, os: start, oe: end, count: 0 });
+            }
+            InlineTok::LinkRefOpen { identifier, label, reftype } => {
+                bump!();
+                out.push(18);
+                w_point(out, leaf_start!(start));
+                let eoff = reserve(out, 12);
+                w_str(&identifier, out);
+                w_str(&label, out);
+                out.push(reftype_code(reftype));
+                let coff = reserve(out, 4);
+                stack.push(Frame { eoff, coff, os: start, oe: end, count: 0 });
+            }
+            InlineTok::Close(_) | InlineTok::LinkClose => {
+                if let Some(f) = stack.pop() {
+                    let cend = if end > f.oe { end } else { f.oe };
+                    let p = mkpos(f.os, cend);
+                    patch_point(out, f.eoff, p.end);
+                    w_u32_at(out, f.coff, f.count);
+                }
+            }
         }
     }
+    // Flush any trailing text run at the top level.
+    if let Some((sx, ps, pe)) = pend.take() {
+        let p = mkpos(ps, pe);
+        out.push(9);
+        w_point(out, p.start);
+        w_point(out, p.end);
+        w_str(&sx, out);
+        bump!();
+    }
+    top
 }
 
 /// Append a JSON string literal (RFC 8259 escaping).
