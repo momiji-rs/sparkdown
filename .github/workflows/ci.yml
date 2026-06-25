@@ -72,3 +72,25 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --verbose
+
+  wasm:
+    name: wasm + npm (652/652 via wasm)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install binaryen (wasm-opt)
+        run: sudo apt-get update && sudo apt-get install -y binaryen
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+      - name: Build wasm (+simd128, +bulk-memory)
+        run: RUSTFLAGS="-D warnings -C target-feature=+simd128,+bulk-memory" cargo build --target wasm32-unknown-unknown --release --features wasm
+      - name: Inline wasm + CommonMark conformance gate (652/652 through the wasm)
+        run: |
+          npm run build
+          npm test
+        working-directory: npm

@@ -14,6 +14,10 @@
   },
   "files": ["sparkdown.mjs", "wasm-inline.mjs", "index.d.ts", "README.md"],
   "sideEffects": false,
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node test.mjs"
+  },
   "keywords": [
     "markdown",
     "commonmark",

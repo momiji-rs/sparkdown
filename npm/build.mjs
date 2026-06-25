@@ -24,7 +24,7 @@ try {
     { stdio: "pipe" },
   );
   wasmPath = opt;
-  console.log("wasm-opt -Oz applied");
+  console.log("wasm-opt -O3 (simd + bulk-memory) applied");
 } catch {
   console.log("wasm-opt (binaryen) not found — inlining the raw wasm");
 }
