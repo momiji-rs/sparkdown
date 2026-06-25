@@ -581,7 +581,9 @@ struct List {
 impl List {
     fn new() -> Self {
         List {
-            slots: Vec::new(),
+            // Pre-sized to a typical paragraph's inline-node count so the early
+            // growth reallocs (and their copies) don't happen per render.
+            slots: Vec::with_capacity(64),
             head: None,
             tail: None,
         }
@@ -748,9 +750,9 @@ impl Scratch {
     pub fn new() -> Self {
         Scratch {
             list: List::new(),
-            stack: Vec::new(),
-            cur: String::new(),
-            norm: String::new(),
+            stack: Vec::with_capacity(16),
+            cur: String::with_capacity(1024),
+            norm: String::with_capacity(48),
         }
     }
     fn reset(&mut self) {
