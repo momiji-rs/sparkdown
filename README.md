@@ -100,18 +100,6 @@ rather than forked.
 > `momiji-core` crate that both rostdown and sparkdown depend on, so a faster
 > NEON/SWAR scan improves both at once.
 
-## Build-out order
-
-1. ~~ATX + setext headings, thematic breaks, indented + fenced code blocks.~~ ✅
-2. ~~Inline pass: escapes, breaks, entities, code spans, emphasis, autolinks.~~ ✅
-3. ~~Links & images (inline + reference) — the other half of the inline pass.~~ ✅
-4. ~~Block quotes and list items (the container-block state machine).~~ ✅
-5. ~~HTML blocks (and raw inline HTML), link reference definitions.~~ ✅
-
-**100% conformance reached.** Ongoing work is performance — keeping it fast and
-lean (trimming allocations now; eventually sharing rostdown's `core`: arena +
-SWAR scan).
-
 ## License
 
 MIT. The vendored CommonMark spec suite under `tests/fixtures/spec.json` is
