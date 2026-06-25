@@ -6,7 +6,7 @@
 
 use crate::block::{Kind, Tree};
 use crate::inline::{Scratch, render_inline};
-use crate::scan::find_escape;
+use crate::scan::escape_block_mask;
 
 /// Render a parsed [`Tree`] to an HTML string.
 pub fn render(tree: &Tree) -> String {
@@ -140,22 +140,43 @@ fn in_tight_list(tree: &Tree, para: usize) -> bool {
 
 /// Append `s` to `out`, escaping the HTML-text specials `&`, `<`, `>`, `"`
 /// (cmark escapes the double quote in text and code as well as attributes).
+fn escape_entity(b: u8) -> &'static str {
+    match b {
+        b'&' => "&amp;",
+        b'<' => "&lt;",
+        b'>' => "&gt;",
+        b'"' => "&quot;",
+        _ => unreachable!("only &, <, >, \" are escaped"),
+    }
+}
+
 pub fn escape_html(s: &str, out: &mut String) {
     let bytes = s.as_bytes();
+    // Pending clean run [clean, i): emitted lazily (one push_str) when a special
+    // is hit or at the end, so consecutive clean blocks coalesce into one copy.
+    let mut clean = 0;
     let mut i = 0;
-    while let Some(rel) = find_escape(&bytes[i..]) {
-        let hit = i + rel;
-        out.push_str(&s[i..hit]);
-        out.push_str(match bytes[hit] {
-            b'&' => "&amp;",
-            b'<' => "&lt;",
-            b'>' => "&gt;",
-            b'"' => "&quot;",
-            _ => unreachable!("find_escape only reports &, <, >, \""),
-        });
-        i = hit + 1;
+    // Fused SIMD: one compare per 16 bytes yields every special in the block.
+    while i + 16 <= bytes.len() {
+        let mut mask = escape_block_mask(bytes, i);
+        while mask != 0 {
+            let hit = i + mask.trailing_zeros() as usize;
+            out.push_str(&s[clean..hit]);
+            out.push_str(escape_entity(bytes[hit]));
+            clean = hit + 1;
+            mask &= mask - 1; // clear the lowest set bit
+        }
+        i += 16;
     }
-    out.push_str(&s[i..]);
+    while i < bytes.len() {
+        if matches!(bytes[i], b'&' | b'<' | b'>' | b'"') {
+            out.push_str(&s[clean..i]);
+            out.push_str(escape_entity(bytes[i]));
+            clean = i + 1;
+        }
+        i += 1;
+    }
+    out.push_str(&s[clean..]);
 }
 
 #[cfg(test)]

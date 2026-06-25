@@ -190,6 +190,73 @@ unsafe fn find_escape_sse2(hay: &[u8]) -> Option<usize> {
     None
 }
 
+/// A 16-bit mask of which of the 16 bytes at `bytes[i..]` are HTML-text
+/// specials (`&` `<` `>` `"`) — bit `b` set ⇒ `bytes[i + b]` must be escaped.
+/// The caller guarantees `i + 16 <= bytes.len()`. Used by the fused escape
+/// loop to emit every special in a block from one SIMD compare.
+#[inline]
+pub(crate) fn escape_block_mask(bytes: &[u8], i: usize) -> u16 {
+    debug_assert!(i + 16 <= bytes.len());
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { escape_block_mask_neon(bytes.as_ptr().add(i)) }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe { escape_block_mask_sse2(bytes.as_ptr().add(i)) }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        let mut m = 0u16;
+        for b in 0..16 {
+            if matches!(bytes[i + b], b'&' | b'<' | b'>' | b'"') {
+                m |= 1 << b;
+            }
+        }
+        m
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn escape_block_mask_neon(p: *const u8) -> u16 {
+    use core::arch::aarch64::*;
+    unsafe {
+        let v = vld1q_u8(p);
+        let m = vorrq_u8(
+            vorrq_u8(vceqq_u8(v, vdupq_n_u8(b'&')), vceqq_u8(v, vdupq_n_u8(b'<'))),
+            vorrq_u8(vceqq_u8(v, vdupq_n_u8(b'>')), vceqq_u8(v, vdupq_n_u8(b'"'))),
+        );
+        // movemask: weight each matched lane, horizontal-add the two halves.
+        let weights: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+        let bits = vandq_u8(m, vld1q_u8(weights.as_ptr()));
+        let lo = vaddv_u8(vget_low_u8(bits)) as u16;
+        let hi = vaddv_u8(vget_high_u8(bits)) as u16;
+        lo | (hi << 8)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[allow(clippy::cast_ptr_alignment)]
+unsafe fn escape_block_mask_sse2(p: *const u8) -> u16 {
+    use core::arch::x86_64::*;
+    unsafe {
+        let v = _mm_loadu_si128(p as *const __m128i);
+        let m = _mm_or_si128(
+            _mm_or_si128(
+                _mm_cmpeq_epi8(v, _mm_set1_epi8(b'&' as i8)),
+                _mm_cmpeq_epi8(v, _mm_set1_epi8(b'<' as i8)),
+            ),
+            _mm_or_si128(
+                _mm_cmpeq_epi8(v, _mm_set1_epi8(b'>' as i8)),
+                _mm_cmpeq_epi8(v, _mm_set1_epi8(b'"' as i8)),
+            ),
+        );
+        _mm_movemask_epi8(m) as u16
+    }
+}
+
 // ---- SIMD byte-set membership (the simdjson nibble-lookup technique) -------
 //
 // For a set whose members all have a high nibble ≤ 7, a byte `b` is in the set
