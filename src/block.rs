@@ -639,12 +639,14 @@ impl<'a> Parser<'a> {
             self.find_next_nonspace();
             // Fast skip: a non-indented line whose first non-space char can't
             // begin any block is plain paragraph text — bypass all matchers.
-            let fast_skip = !self.indented && !maybe_special(peek(self.line, self.next_nonspace));
+            let first = peek(self.line, self.next_nonspace);
+            let fast_skip = !self.indented && !maybe_special(first);
             // A GFM table delimiter row can start with `|`/`:` (not in
-            // `maybe_special`); with tables on, route every line through the
-            // matchers so `start_table` sees it. Compiled out when `gfm` is off.
+            // `maybe_special`); only such lines need to reach `start_table`, so
+            // the fast skip stays on for everything else. Compiled out off `gfm`.
             #[cfg(feature = "gfm")]
-            let fast_skip = fast_skip && !self.opts.tables;
+            let fast_skip =
+                fast_skip && !(self.opts.tables && matches!(first, Some(b'|') | Some(b':')));
             if fast_skip {
                 self.advance_next_nonspace();
                 break;

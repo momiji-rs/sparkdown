@@ -129,6 +129,11 @@ impl Renderer {
         }
     }
 
+    /// Replace the options applied to subsequent renders (buffers are kept).
+    pub fn set_options(&mut self, opts: Options) {
+        self.opts = opts;
+    }
+
     /// Render CommonMark `src` to HTML, reusing the held buffers. The returned
     /// string borrows the context until the next call.
     pub fn render(&mut self, src: &str) -> &str {
