@@ -2387,16 +2387,21 @@ fn process_emphasis(list: &mut List, stack: &mut Vec<StackItem>, start: usize) {
                 let ctag = list.splice_before(cnode, Node::Tag(close_tag));
                 #[cfg(not(feature = "ast"))]
                 let _ = (otag, ctag);
-                // SPIKE (`ast`): emphasis markers are 1 byte each. The opener
-                // consumes its rightmost `use_delims`; the closer its leftmost.
+                // SPIKE (`ast`): markers are 1 byte each. The opener consumes its
+                // rightmost `use_delims` chars, the closer its leftmost; each tag
+                // gets the consumed chars, and the run's remaining span shrinks
+                // accordingly (so an unconsumed remainder, rendered as literal
+                // text, is positioned correctly). Operate on the *current* run
+                // bounds so repeated matches on the same run stay consistent.
                 #[cfg(feature = "ast")]
                 {
-                    let ostart = list.slots[onode].cspan.0 as usize;
-                    let o_end = ostart + ocount;
-                    list.slots[otag].cspan = ((o_end - use_delims) as u32, o_end as u32);
-                    let cstart = list.slots[cnode].cspan.0 as usize;
-                    let c_start = cstart + (corig - ccount);
-                    list.slots[ctag].cspan = (c_start as u32, (c_start + use_delims) as u32);
+                    let ud = use_delims as u32;
+                    let o_end = list.slots[onode].cspan.1;
+                    list.slots[otag].cspan = (o_end - ud, o_end);
+                    list.slots[onode].cspan.1 = o_end - ud;
+                    let c_start = list.slots[cnode].cspan.0;
+                    list.slots[ctag].cspan = (c_start, c_start + ud);
+                    list.slots[cnode].cspan.0 = c_start + ud;
                 }
                 set_count(list, onode, ocount - use_delims);
                 set_count(list, cnode, ccount - use_delims);

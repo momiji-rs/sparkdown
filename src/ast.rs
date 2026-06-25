@@ -91,6 +91,7 @@ impl PosCtx {
 
     /// A `(line, column, offset)` point at a byte offset — column/offset in UTF-16.
     fn point(&self, off: usize) -> (u32, u32, u32) {
+        let off = off.min(self.src_len);
         let line = self.line_off.partition_point(|&s| s <= off).max(1);
         let off16 = self.u16[off];
         let col = off16 - self.u16[self.line_off[line - 1]] + 1;
