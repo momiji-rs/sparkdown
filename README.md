@@ -1,6 +1,7 @@
 # sparkdown
 
 [![CI](https://github.com/momiji-rs/sparkdown/actions/workflows/ci.yml/badge.svg)](https://github.com/momiji-rs/sparkdown/actions/workflows/ci.yml)
+[![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://app.codspeed.io/momiji-rs/sparkdown?utm_source=badge)
 [![crates.io](https://img.shields.io/crates/v/sparkdown.svg)](https://crates.io/crates/sparkdown)
 [![npm](https://img.shields.io/npm/v/@momiji-rs/sparkdown.svg)](https://www.npmjs.com/package/@momiji-rs/sparkdown)
 [![docs.rs](https://img.shields.io/docsrs/sparkdown)](https://docs.rs/sparkdown)
