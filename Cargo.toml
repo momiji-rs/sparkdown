@@ -1,7 +1,7 @@
 [package]
 name = "sparkdown"
 description = "Fast, zero-dependency CommonMark 0.31.2 parser — 100% conformant and byte-identical to cmark, with opt-in GFM extensions (the `gfm` feature)."
-version = "0.0.2"
+version = "0.0.3"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
