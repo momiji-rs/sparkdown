@@ -110,6 +110,16 @@ impl PosCtx {
         end
     }
 
+    /// Advance past trailing spaces/tabs to the end of the line (the newline or
+    /// EOF). A definition's tracked end sits right after its title; mdast extends
+    /// it to the line end, keeping the trailing spaces.
+    fn line_content_end(&self, mut end: usize) -> usize {
+        while end < self.src_len && matches!(self.src[end], b' ' | b'\t') {
+            end += 1;
+        }
+        end
+    }
+
     /// Indented-code `position.end`: mdast keeps trailing spaces on the last
     /// content line and even a trailing *spaces-only* line, but drops trailing
     /// *zero-width* (empty) lines and the final newline. Drop newlines and the
@@ -218,7 +228,10 @@ fn block(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> (Mdast
                     title: d.title.clone(),
                 },
                 sb,
-                ctx.rtrim(sb, se),
+                // Back up to the last significant char (the span may run past the
+                // line for buffered defs), then forward over trailing spaces to
+                // the line end — mdast keeps a definition's trailing spaces.
+                ctx.line_content_end(ctx.rtrim(sb, se)),
             )
         }
         Kind::List => {
