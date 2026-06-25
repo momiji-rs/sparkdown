@@ -72,6 +72,21 @@ pub unsafe extern "C" fn sparkdown_to_html(ptr: *const u8, len: usize) -> *mut u
     RENDERER.with(|cell| box_html(cell.borrow_mut().render(&md).as_bytes()))
 }
 
+/// SPIKE (`ast` feature): parse `len` UTF-8 bytes at `ptr` and return the mdast
+/// as JSON, in the same `[u32 little-endian length][bytes]` framing as
+/// [`sparkdown_to_html`]. This is the payload the wasm→JS boundary spike moves
+/// across; the host does `JSON.parse` on the bytes to get a remark-shaped tree.
+///
+/// # Safety
+/// `ptr` must point to `len` readable, initialized bytes.
+#[cfg(feature = "ast")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sparkdown_to_mdast_json(ptr: *const u8, len: usize) -> *mut u8 {
+    let input = unsafe { core::slice::from_raw_parts(ptr, len) };
+    let md = String::from_utf8_lossy(input);
+    box_html(crate::ast::to_mdast_json(&md).as_bytes())
+}
+
 /// Like [`sparkdown_to_html`] but applies extension options from a bitmask: bit
 /// 0 strikethrough, 1 task lists, 2 autolinks, 3 tag filter, 4 tables, 5 hard
 /// wraps, 6 diagram. A bit only takes effect if the matching Cargo feature was

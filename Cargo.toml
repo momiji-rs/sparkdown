@@ -37,6 +37,11 @@ diagram = []
 arena = []
 # Exposes profile_phases() for benchmarks (parse-vs-render split). Diagnostic.
 profiling = []
+# SPIKE: materialize an owned, programmable MDAST (blocks + real inline nodes)
+# and render from it, to measure the cost of an AST/plugin layer vs the direct
+# source->HTML fast path. Off by default; nothing here compiles into the default
+# build. See src/ast.rs and benches/ast_tax.rs.
+ast = []
 # WASI-free WebAssembly interface: raw C-ABI exports (src/wasm.rs) for
 # `wasm32-unknown-unknown`. Zero dependencies — drives from any wasm host.
 wasm = []
@@ -51,6 +56,19 @@ criterion = { version = "5.0.0", package = "codspeed-criterion-compat" }
 [[bench]]
 name = "vs_pulldown"
 harness = false
+
+# SPIKE: AST-path tax (build + render an owned MDAST vs the direct fast path).
+# Run: `cargo bench --features ast --bench ast_tax`.
+[[bench]]
+name = "ast_tax"
+harness = false
+required-features = ["ast"]
+
+# SPIKE: emits the mdast JSON corpus consumed by the Node compat harness.
+# Run: `cargo run --features ast --example mdast_json`.
+[[example]]
+name = "mdast_json"
+required-features = ["ast"]
 
 [profile.release]
 opt-level = 3

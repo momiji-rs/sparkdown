@@ -34,6 +34,9 @@
 
 #[cfg(feature = "arena")]
 mod arena;
+/// SPIKE: owned programmable MDAST + renderer (see [`ast`]). `ast` feature only.
+#[cfg(feature = "ast")]
+pub mod ast;
 mod block;
 mod bump;
 mod entities;

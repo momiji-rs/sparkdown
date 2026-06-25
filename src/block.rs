@@ -26,10 +26,26 @@ pub enum Kind {
     ThematicBreak,
     CodeBlock,
     HtmlBlock,
+    /// SPIKE (`ast` feature): a link reference definition `[label]: url "title"`.
+    /// Renders to nothing (HTML output unchanged); carries an index into
+    /// [`Tree::defs`] via [`Node::def`] for the mdast `definition` node.
+    #[cfg(feature = "ast")]
+    Definition,
     /// GFM pipe table (opt-in). Content holds the raw rows (header, delimiter,
     /// then data rows), each `\n`-terminated; cells are parsed at render time.
     #[cfg(feature = "gfm")]
     Table,
+}
+
+/// SPIKE (`ast` feature): payload for a `definition` mdast node — all fields
+/// already decoded/normalized to match `mdast-util-from-markdown`.
+#[cfg(feature = "ast")]
+#[derive(Clone)]
+pub struct DefData {
+    pub label: String,
+    pub identifier: String,
+    pub url: String,
+    pub title: Option<String>,
 }
 
 #[derive(Clone)]
@@ -41,6 +57,11 @@ pub struct ListData {
     pub padding: usize,
     pub marker_offset: usize,
     pub tight: bool,
+    /// SPIKE (`ast` feature): mdast `list.spread` — a blank line occurs *between
+    /// items* (distinct from CommonMark's combined `tight`, which also folds in
+    /// blanks *within* an item; see [`Node::item_spread`]).
+    #[cfg(feature = "ast")]
+    pub spread: bool,
 }
 
 pub struct Node {
@@ -72,6 +93,31 @@ pub struct Node {
     info_end: u32,
     html_kind: u8,
     pub list: Option<ListData>,
+    /// SPIKE (`ast` feature): index into [`Tree::defs`] for `Kind::Definition`
+    /// nodes (meaningless otherwise).
+    #[cfg(feature = "ast")]
+    pub def: u32,
+    /// SPIKE (`ast` feature): mdast `listItem.spread` for `Kind::Item` nodes — a
+    /// blank line occurs between this item's own block children.
+    #[cfg(feature = "ast")]
+    pub item_spread: bool,
+    /// SPIKE (`ast` feature): end offset of an `Kind::HtmlBlock`'s mdast `value`
+    /// (which differs from the HTML-render `cend`: mdast keeps the trailing
+    /// newline for a type-1 block ended by EOF, and drops exactly one otherwise).
+    #[cfg(feature = "ast")]
+    html_ast_cend: u32,
+    /// SPIKE (`ast` feature): set when a `Kind::HtmlBlock` closed via its explicit
+    /// end condition (types 1–5) rather than EOF / a blank line.
+    #[cfg(feature = "ast")]
+    html_closed_by_cond: bool,
+    /// SPIKE (`ast` feature): the node's raw source span `[start, end)`, tracked
+    /// even after the content is materialized/de-indented into `buf`. Used to
+    /// recover reference-definition labels with their original indentation
+    /// (mdast keeps it; the de-indented buffer does not). `u32::MAX` start = unset.
+    #[cfg(feature = "ast")]
+    src_start: u32,
+    #[cfg(feature = "ast")]
+    src_end: u32,
 }
 
 impl Node {
@@ -97,6 +143,18 @@ impl Node {
             info_end: 0,
             html_kind: 0,
             list: None,
+            #[cfg(feature = "ast")]
+            def: 0,
+            #[cfg(feature = "ast")]
+            item_spread: false,
+            #[cfg(feature = "ast")]
+            html_ast_cend: 0,
+            #[cfg(feature = "ast")]
+            html_closed_by_cond: false,
+            #[cfg(feature = "ast")]
+            src_start: u32::MAX,
+            #[cfg(feature = "ast")]
+            src_end: 0,
         }
     }
 }
@@ -111,6 +169,10 @@ pub struct Tree<'a> {
     source: &'a str,
     /// Buffer for assembled text (block quotes, lists, code/HTML literals).
     buf: String,
+    /// SPIKE (`ast` feature): payloads for `Kind::Definition` nodes; indexed by
+    /// [`Node::def`].
+    #[cfg(feature = "ast")]
+    pub defs: Vec<DefData>,
 }
 
 impl Tree<'_> {
@@ -151,6 +213,28 @@ impl Tree<'_> {
             &self.buf
         };
         &store[n.info_start as usize..n.info_end as usize]
+    }
+
+    /// SPIKE: the 1-based source line on which node `idx` opened (0 for the
+    /// document root). Used to attach unist `position` to block nodes.
+    pub fn start_line(&self, idx: usize) -> u32 {
+        self.nodes[idx].start_line
+    }
+
+    /// SPIKE (`ast` feature): the `definition` payload of a `Kind::Definition`
+    /// node.
+    #[cfg(feature = "ast")]
+    pub fn definition(&self, idx: usize) -> &DefData {
+        &self.defs[self.nodes[idx].def as usize]
+    }
+
+    /// SPIKE (`ast` feature): the mdast `value` of a `Kind::HtmlBlock` (keeps the
+    /// trailing newline per mdast's rule, unlike the HTML-render [`content`]).
+    #[cfg(feature = "ast")]
+    pub fn html_value(&self, idx: usize) -> &str {
+        let n = &self.nodes[idx];
+        let store = if n.content_src { self.source } else { &self.buf };
+        &store[n.cstart as usize..n.html_ast_cend as usize]
     }
 }
 
@@ -210,6 +294,10 @@ struct Parser<'a> {
     blank: bool,
     partially_consumed_tab: bool,
     opts: Options,
+    /// SPIKE (`ast` feature): payloads for `Kind::Definition` nodes, in creation
+    /// order; a node's [`Node::def`] indexes here.
+    #[cfg(feature = "ast")]
+    defs: Vec<DefData>,
 }
 
 impl<'a> Parser<'a> {
@@ -241,6 +329,8 @@ impl<'a> Parser<'a> {
             blank: false,
             partially_consumed_tab: false,
             opts,
+            #[cfg(feature = "ast")]
+            defs: Vec::new(),
         }
     }
 
@@ -338,8 +428,88 @@ impl<'a> Parser<'a> {
         idx
     }
 
+    /// SPIKE (`ast` feature): create a new leaf node and splice it into the child
+    /// list immediately *before* `sibling` (same parent), preserving source
+    /// order. Used to emit `Kind::Definition` nodes ahead of the paragraph they
+    /// were stripped from. Does not touch `tip`.
+    #[cfg(feature = "ast")]
+    fn insert_before(&mut self, sibling: usize, kind: Kind) -> usize {
+        let parent = self.nodes[sibling].parent;
+        let idx = self.nodes.len();
+        self.nodes.push(Node::new(kind, parent, self.line_number));
+        let sib32 = sibling as u32;
+        if self.nodes[parent].first_child == sib32 {
+            self.nodes[parent].first_child = idx as u32;
+        } else {
+            let mut prev = self.nodes[parent].first_child;
+            while self.nodes[prev as usize].next_sibling != sib32 {
+                prev = self.nodes[prev as usize].next_sibling;
+            }
+            self.nodes[prev as usize].next_sibling = idx as u32;
+        }
+        self.nodes[idx].next_sibling = sib32;
+        idx
+    }
+
+    /// SPIKE (`ast` feature): register the leading reference definitions of a
+    /// paragraph/heading — insert each into the [`RefMap`] (first wins) and, as a
+    /// side effect, emit a `Kind::Definition` node before `before` for each.
+    /// SPIKE (`ast` feature): replace each def's label (de-indented by the buffer)
+    /// with its raw source form, so mdast's `label` keeps the original
+    /// continuation-line indentation. Only safe for **top-level** paragraphs,
+    /// whose source span is contiguous (no stripped container prefixes); nested
+    /// defs keep the buffer label (correct `identifier`, rare label-whitespace
+    /// divergence). No-op unless the source re-parse yields the same def count.
+    #[cfg(feature = "ast")]
+    fn recover_raw_labels(&self, node: usize, defs: &mut [(String, String, Option<String>)]) {
+        if self.nodes[node].parent != 0 {
+            return;
+        }
+        let (ss, se) = (self.nodes[node].src_start, self.nodes[node].src_end);
+        if ss == u32::MAX || ss >= se || (se as usize) > self.source.len() {
+            return;
+        }
+        let src_defs = take_ref_defs(&self.source[ss as usize..se as usize]).1;
+        if src_defs.len() == defs.len() {
+            for (d, sd) in defs.iter_mut().zip(src_defs) {
+                d.0 = sd.0;
+            }
+        }
+    }
+
+    #[cfg(feature = "ast")]
+    fn emit_defs(&mut self, before: usize, defs: Vec<(String, String, Option<String>)>) {
+        for (label, dest, title) in defs {
+            let identifier = crate::inline::normalize_label(&label).into_owned();
+            let di = self.defs.len() as u32;
+            self.defs.push(DefData {
+                label: crate::inline::unescape_string(&label).into_owned(),
+                identifier: identifier.clone(),
+                url: crate::inline::unescape_string(&dest).into_owned(),
+                title: title
+                    .as_deref()
+                    .map(|t| crate::inline::unescape_string(t).into_owned()),
+            });
+            let dn = self.insert_before(before, Kind::Definition);
+            self.nodes[dn].def = di;
+            self.refmap.entry(identifier).or_insert((dest, title));
+        }
+    }
+
     fn add_line(&mut self) {
         let tip = self.tip;
+        // SPIKE (`ast`): remember the raw source span (survives materialization),
+        // for recovering ref-def labels with their original indentation.
+        #[cfg(feature = "ast")]
+        {
+            let line_end = self.line_src_start + self.line.len();
+            let nl = (line_end < self.source.len()
+                && self.source.as_bytes()[line_end] == b'\n') as usize;
+            if self.nodes[tip].src_start == u32::MAX {
+                self.nodes[tip].src_start = (self.line_src_start + self.offset) as u32;
+            }
+            self.nodes[tip].src_end = (line_end + nl) as u32;
+        }
         // Try to (keep) borrowing a contiguous slice of the source. Borrowed
         // ranges include each line's trailing newline (so code/HTML literals,
         // which need it, work); the contiguous next line begins exactly at the
@@ -434,8 +604,17 @@ impl<'a> Parser<'a> {
                     let empty = body.trim_matches(['\n', ' ', '\t']).is_empty();
                     (lead, off, defs, empty, hl, inner.len())
                 };
+                #[cfg(feature = "ast")]
+                {
+                    let mut defs = defs;
+                    self.recover_raw_labels(idx, &mut defs);
+                    self.emit_defs(idx, defs);
+                }
+                #[cfg(not(feature = "ast"))]
                 for (label, dest, title) in defs {
-                    self.refmap.entry(label).or_insert((dest, title));
+                    self.refmap
+                        .entry(crate::inline::normalize_label(&label).into_owned())
+                        .or_insert((dest, title));
                 }
                 let bs = s + lead + off;
                 if empty {
@@ -487,6 +666,30 @@ impl<'a> Parser<'a> {
                     let store: &str = if csrc { self.source } else { &self.buf };
                     html_trim_end(&store[s..e])
                 };
+                // mdast `value` differs from the trimmed HTML-render content: a
+                // type-1 block (`<script>`/`<style>`/`<pre>`) ended by EOF keeps
+                // its raw span verbatim; every other block drops exactly the
+                // final line ending.
+                #[cfg(feature = "ast")]
+                {
+                    let store: &str = if csrc { self.source } else { &self.buf };
+                    let bytes = store.as_bytes();
+                    let ast_end = if self.nodes[idx].html_kind == 1
+                        && !self.nodes[idx].html_closed_by_cond
+                    {
+                        e
+                    } else {
+                        let mut x = e;
+                        if x > s && bytes[x - 1] == b'\n' {
+                            x -= 1;
+                            if x > s && bytes[x - 1] == b'\r' {
+                                x -= 1;
+                            }
+                        }
+                        x
+                    };
+                    self.nodes[idx].html_ast_cend = ast_end as u32;
+                }
                 self.nodes[idx].cend = (s + keep) as u32;
             }
             Kind::List => {
@@ -494,6 +697,8 @@ impl<'a> Parser<'a> {
                 if let Some(ld) = &mut self.nodes[idx].list {
                     ld.tight = tight;
                 }
+                #[cfg(feature = "ast")]
+                self.compute_spread(idx);
             }
             _ => {}
         }
@@ -545,6 +750,40 @@ impl<'a> Parser<'a> {
         true
     }
 
+    /// SPIKE (`ast` feature): split CommonMark's combined looseness into mdast's
+    /// two spread bits — `list.spread` (blank *between* items) on the list, and
+    /// `listItem.spread` (blank *between an item's own block children*) on each
+    /// item. The disjunction `list.spread || any(item.spread)` equals
+    /// `!compute_tight`, so HTML rendering (which uses `tight`) is unaffected.
+    #[cfg(feature = "ast")]
+    fn compute_spread(&mut self, list: usize) {
+        let mut list_spread = false;
+        let mut item = self.nodes[list].first_child;
+        while item != NO_NODE {
+            let iu = item as usize;
+            let item_last = self.nodes[iu].next_sibling == NO_NODE;
+            // A blank after a non-last item ⇒ the list is spread.
+            if !item_last && self.ends_with_blank_line(iu) {
+                list_spread = true;
+            }
+            // A blank between two of an item's own block children ⇒ item spread.
+            let mut item_spread = false;
+            let mut sub = self.nodes[iu].first_child;
+            while sub != NO_NODE {
+                let sub_last = self.nodes[sub as usize].next_sibling == NO_NODE;
+                if !sub_last && self.ends_with_blank_line(sub as usize) {
+                    item_spread = true;
+                }
+                sub = self.nodes[sub as usize].next_sibling;
+            }
+            self.nodes[iu].item_spread = item_spread;
+            item = self.nodes[iu].next_sibling;
+        }
+        if let Some(ld) = &mut self.nodes[list].list {
+            ld.spread = list_spread;
+        }
+    }
+
     fn ends_with_blank_line(&self, mut idx: usize) -> bool {
         loop {
             if self.nodes[idx].last_line_blank {
@@ -593,6 +832,8 @@ impl<'a> Parser<'a> {
             opts: self.opts,
             source: src,
             buf: self.buf,
+            #[cfg(feature = "ast")]
+            defs: self.defs,
         }
     }
 
@@ -704,6 +945,10 @@ impl<'a> Parser<'a> {
                 self.add_line();
                 if t == Kind::HtmlBlock && self.html_block_closes(container) {
                     let cur = container;
+                    #[cfg(feature = "ast")]
+                    {
+                        self.nodes[cur].html_closed_by_cond = true;
+                    }
                     self.finalize(cur);
                 }
             } else if self.offset < self.line.len() && !self.blank {
@@ -760,6 +1005,9 @@ impl<'a> Parser<'a> {
                 }
             }
             Kind::Heading | Kind::ThematicBreak => 1,
+            // Definitions are inserted already-closed (never an open container).
+            #[cfg(feature = "ast")]
+            Kind::Definition => 1,
             Kind::CodeBlock => {
                 if self.nodes[c].fenced {
                     let fc = self.nodes[c].fence_char;
@@ -920,11 +1168,21 @@ impl<'a> Parser<'a> {
                 .is_empty();
             (lead, off, defs, empty)
         };
-        for (label, dest, title) in defs {
-            self.refmap.entry(label).or_insert((dest, title));
-        }
         if empty {
-            return 0; // only reference definitions; not a heading
+            // Only reference definitions: not a heading. Leave them in place —
+            // the paragraph's `finalize` registers/emits them (emitting here too
+            // would duplicate the `definition` node).
+            return 0;
+        }
+        // Becomes a heading: the defs are stripped from the heading content
+        // below, so register/emit them now (finalize won't see them).
+        #[cfg(feature = "ast")]
+        self.emit_defs(container, defs);
+        #[cfg(not(feature = "ast"))]
+        for (label, dest, title) in defs {
+            self.refmap
+                .entry(crate::inline::normalize_label(&label).into_owned())
+                .or_insert((dest, title));
         }
         // Reuse the paragraph node as the heading (its finalize trims the range).
         self.nodes[container].kind = Kind::Heading;
@@ -1023,6 +1281,8 @@ impl<'a> Parser<'a> {
             padding: 0,
             marker_offset: self.indent,
             tight: true,
+            #[cfg(feature = "ast")]
+            spread: false,
         };
         let marker_width;
         match rest.first() {

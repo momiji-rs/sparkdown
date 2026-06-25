@@ -229,6 +229,44 @@ fn try_code_span(src: &str, bytes: &[u8], i: usize, out: &mut String) -> Option<
     None
 }
 
+/// SPIKE: code-span value (mdast `inlineCode.value`) — the raw, un-escaped
+/// interior as the mdast `inlineCode.value`. Unlike the HTML render path (which
+/// converts line endings to spaces), mdast keeps line endings **literal**; only
+/// the CommonMark code-span padding applies: strip one leading and one trailing
+/// space-or-line-ending when both ends are padded and the content is not entirely
+/// whitespace. Matches `mdast-util-from-markdown`. Returns the value + new index.
+/// Unconditional (dead without `ast`) so AST branches compile in every build.
+#[allow(dead_code)]
+fn code_span_value(src: &str, bytes: &[u8], i: usize) -> Option<(String, usize)> {
+    let open_len = bytes[i..].iter().take_while(|&&b| b == b'`').count();
+    let content_start = i + open_len;
+    let mut j = content_start;
+    while j < bytes.len() {
+        if bytes[j] == b'`' {
+            let run = bytes[j..].iter().take_while(|&&b| b == b'`').count();
+            if run == open_len {
+                let content = &src[content_start..j];
+                let b = content.as_bytes();
+                let pad = |c: u8| matches!(c, b' ' | b'\n' | b'\r');
+                let value = if b.len() >= 2
+                    && pad(b[0])
+                    && pad(b[b.len() - 1])
+                    && b.iter().any(|&c| !pad(c))
+                {
+                    content[1..content.len() - 1].to_owned()
+                } else {
+                    content.to_owned()
+                };
+                return Some((value, j + run));
+            }
+            j += run;
+        } else {
+            j += 1;
+        }
+    }
+    None
+}
+
 /// A code span is bounded by single spaces (but not all spaces)?
 fn code_span_strips(s: &str) -> bool {
     s.len() >= 2 && s.starts_with(' ') && s.ends_with(' ') && s.bytes().any(|b| b != b' ')
@@ -539,7 +577,7 @@ fn norm_key<'a>(s: &'a str, buf: &'a mut String) -> &'a str {
 
 /// Normalize a link label: trim, collapse internal whitespace, case-fold.
 /// Borrows when the label is already normalized.
-fn normalize_label(s: &str) -> Cow<'_, str> {
+pub(crate) fn normalize_label(s: &str) -> Cow<'_, str> {
     if already_normalized(s) {
         return Cow::Borrowed(s);
     }
@@ -566,6 +604,177 @@ enum Node {
     },
     /// A static tag/literal: emphasis tags, `</a>`, or an unconsumed `[`/`![`/`]`.
     Tag(&'static str),
+    /// SPIKE (AST mode only): a semantic node indexing the `sem` side-table.
+    /// Dead in the HTML path (never set), so it is unreachable in `render_node`.
+    Sem(u32),
+    /// SPIKE (AST mode only): close of an mdast `link`.
+    LinkClose,
+}
+
+/// SPIKE: semantic payload for inline constructs that are *lossy* once rendered
+/// to HTML — captured at parse time (where the raw values still exist) and
+/// referenced by [`Node::Sem`]. Defined unconditionally (dead without `ast`) so
+/// it can flow through `look_for_link_or_image`'s signature without cfg-gating.
+#[derive(Debug, Clone)]
+enum Sem {
+    /// Inline code: the raw (un-escaped) value.
+    Code(String),
+    /// `[text](url "title")` opener. `url`/`title` are the resolved destination
+    /// (NOT the percent-encoded `href` — that is unrecoverable from the output).
+    LinkOpen { url: String, title: Option<String> },
+    /// `![alt](url "title")` — a leaf in mdast (alt is plain text).
+    Image { url: String, title: Option<String>, alt: String },
+    /// `<url>` / `<email>` autolink → an mdast `link` with one text child.
+    Autolink { url: String, text: String },
+    /// Raw inline HTML, verbatim.
+    Html(String),
+    /// A hard line break.
+    Break,
+    /// `[text][label]` etc. → mdast `linkReference` opener (children = link text,
+    /// closed by [`Node::LinkClose`]). Carries the normalized `identifier`, the
+    /// raw `label`, and `reftype` (`"shortcut"`/`"collapsed"`/`"full"`).
+    LinkRef { identifier: String, label: String, reftype: &'static str },
+    /// `![alt][label]` etc. → mdast `imageReference` (a leaf; alt is plain text).
+    ImageRef { identifier: String, label: String, reftype: &'static str, alt: String },
+}
+
+/// SPIKE: reference-resolution metadata produced by [`parse_link_target`] in AST
+/// mode, so the emitter can build a `linkReference`/`imageReference` node instead
+/// of a resolved `link`/`image`. `None` for inline `(url)` targets.
+struct RefInfo {
+    identifier: String,
+    label: String,
+    reftype: &'static str,
+}
+
+/// SPIKE (`ast` feature): a flat, ordered stream of semantic inline tokens —
+/// emphasis/link nesting is expressed by `Open`/`Close` pairs (reconstructed
+/// into a tree by `ast.rs`). This is the lossless counterpart of the HTML the
+/// fast path would emit.
+#[cfg(feature = "ast")]
+#[derive(Debug, Clone)]
+pub enum InlineTok {
+    /// mdast `text` value (HTML-unescaped).
+    Text(String),
+    /// Open a container: `"emphasis"` | `"strong"` | `"delete"`.
+    Open(&'static str),
+    /// Close the matching container.
+    Close(&'static str),
+    /// Open an mdast `link`.
+    LinkOpen { url: String, title: Option<String> },
+    /// Close the matching `link`.
+    LinkClose,
+    /// mdast `image` (leaf).
+    Image { url: String, title: Option<String>, alt: String },
+    /// mdast `inlineCode`.
+    Code(String),
+    /// mdast `link` from an autolink (single text child).
+    Autolink { url: String, text: String },
+    /// mdast `html` (raw inline).
+    Html(String),
+    /// mdast `break` (hard line break).
+    Break,
+    /// Open an mdast `linkReference` (closed by the matching [`LinkClose`]).
+    LinkRefOpen { identifier: String, label: String, reftype: &'static str },
+    /// mdast `imageReference` (leaf).
+    ImageRef { identifier: String, label: String, reftype: &'static str, alt: String },
+}
+
+/// SPIKE: reverse [`escape_html`] (`&amp;`/`&lt;`/`&gt;`/`&quot;` only) to recover
+/// an mdast `text` value from a rendered span. escape_html escapes exactly these
+/// four, after entity/backslash resolution — so this is exact, not heuristic.
+/// Unconditional (dead without `ast`) so AST branches compile in every build.
+#[allow(dead_code)]
+fn unescape_html_text(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_owned();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let tail = &rest[amp..];
+        if let Some(after) = tail.strip_prefix("&amp;") {
+            out.push('&');
+            rest = after;
+        } else if let Some(after) = tail.strip_prefix("&lt;") {
+            out.push('<');
+            rest = after;
+        } else if let Some(after) = tail.strip_prefix("&gt;") {
+            out.push('>');
+            rest = after;
+        } else if let Some(after) = tail.strip_prefix("&quot;") {
+            out.push('"');
+            rest = after;
+        } else {
+            out.push('&');
+            rest = &tail[1..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// SPIKE: convert the resolved slot list into the semantic [`InlineTok`] stream.
+/// Spans now hold *only* plain escaped text (every lossy construct is a
+/// [`Node::Sem`]/[`Node::LinkClose`]), so reconstruction is exact.
+#[cfg(feature = "ast")]
+fn list_to_tokens(list: &List, cur: &str, sem: &[Sem], out: &mut Vec<InlineTok>) {
+    let mut node = list.head;
+    while let Some(idx) = node {
+        match &list.slots[idx].node {
+            Node::Span { start, end } => {
+                let t = unescape_html_text(&cur[*start..*end]);
+                if !t.is_empty() {
+                    out.push(InlineTok::Text(t));
+                }
+            }
+            Node::Tag(t) => out.push(match *t {
+                "<em>" => InlineTok::Open("emphasis"),
+                "</em>" => InlineTok::Close("emphasis"),
+                "<strong>" => InlineTok::Open("strong"),
+                "</strong>" => InlineTok::Close("strong"),
+                "<del>" => InlineTok::Open("delete"),
+                "</del>" => InlineTok::Close("delete"),
+                // Unconsumed literal brackets stay as text.
+                lit => InlineTok::Text(lit.to_owned()),
+            }),
+            Node::Delim { ch, count, .. } => {
+                out.push(InlineTok::Text(core::iter::repeat(*ch as char).take(*count).collect()))
+            }
+            Node::Sem(i) => out.push(match &sem[*i as usize] {
+                Sem::Code(v) => InlineTok::Code(v.clone()),
+                Sem::LinkOpen { url, title } => InlineTok::LinkOpen {
+                    url: url.clone(),
+                    title: title.clone(),
+                },
+                Sem::Image { url, title, alt } => InlineTok::Image {
+                    url: url.clone(),
+                    title: title.clone(),
+                    alt: alt.clone(),
+                },
+                Sem::Autolink { url, text } => InlineTok::Autolink {
+                    url: url.clone(),
+                    text: text.clone(),
+                },
+                Sem::Html(h) => InlineTok::Html(h.clone()),
+                Sem::Break => InlineTok::Break,
+                Sem::LinkRef { identifier, label, reftype } => InlineTok::LinkRefOpen {
+                    identifier: identifier.clone(),
+                    label: label.clone(),
+                    reftype,
+                },
+                Sem::ImageRef { identifier, label, reftype, alt } => InlineTok::ImageRef {
+                    identifier: identifier.clone(),
+                    label: label.clone(),
+                    reftype,
+                    alt: alt.clone(),
+                },
+            }),
+            Node::LinkClose => out.push(InlineTok::LinkClose),
+        }
+        node = list.slots[idx].next;
+    }
 }
 
 struct Slot {
@@ -661,6 +870,8 @@ fn render_node(node: &Node, cur: &str, out: &mut String) {
                 out.push(*ch as char);
             }
         }
+        // AST-mode only; never present on the HTML path.
+        Node::Sem(_) | Node::LinkClose => {}
     }
 }
 
@@ -748,6 +959,15 @@ pub struct Scratch {
     cur: String,
     /// Reused scratch for normalized reference-link lookup keys.
     norm: String,
+    /// SPIKE: side-table for [`Node::Sem`] semantic payloads. Unconditional (dead
+    /// without `ast`) so `look_for_link_or_image`'s signature stays uncfg'd.
+    sem: Vec<Sem>,
+    /// SPIKE (`ast` feature): when `Some`, `render_inline` materializes owned
+    /// [`InlineTok`] nodes here instead of emitting HTML to `out`. `None` (the
+    /// default) is the unchanged fast path — the one extra branch it adds is only
+    /// compiled in `ast` builds.
+    #[cfg(feature = "ast")]
+    toks: Option<Vec<InlineTok>>,
 }
 
 impl Scratch {
@@ -757,6 +977,9 @@ impl Scratch {
             stack: Vec::with_capacity(16),
             cur: String::with_capacity(1024),
             norm: String::with_capacity(48),
+            sem: Vec::new(),
+            #[cfg(feature = "ast")]
+            toks: None,
         }
     }
     fn reset(&mut self) {
@@ -765,6 +988,7 @@ impl Scratch {
         self.list.tail = None;
         self.stack.clear();
         self.cur.clear();
+        self.sem.clear();
     }
 }
 
@@ -1141,6 +1365,22 @@ pub fn render_inline(
     }
 }
 
+/// SPIKE (`ast` feature): parse `src`'s inline content into owned [`InlineTok`]
+/// nodes instead of HTML. Runs the exact same pipeline as [`render_inline`]
+/// (text/code/links, emphasis resolution) but captures the resolved node list.
+#[cfg(feature = "ast")]
+pub fn render_inline_to_tokens(
+    src: &str,
+    refmap: &RefMap,
+    scratch: &mut Scratch,
+    opts: Options,
+) -> Vec<InlineTok> {
+    scratch.toks = Some(Vec::new());
+    let mut sink = String::new(); // unused in token mode
+    render_inline(src, &mut sink, refmap, scratch, opts);
+    scratch.toks.take().unwrap_or_default()
+}
+
 #[allow(unused_assignments)] // `seg` is updated at segment ends; the last is unused
 fn render_inline_impl<const HW: bool, const ST: bool>(
     src: &str,
@@ -1151,13 +1391,22 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
     al: bool,
 ) {
     let bytes = src.as_bytes();
+    // SPIKE: AST mode captures semantic nodes instead of HTML. `ast_mode` is a
+    // compile-time `false` without the `ast` feature, so every `if ast_mode {…}`
+    // branch below is dead-code-eliminated and the fast path is untouched.
+    #[cfg(feature = "ast")]
+    let ast_mode = scratch.toks.is_some();
+    #[cfg(not(feature = "ast"))]
+    let ast_mode = false;
     // Fast path: no emphasis/link (or `~` when ST) delimiters → stream directly.
+    // Skipped in AST mode: the streaming path emits HTML for code spans /
+    // autolinks / raw HTML, which we must instead capture as semantic nodes.
     let gate = if ST {
         find_emph_gfm(bytes)
     } else {
         find_emph(bytes)
     };
-    if gate.is_none() {
+    if gate.is_none() && !ast_mode {
         if al {
             stream_autolink(src, out, HW, tf);
         } else {
@@ -1170,6 +1419,7 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
     let stack = &mut scratch.stack;
     let cur = &mut scratch.cur;
     let norm = &mut scratch.norm;
+    let sem = &mut scratch.sem;
     let mut i = 0usize;
     let mut run = 0usize;
     let mut seg = 0usize; // start (in `cur`) of the open text segment
@@ -1192,7 +1442,15 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
             b'\\' => {
                 escape_html(&src[run..i], cur);
                 if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
-                    cur.push_str("<br />\n");
+                    if ast_mode {
+                        flush!();
+                        let si = sem.len() as u32;
+                        sem.push(Sem::Break);
+                        list.push(Node::Sem(si));
+                        seg = cur.len();
+                    } else {
+                        cur.push_str("<br />\n");
+                    }
                     i = skip_spaces(bytes, i + 2);
                 } else if i + 1 < bytes.len() && is_ascii_punct(bytes[i + 1]) {
                     push_escaped_byte(cur, bytes[i + 1]);
@@ -1205,7 +1463,20 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
             }
             b'`' => {
                 escape_html(&src[run..i], cur);
-                if let Some(new_i) = try_code_span(src, bytes, i, cur) {
+                if ast_mode {
+                    if let Some((val, new_i)) = code_span_value(src, bytes, i) {
+                        flush!();
+                        let si = sem.len() as u32;
+                        sem.push(Sem::Code(val));
+                        list.push(Node::Sem(si));
+                        seg = cur.len();
+                        i = new_i;
+                    } else {
+                        let n = bytes[i..].iter().take_while(|&&b| b == b'`').count();
+                        cur.push_str(&src[i..i + n]);
+                        i += n;
+                    }
+                } else if let Some(new_i) = try_code_span(src, bytes, i, cur) {
                     i = new_i;
                 } else {
                     let n = bytes[i..].iter().take_while(|&&b| b == b'`').count();
@@ -1231,10 +1502,33 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
             b'<' => {
                 escape_html(&src[run..i], cur);
                 if let Some((consumed, html)) = try_autolink(src, bytes, i) {
-                    cur.push_str(&html);
+                    if ast_mode {
+                        // Recover url/text: href is percent-encoded (lossy), but
+                        // the visible text is the original (only HTML-escaped).
+                        let close = bytes[i + 1..].iter().position(|&b| b == b'>').unwrap();
+                        let content = &src[i + 1..i + 1 + close];
+                        let url = if is_uri_autolink(content) {
+                            content.to_owned()
+                        } else {
+                            format!("mailto:{content}")
+                        };
+                        flush!();
+                        let si = sem.len() as u32;
+                        sem.push(Sem::Autolink { url, text: content.to_owned() });
+                        list.push(Node::Sem(si));
+                        seg = cur.len();
+                    } else {
+                        cur.push_str(&html);
+                    }
                     i += consumed;
                 } else if let Some(end) = try_raw_html(bytes, i) {
-                    if tf {
+                    if ast_mode {
+                        flush!();
+                        let si = sem.len() as u32;
+                        sem.push(Sem::Html(src[i..end].to_owned()));
+                        list.push(Node::Sem(si));
+                        seg = cur.len();
+                    } else if tf {
                         crate::render::filter_html(&src[i..end], cur);
                     } else {
                         cur.push_str(&src[i..end]); // verbatim
@@ -1322,7 +1616,8 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                 let rb_src = i;
                 i += 1;
                 look_for_link_or_image(
-                    src, bytes, &mut i, list, stack, cur, norm, refmap, rb, rb_src,
+                    src, bytes, &mut i, list, stack, cur, norm, refmap, rb, rb_src, ast_mode,
+                    sem,
                 );
                 // A resolved link/image appended its tag to `cur` and spanned it
                 // directly; the next text segment starts after it.
@@ -1335,7 +1630,17 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                 let trimmed = line.trim_end_matches(' ');
                 let hard = line.len() - trimmed.len() >= 2;
                 escape_html(trimmed, cur);
-                cur.push_str(if hard || HW { "<br />\n" } else { "\n" });
+                if (hard || HW) && ast_mode {
+                    flush!();
+                    let si = sem.len() as u32;
+                    sem.push(Sem::Break);
+                    list.push(Node::Sem(si));
+                    seg = cur.len();
+                } else {
+                    // Soft break stays as text "\n"; in AST mode it is folded into
+                    // the surrounding text node.
+                    cur.push_str(if hard || HW { "<br />\n" } else { "\n" });
+                }
                 i = skip_spaces(bytes, i + 1);
                 run = i;
             }
@@ -1398,6 +1703,16 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
     flush!();
 
     process_emphasis(list, stack, 0);
+    // SPIKE: materialize owned inline nodes instead of rendering to `out`. The
+    // `list`/`cur` borrows of `scratch` end at the `list_to_tokens` call, so the
+    // disjoint `scratch.toks` field can be assigned right after.
+    #[cfg(feature = "ast")]
+    if ast_mode {
+        let mut v = Vec::new();
+        list_to_tokens(list, cur, sem, &mut v);
+        scratch.toks = Some(v);
+        return;
+    }
     render_list(list, cur, out);
 }
 
@@ -1416,6 +1731,8 @@ fn look_for_link_or_image(
     refmap: &RefMap,
     rb_node: usize,
     rb_src: usize,
+    ast_mode: bool,
+    sem: &mut Vec<Sem>,
 ) {
     let Some(op) = stack
         .iter()
@@ -1438,7 +1755,9 @@ fn look_for_link_or_image(
     }
 
     let text = &src[text_src..rb_src];
-    let Some((dest_raw, title_raw, new_i)) = parse_link_target(src, bytes, *i, refmap, text, norm)
+    let mut ref_info: Option<RefInfo> = None;
+    let Some((dest_raw, title_raw, new_i)) =
+        parse_link_target(src, bytes, *i, refmap, text, norm, &mut ref_info)
     else {
         stack.remove(op);
         return; // ] stays literal
@@ -1448,33 +1767,54 @@ fn look_for_link_or_image(
     process_emphasis(list, stack, op + 1);
 
     if image {
-        // Alt text = the rendered link text with tags stripped.
-        let mut inner = String::new();
-        let mut node = list.slots[op_node].next;
-        while let Some(idx) = node {
-            if idx == rb_node {
-                break;
+        if ast_mode {
+            // mdast `image`/`imageReference` is a leaf whose `alt` is the
+            // *plain text* of the link text — including nested image alts (which
+            // are `Sem` nodes the HTML renderer would drop).
+            let alt = ast_image_alt(list, op_node, rb_node, cur, sem);
+            let si = sem.len() as u32;
+            sem.push(match ref_info {
+                Some(ri) => Sem::ImageRef {
+                    identifier: ri.identifier,
+                    label: ri.label,
+                    reftype: ri.reftype,
+                    alt,
+                },
+                None => Sem::Image {
+                    url: unescape_string(dest_raw).into_owned(),
+                    title: title_raw.map(|t| unescape_string(t).into_owned()),
+                    alt,
+                },
+            });
+            list.slots[op_node].node = Node::Sem(si);
+        } else {
+            // Alt text = the rendered link text with tags stripped.
+            let mut inner = String::new();
+            let mut node = list.slots[op_node].next;
+            while let Some(idx) = node {
+                if idx == rb_node {
+                    break;
+                }
+                render_node(&list.slots[idx].node, cur, &mut inner);
+                node = list.slots[idx].next;
             }
-            render_node(&list.slots[idx].node, cur, &mut inner);
-            node = list.slots[idx].next;
-        }
-        let alt = strip_tags(&inner);
-
-        // Build the <img> tag into the shared buffer (no per-image allocation).
-        let start = cur.len();
-        cur.push_str("<img src=\"");
-        escape_href(unescape_string(dest_raw).as_ref(), cur);
-        cur.push_str("\" alt=\"");
-        cur.push_str(&alt);
-        cur.push('"');
-        if let Some(t) = title_raw {
-            cur.push_str(" title=\"");
-            escape_attr(unescape_string(t).as_ref(), cur);
+            let alt = strip_tags(&inner);
+            // Build the <img> tag into the shared buffer (no per-image allocation).
+            let start = cur.len();
+            cur.push_str("<img src=\"");
+            escape_href(unescape_string(dest_raw).as_ref(), cur);
+            cur.push_str("\" alt=\"");
+            cur.push_str(&alt);
             cur.push('"');
+            if let Some(t) = title_raw {
+                cur.push_str(" title=\"");
+                escape_attr(unescape_string(t).as_ref(), cur);
+                cur.push('"');
+            }
+            cur.push_str(" />");
+            let end = cur.len();
+            list.slots[op_node].node = Node::Span { start, end };
         }
-        cur.push_str(" />");
-        let end = cur.len();
-        list.slots[op_node].node = Node::Span { start, end };
 
         // Unlink the link text and the closing bracket.
         let mut c = list.slots[op_node].next;
@@ -1487,20 +1827,37 @@ fn look_for_link_or_image(
             c = nxt;
         }
     } else {
-        // Build the <a> open tag into the shared buffer (no per-link allocation).
-        let start = cur.len();
-        cur.push_str("<a href=\"");
-        escape_href(unescape_string(dest_raw).as_ref(), cur);
-        cur.push('"');
-        if let Some(t) = title_raw {
-            cur.push_str(" title=\"");
-            escape_attr(unescape_string(t).as_ref(), cur);
+        if ast_mode {
+            let si = sem.len() as u32;
+            sem.push(match ref_info {
+                Some(ri) => Sem::LinkRef {
+                    identifier: ri.identifier,
+                    label: ri.label,
+                    reftype: ri.reftype,
+                },
+                None => Sem::LinkOpen {
+                    url: unescape_string(dest_raw).into_owned(),
+                    title: title_raw.map(|t| unescape_string(t).into_owned()),
+                },
+            });
+            list.slots[op_node].node = Node::Sem(si);
+            list.slots[rb_node].node = Node::LinkClose;
+        } else {
+            // Build the <a> open tag into the shared buffer (no per-link allocation).
+            let start = cur.len();
+            cur.push_str("<a href=\"");
+            escape_href(unescape_string(dest_raw).as_ref(), cur);
             cur.push('"');
+            if let Some(t) = title_raw {
+                cur.push_str(" title=\"");
+                escape_attr(unescape_string(t).as_ref(), cur);
+                cur.push('"');
+            }
+            cur.push('>');
+            let end = cur.len();
+            list.slots[op_node].node = Node::Span { start, end };
+            list.slots[rb_node].node = Node::Tag("</a>");
         }
-        cur.push('>');
-        let end = cur.len();
-        list.slots[op_node].node = Node::Span { start, end };
-        list.slots[rb_node].node = Node::Tag("</a>");
 
         // No links inside links: deactivate earlier `[` openers.
         for e in stack.iter_mut() {
@@ -1517,6 +1874,44 @@ fn look_for_link_or_image(
 
     stack.truncate(op); // drop the opener and any delimiters above it
     *i = new_i;
+}
+
+/// SPIKE (AST mode): the *plain text* of an image's link text (the slots between
+/// `op_node` and `rb_node`), for mdast `image.alt`. Mirrors [`list_to_tokens`]'s
+/// text projection: emphasis markers contribute nothing, `Sem` leaves contribute
+/// their plain value (a nested image its `alt`, code its value, …). Defined
+/// unconditionally (dead without `ast`) so the `if ast_mode` branch compiles.
+#[allow(dead_code)]
+fn ast_image_alt(list: &List, op_node: usize, rb_node: usize, cur: &str, sem: &[Sem]) -> String {
+    let mut s = String::new();
+    let mut node = list.slots[op_node].next;
+    while let Some(idx) = node {
+        if idx == rb_node {
+            break;
+        }
+        match &list.slots[idx].node {
+            Node::Span { start, end } => s.push_str(&unescape_html_text(&cur[*start..*end])),
+            Node::Tag(t) => match *t {
+                "<em>" | "</em>" | "<strong>" | "</strong>" | "<del>" | "</del>" => {}
+                lit => s.push_str(lit),
+            },
+            Node::Delim { ch, count, .. } => {
+                for _ in 0..*count {
+                    s.push(*ch as char);
+                }
+            }
+            Node::Sem(i) => match &sem[*i as usize] {
+                Sem::Image { alt, .. } | Sem::ImageRef { alt, .. } => s.push_str(alt),
+                Sem::Code(v) => s.push_str(v),
+                Sem::Autolink { text, .. } => s.push_str(text),
+                Sem::Html(h) => s.push_str(h),
+                Sem::LinkOpen { .. } | Sem::LinkRef { .. } | Sem::Break => {}
+            },
+            Node::LinkClose => {}
+        }
+        node = list.slots[idx].next;
+    }
+    s
 }
 
 /// Remove `<...>` tag spans from `s` to derive image alt text. A nested
@@ -1558,24 +1953,36 @@ fn parse_link_target<'a>(
     refmap: &'a RefMap,
     text: &'a str,
     norm: &mut String,
+    ref_out: &mut Option<RefInfo>,
 ) -> Option<(&'a str, Option<&'a str>, usize)> {
     if bytes.get(i) == Some(&b'(')
         && let Some(r) = parse_inline_paren(src, bytes, i)
     {
-        return Some(r);
+        return Some(r); // inline target: not a reference, `ref_out` stays None
     }
-    // Full reference: [label]
+    // Full/collapsed reference: [label] / []
     if bytes.get(i) == Some(&b'[') {
         if let Some((label, end)) = read_bracket_label(src, bytes, i) {
-            // collapsed [] uses the link text
-            let label = if label.trim().is_empty() { text } else { label };
-            let (d, t) = refmap.get(norm_key(label, norm))?;
+            // collapsed `[]` reuses the link text as the label.
+            let collapsed = label.trim().is_empty();
+            let lab = if collapsed { text } else { label };
+            let (d, t) = refmap.get(norm_key(lab, norm))?;
+            *ref_out = Some(RefInfo {
+                identifier: normalize_label(lab).into_owned(),
+                label: unescape_string(lab).into_owned(),
+                reftype: if collapsed { "collapsed" } else { "full" },
+            });
             return Some((d.as_str(), t.as_deref(), end));
         }
         return None;
     }
     // Shortcut reference: the link text itself is the label.
     let (d, t) = refmap.get(norm_key(text, norm))?;
+    *ref_out = Some(RefInfo {
+        identifier: normalize_label(text).into_owned(),
+        label: unescape_string(text).into_owned(),
+        reftype: "shortcut",
+    });
     Some((d.as_str(), t.as_deref(), i))
 }
 
@@ -1705,13 +2112,15 @@ fn parse_title<'a>(text: &'a str, bytes: &[u8], j: usize) -> Option<(&'a str, us
 
 /// Extract leading link reference definitions from a paragraph's text. Returns
 /// the offset where the remaining paragraph begins and the defs as
-/// `(normalized label, raw destination, raw title)`.
+/// `(raw label, raw destination, raw title)`. The caller normalizes the label
+/// for the [`RefMap`] key (and, in AST mode, keeps the raw label for the
+/// `definition` node).
 pub fn take_ref_defs(text: &str) -> (usize, Vec<(String, String, Option<String>)>) {
     let bytes = text.as_bytes();
     let mut pos = 0;
     let mut defs = Vec::new();
     while let Some((end, label, dest, title)) = parse_ref_def(text, bytes, pos) {
-        defs.push((normalize_label(&label).into_owned(), dest, title));
+        defs.push((label, dest, title));
         pos = end;
     }
     (pos, defs)

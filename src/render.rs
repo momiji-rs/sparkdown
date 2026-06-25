@@ -124,6 +124,9 @@ fn render_node(tree: &Tree, idx: usize, out: &mut String, scratch: &mut Scratch)
             }
             cr(out);
         }
+        // SPIKE (`ast` feature): reference definitions produce no HTML.
+        #[cfg(feature = "ast")]
+        Kind::Definition => {}
         Kind::BlockQuote => {
             cr(out);
             out.push_str("<blockquote>");
