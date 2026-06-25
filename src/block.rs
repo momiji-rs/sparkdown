@@ -66,7 +66,7 @@ pub struct Node {
     info_start: u32,
     info_end: u32,
     html_kind: u8,
-    pub list: Option<Box<ListData>>,
+    pub list: Option<ListData>,
 }
 
 impl Node {
@@ -914,10 +914,10 @@ impl<'a> Parser<'a> {
                 .is_some_and(|l| lists_match(l, &data));
         if !tip_is_matching_list {
             let l = self.add_child(Kind::List);
-            self.nodes[l].list = Some(Box::new(data.clone()));
+            self.nodes[l].list = Some(data.clone());
         }
         let item = self.add_child(Kind::Item);
-        self.nodes[item].list = Some(Box::new(data));
+        self.nodes[item].list = Some(data);
         1
     }
 
