@@ -649,6 +649,17 @@ impl<'a> Parser<'a> {
         self.nodes[tip].cend = self.buf.len() as u32;
     }
 
+    /// SPIKE (`ast`): map a `buf` byte offset to source via the segment map.
+    #[cfg(feature = "ast")]
+    fn map_buf_off(&self, buf_off: u32) -> u32 {
+        let i = self.buf_segs.partition_point(|&(b, _)| b <= buf_off);
+        if i == 0 {
+            return buf_off;
+        }
+        let (b, s) = self.buf_segs[i - 1];
+        s + (buf_off - b)
+    }
+
     fn close_unmatched_blocks(&mut self) {
         if !self.all_closed {
             while self.oldtip != self.last_matched_container {
@@ -706,6 +717,14 @@ impl<'a> Parser<'a> {
                 } else {
                     self.nodes[idx].cstart = (bs + hl) as u32;
                     self.nodes[idx].cend = (bs + hl + inner_len) as u32;
+                    // SPIKE (`ast`): leading defs shift the paragraph's start past
+                    // the (now-stripped) definition lines.
+                    #[cfg(feature = "ast")]
+                    {
+                        let cs = (bs + hl) as u32;
+                        self.nodes[idx].src_start =
+                            if csrc { cs } else { self.map_buf_off(cs) };
+                    }
                 }
             }
             Kind::Heading => {

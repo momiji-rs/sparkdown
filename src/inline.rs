@@ -1502,7 +1502,8 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                         let si = sem.len() as u32;
                         sem.push(Sem::Break);
                         let bid = list.push(Node::Sem(si));
-                        cspan!(bid, i, i + 1);
+                        // The break spans the `\` and the line ending.
+                        cspan!(bid, i, i + 2);
                         seg = cur.len();
                         i = skip_spaces(bytes, i + 2);
                         #[cfg(feature = "ast")]
