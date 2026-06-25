@@ -161,6 +161,22 @@ import { toHtml } from "@momiji-rs/sparkdown";
 const html = await toHtml("# Hello *world*");
 ```
 
+Importing the package has **no side effect** — the wasm instantiates lazily on
+first use. For synchronous, server-side rendering (Node / Bun / Deno / edge /
+workers — *not* the browser main thread, where sync wasm compile is capped at
+~4 KB), call `initSync()` once and then `toHtmlSync`:
+
+```js
+import { initSync, toHtmlSync } from "@momiji-rs/sparkdown";
+let ready = false;
+function render(md) {
+  if (!ready) { initSync(); ready = true; } // sync, once, on first render
+  return toHtmlSync(md);
+}
+```
+
+In the browser, keep using `await toHtml(...)` (or `await ready` then `toHtmlSync`).
+
 Under the hood it's a `wasm32-unknown-unknown` build behind a tiny raw C-ABI
 (`sparkdown_alloc` / `sparkdown_free` / `sparkdown_to_html`, plus
 `sparkdown_to_html_opts(ptr, len, flags)` in the GFM build) — no `wasm-bindgen`,

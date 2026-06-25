@@ -19,11 +19,19 @@ export interface Options {
   hardWraps?: boolean;
 }
 
-/** Instantiate the wasm module (idempotent). Resolves once it is ready. */
+/**
+ * Synchronously instantiate the wasm module (idempotent); afterwards
+ * {@link toHtmlSync} works with no await. For Node/Bun/Deno/server/workers — NOT
+ * the browser main thread (synchronous compile is capped at ~4 KB there; use
+ * {@link init}/{@link ready} in browsers). Returns the raw wasm exports.
+ */
+export function initSync(): unknown;
+
+/** Instantiate the wasm module asynchronously (idempotent). Resolves once it is ready. */
 export function init(): Promise<unknown>;
 
-/** Resolves once the wasm module is ready; afterwards {@link toHtmlSync} works. */
-export const ready: Promise<void>;
+/** Resolves once the wasm module is ready; afterwards {@link toHtmlSync} works (lazy). */
+export const ready: PromiseLike<void>;
 
 /** Render `markdown` to HTML with GFM extensions (default: all on). */
 export function toHtml(markdown: string, options?: Options): Promise<string>;

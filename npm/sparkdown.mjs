@@ -19,19 +19,42 @@ function base64ToBytes(b64) {
 let wasm = null;
 let initPromise = null;
 
-/** Instantiate the wasm module (idempotent). Resolves to the raw exports. */
+function instantiateSync() {
+  // Synchronous compile + instantiate of the inlined module (no imports — WASI-free).
+  return new WebAssembly.Instance(new WebAssembly.Module(base64ToBytes(WASM_BASE64)), {})
+    .exports;
+}
+
+/**
+ * Synchronously instantiate the wasm module (idempotent); afterwards `toHtmlSync`
+ * works with no await. For Node / Bun / Deno / edge / workers — NOT the browser
+ * main thread, where synchronous WebAssembly compilation is capped at ~4 KB (this
+ * module is far larger and will throw); use `init()` / `ready` in browsers.
+ */
+export function initSync() {
+  if (!wasm) wasm = instantiateSync();
+  return wasm;
+}
+
+/** Instantiate the wasm module asynchronously (idempotent). Resolves to the exports. */
 export function init() {
   if (wasm) return Promise.resolve(wasm);
   if (!initPromise) {
     initPromise = WebAssembly.instantiate(base64ToBytes(WASM_BASE64), {}).then(
-      ({ instance }) => (wasm = instance.exports),
+      ({ instance }) => (wasm ??= instance.exports), // ??= so a prior initSync() isn't clobbered
     );
   }
   return initPromise;
 }
 
-/** Resolves once the wasm module is ready; then `toHtmlSync` may be used. */
-export const ready = init().then(() => {});
+/**
+ * Resolves once the wasm module is ready; then `toHtmlSync` may be used. Lazy —
+ * awaiting it (or calling `init`/`initSync`) is what instantiates, so importing
+ * this package has no side effect.
+ */
+export const ready = {
+  then: (onFulfilled, onRejected) => init().then(() => onFulfilled?.(), onRejected),
+};
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -58,7 +81,7 @@ export async function toHtml(markdown) {
 /** Synchronous render — valid only after `await ready` (or a prior `toHtml`). */
 export function toHtmlSync(markdown) {
   if (!wasm) {
-    throw new Error("sparkdown: await ready (or toHtml) before toHtmlSync");
+    throw new Error("sparkdown: call initSync() or await ready/init() before toHtmlSync()");
   }
   return render(wasm, String(markdown));
 }
