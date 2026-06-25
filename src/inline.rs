@@ -496,13 +496,9 @@ fn already_normalized(s: &str) -> bool {
     true
 }
 
-/// Normalize a link label: trim, collapse internal whitespace, case-fold.
-/// Borrows when the label is already normalized.
-fn normalize_label(s: &str) -> Cow<'_, str> {
-    if already_normalized(s) {
-        return Cow::Borrowed(s);
-    }
-    let mut out = String::new();
+/// Append the normalized form of `s` (trim, collapse whitespace, case-fold) to
+/// `out`.
+fn normalize_label_append(s: &str, out: &mut String) {
     let mut prev_ws = false;
     for c in s.trim().chars() {
         if c.is_whitespace() {
@@ -523,6 +519,28 @@ fn normalize_label(s: &str) -> Cow<'_, str> {
             prev_ws = false;
         }
     }
+}
+
+/// A normalized lookup key for `s`: borrowed when `s` is already normalized,
+/// otherwise written into the reused `buf` — no per-lookup allocation.
+fn norm_key<'a>(s: &'a str, buf: &'a mut String) -> &'a str {
+    if already_normalized(s) {
+        s
+    } else {
+        buf.clear();
+        normalize_label_append(s, buf);
+        buf
+    }
+}
+
+/// Normalize a link label: trim, collapse internal whitespace, case-fold.
+/// Borrows when the label is already normalized.
+fn normalize_label(s: &str) -> Cow<'_, str> {
+    if already_normalized(s) {
+        return Cow::Borrowed(s);
+    }
+    let mut out = String::new();
+    normalize_label_append(s, &mut out);
     Cow::Owned(out)
 }
 
@@ -722,6 +740,8 @@ pub struct Scratch {
     list: List,
     stack: Vec<StackItem>,
     cur: String,
+    /// Reused scratch for normalized reference-link lookup keys.
+    norm: String,
 }
 
 impl Scratch {
@@ -730,6 +750,7 @@ impl Scratch {
             list: List::new(),
             stack: Vec::new(),
             cur: String::new(),
+            norm: String::new(),
         }
     }
     fn reset(&mut self) {
@@ -832,6 +853,7 @@ pub fn render_inline(src: &str, out: &mut String, refmap: &RefMap, scratch: &mut
     let list = &mut scratch.list;
     let stack = &mut scratch.stack;
     let cur = &mut scratch.cur;
+    let norm = &mut scratch.norm;
     let mut i = 0usize;
     let mut run = 0usize;
     let mut seg = 0usize; // start (in `cur`) of the open text segment
@@ -955,7 +977,9 @@ pub fn render_inline(src: &str, out: &mut String, refmap: &RefMap, scratch: &mut
                 let rb = list.push(Node::Tag("]"));
                 let rb_src = i;
                 i += 1;
-                look_for_link_or_image(src, bytes, &mut i, list, stack, cur, refmap, rb, rb_src);
+                look_for_link_or_image(
+                    src, bytes, &mut i, list, stack, cur, norm, refmap, rb, rb_src,
+                );
                 // A resolved link/image appended its tag to `cur` and spanned it
                 // directly; the next text segment starts after it.
                 seg = cur.len();
@@ -995,6 +1019,7 @@ fn look_for_link_or_image(
     list: &mut List,
     stack: &mut Vec<StackItem>,
     cur: &mut String,
+    norm: &mut String,
     refmap: &RefMap,
     rb_node: usize,
     rb_src: usize,
@@ -1020,7 +1045,8 @@ fn look_for_link_or_image(
     }
 
     let text = &src[text_src..rb_src];
-    let Some((dest_raw, title_raw, new_i)) = parse_link_target(src, bytes, *i, refmap, text) else {
+    let Some((dest_raw, title_raw, new_i)) = parse_link_target(src, bytes, *i, refmap, text, norm)
+    else {
         stack.remove(op);
         return; // ] stays literal
     };
@@ -1138,6 +1164,7 @@ fn parse_link_target<'a>(
     i: usize,
     refmap: &'a RefMap,
     text: &'a str,
+    norm: &mut String,
 ) -> Option<(&'a str, Option<&'a str>, usize)> {
     if bytes.get(i) == Some(&b'(')
         && let Some(r) = parse_inline_paren(src, bytes, i)
@@ -1147,18 +1174,15 @@ fn parse_link_target<'a>(
     // Full reference: [label]
     if bytes.get(i) == Some(&b'[') {
         if let Some((label, end)) = read_bracket_label(src, bytes, i) {
-            let key = if label.trim().is_empty() {
-                normalize_label(text) // collapsed [] uses the link text
-            } else {
-                normalize_label(label)
-            };
-            let (d, t) = refmap.get(key.as_ref())?;
+            // collapsed [] uses the link text
+            let label = if label.trim().is_empty() { text } else { label };
+            let (d, t) = refmap.get(norm_key(label, norm))?;
             return Some((d.as_str(), t.as_deref(), end));
         }
         return None;
     }
     // Shortcut reference: the link text itself is the label.
-    let (d, t) = refmap.get(normalize_label(text).as_ref())?;
+    let (d, t) = refmap.get(norm_key(text, norm))?;
     Some((d.as_str(), t.as_deref(), i))
 }
 
