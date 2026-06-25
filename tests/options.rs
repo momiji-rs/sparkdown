@@ -206,4 +206,18 @@ fn autolink() {
         to_html("see http://example.com\n"),
         "<p>see http://example.com</p>\n"
     );
+    // Full path: autolinks alongside emphasis / links in the same paragraph; a
+    // URL trigger fires before any `_`/`*` in the path becomes a delimiter.
+    assert_eq!(
+        go("**bold** http://example.com\n"),
+        "<p><strong>bold</strong> <a href=\"http://example.com\">http://example.com</a></p>\n"
+    );
+    assert_eq!(
+        go("see *this*: www.x.org/p?a=1&b=2\n"),
+        "<p>see <em>this</em>: <a href=\"http://www.x.org/p?a=1&amp;b=2\">www.x.org/p?a=1&amp;b=2</a></p>\n"
+    );
+    assert_eq!(
+        go("x http://example.com/a_b yz\n"),
+        "<p>x <a href=\"http://example.com/a_b\">http://example.com/a_b</a> yz</p>\n"
+    );
 }

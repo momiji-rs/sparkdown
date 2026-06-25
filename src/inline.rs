@@ -1302,15 +1302,43 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                 i = skip_spaces(bytes, i + 1);
                 run = i;
             }
-            // Skip plain text to the next significant byte in one SIMD pass.
-            _ => {
-                let rest = &bytes[i + 1..];
-                let skip = if ST {
-                    find_inline_gfm(rest)
+            // GFM autolinks in delimiter-run text (when on). The URL trigger
+            // fires at the start, so `gfm_scan_url` swallows the whole URL —
+            // including any `_`/`*` in the path — before they become delimiters.
+            b'@' if al => {
+                if let Some((s, e)) = gfm_scan_email(bytes, i) {
+                    escape_html(&src[run..s], cur);
+                    emit_email(src, s, e, cur);
+                    i = e;
+                    run = i;
                 } else {
-                    find_inline(rest)
-                };
-                i += 1 + skip.unwrap_or(bytes.len() - i - 1);
+                    i += 1;
+                }
+            }
+            b'w' | b'W' | b'h' | b'H' if al && al_boundary(bytes, i) => {
+                if let Some(end) = gfm_scan_url(bytes, i) {
+                    escape_html(&src[run..i], cur);
+                    emit_url(src, i, end, cur);
+                    i = end;
+                    run = i;
+                } else {
+                    i += 1;
+                }
+            }
+            // Skip plain text to the next significant byte in one SIMD pass —
+            // byte-by-byte when autolink is on so the triggers above are seen.
+            _ => {
+                if al {
+                    i += 1;
+                } else {
+                    let rest = &bytes[i + 1..];
+                    let skip = if ST {
+                        find_inline_gfm(rest)
+                    } else {
+                        find_inline(rest)
+                    };
+                    i += 1 + skip.unwrap_or(bytes.len() - i - 1);
+                }
             }
         }
     }
