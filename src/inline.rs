@@ -1124,6 +1124,10 @@ pub struct Scratch {
     /// [`InlineTok`] nodes here instead of emitting HTML to `out`. `None` (the
     /// default) is the unchanged fast path — the one extra branch it adds is only
     /// compiled in `ast` builds.
+    /// PROTOTYPE (built-in heading-id transform): per-document slug→count map for
+    /// github-slugger-style de-duplication. Persists across the whole render
+    /// (cleared per document in `render_with`), unlike the per-paragraph `reset()`.
+    pub(crate) slugs: std::collections::HashMap<String, u32>,
     #[cfg(feature = "ast")]
     toks: Option<Vec<SpanTok>>,
     /// SPIKE (`ast` feature): when `true`, `render_inline` resolves the inline
@@ -1142,6 +1146,7 @@ impl Scratch {
             cur: String::with_capacity(1024),
             norm: String::with_capacity(48),
             sem: Vec::new(),
+            slugs: std::collections::HashMap::new(),
             #[cfg(feature = "ast")]
             toks: None,
             #[cfg(feature = "ast")]

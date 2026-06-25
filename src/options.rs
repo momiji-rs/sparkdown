@@ -26,6 +26,11 @@ pub struct Options {
     /// Diagram extension: render `mermaid` fenced code blocks as a client-side
     /// `<pre class="mermaid">` wrapper. Effective only with the `diagram` feature.
     pub diagram: bool,
+    /// Built-in transform (PROTOTYPE): emit a github-slugger-style `id` on every
+    /// heading during the render walk (the Rust equivalent of rehype-slug), so the
+    /// common "headings get anchors" task stays on the all-wasm fast path instead
+    /// of crossing into a JS plugin. Applied in `render.rs`; not GFM-gated.
+    pub heading_ids: bool,
 }
 
 impl Options {
@@ -58,6 +63,7 @@ impl Options {
             tables: true,
             hard_wraps: false,
             diagram: false,
+            heading_ids: false,
         }
     }
 }

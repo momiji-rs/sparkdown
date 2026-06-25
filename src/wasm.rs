@@ -104,8 +104,9 @@ pub unsafe extern "C" fn sparkdown_to_mdast_wire(ptr: *const u8, len: usize) -> 
 
 /// Like [`sparkdown_to_html`] but applies extension options from a bitmask: bit
 /// 0 strikethrough, 1 task lists, 2 autolinks, 3 tag filter, 4 tables, 5 hard
-/// wraps, 6 diagram. A bit only takes effect if the matching Cargo feature was
-/// compiled in. Built with the `gfm` feature.
+/// wraps, 6 diagram, 7 heading ids (built-in slug transform). A bit only takes
+/// effect if the matching Cargo feature was compiled in. Built with the `gfm`
+/// feature.
 ///
 /// # Safety
 /// `ptr` must point to `len` readable, initialized bytes.
@@ -122,6 +123,7 @@ pub unsafe extern "C" fn sparkdown_to_html_opts(ptr: *const u8, len: usize, flag
         tables: flags & 16 != 0,
         hard_wraps: flags & 32 != 0,
         diagram: flags & 64 != 0,
+        heading_ids: flags & 128 != 0,
     };
     RENDERER.with(|cell| {
         let mut r = cell.borrow_mut();

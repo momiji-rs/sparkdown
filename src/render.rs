@@ -25,7 +25,71 @@ pub fn render(tree: &Tree) -> String {
 /// Render `tree` into a caller-owned buffer with a caller-owned scratch — both
 /// reused across renders by [`crate::Renderer`]. The caller clears `out`.
 pub(crate) fn render_with(tree: &Tree, out: &mut String, scratch: &mut Scratch) {
+    // Per-document slug de-dup state for the built-in heading-id transform.
+    if tree.opts.heading_ids {
+        scratch.slugs.clear();
+    }
     children(tree, tree.root, out, scratch);
+}
+
+/// PROTOTYPE built-in transform: derive a github-slugger-style id from a heading's
+/// already-rendered inline HTML (strip tags, unescape the four named entities,
+/// lowercase, keep `[a-z0-9_-]` + Unicode alphanumerics, spaces→`-`), then
+/// de-duplicate with a `-N` suffix. The Rust equivalent of rehype-slug, applied
+/// in the render walk so the common "headings get anchors" task never leaves wasm.
+fn heading_slug(html: &str, seen: &mut std::collections::HashMap<String, u32>) -> String {
+    // 1. strip tags + unescape entities -> plain text
+    let mut text = String::with_capacity(html.len());
+    let mut rest = html;
+    while !rest.is_empty() {
+        let b = rest.as_bytes()[0];
+        if b == b'<' {
+            rest = rest.find('>').map_or("", |p| &rest[p + 1..]);
+        } else if b == b'&' {
+            if let Some(r) = rest.strip_prefix("&amp;") {
+                text.push('&');
+                rest = r;
+            } else if let Some(r) = rest.strip_prefix("&lt;") {
+                text.push('<');
+                rest = r;
+            } else if let Some(r) = rest.strip_prefix("&gt;") {
+                text.push('>');
+                rest = r;
+            } else if let Some(r) = rest.strip_prefix("&quot;") {
+                text.push('"');
+                rest = r;
+            } else {
+                text.push('&');
+                rest = &rest[1..];
+            }
+        } else {
+            let c = rest.chars().next().unwrap();
+            text.push(c);
+            rest = &rest[c.len_utf8()..];
+        }
+    }
+    // 2. slugify
+    let mut slug = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c == ' ' {
+            slug.push('-');
+        } else if c == '-' || c == '_' {
+            slug.push(c);
+        } else if c.is_alphanumeric() {
+            slug.extend(c.to_lowercase());
+        }
+    }
+    // 3. de-duplicate (first wins as-is; repeats get -1, -2, … like github-slugger)
+    match seen.get_mut(&slug) {
+        Some(n) => {
+            *n += 1;
+            format!("{slug}-{n}")
+        }
+        None => {
+            seen.insert(slug.clone(), 0);
+            slug
+        }
+    }
 }
 
 /// Emit a newline unless `out` is empty or already ends with one. One byte
@@ -82,8 +146,20 @@ fn render_node(tree: &Tree, idx: usize, out: &mut String, scratch: &mut Scratch)
             cr(out);
             out.push_str("<h");
             out.push((b'0' + level) as char);
-            out.push('>');
-            render_inline(tree.content(idx), out, &tree.refmap, scratch, tree.opts);
+            if tree.opts.heading_ids {
+                // Built-in transform: render the inline once into a scratch buffer,
+                // derive the id from it, then reuse the buffer (no double render).
+                let mut inner = String::new();
+                render_inline(tree.content(idx), &mut inner, &tree.refmap, scratch, tree.opts);
+                let slug = heading_slug(&inner, &mut scratch.slugs);
+                out.push_str(" id=\"");
+                out.push_str(&slug);
+                out.push_str("\">");
+                out.push_str(&inner);
+            } else {
+                out.push('>');
+                render_inline(tree.content(idx), out, &tree.refmap, scratch, tree.opts);
+            }
             out.push_str("</h");
             out.push((b'0' + level) as char);
             out.push('>');

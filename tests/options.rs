@@ -30,6 +30,28 @@ fn hard_wraps() {
 }
 
 #[test]
+fn heading_ids() {
+    let on = Options {
+        heading_ids: true,
+        ..Options::default()
+    };
+    // Off by default — no id attribute.
+    assert_eq!(to_html("# Hello\n"), "<h1>Hello</h1>\n");
+    // On: github-slugger-style slug from the heading's text content.
+    assert_eq!(to_html_with("# Hello World\n", &on), "<h1 id=\"hello-world\">Hello World</h1>\n");
+    // Inline markup is stripped for the slug; punctuation dropped, case folded.
+    assert_eq!(
+        to_html_with("## Foo, *Bar* & `Baz`!\n", &on),
+        "<h2 id=\"foo-bar--baz\">Foo, <em>Bar</em> &amp; <code>Baz</code>!</h2>\n"
+    );
+    // Duplicates get -1, -2, … suffixes (per github-slugger).
+    assert_eq!(
+        to_html_with("# dup\n\n# dup\n\n# dup\n", &on),
+        "<h1 id=\"dup\">dup</h1>\n<h1 id=\"dup-1\">dup</h1>\n<h1 id=\"dup-2\">dup</h1>\n"
+    );
+}
+
+#[test]
 fn renderer_carries_options() {
     let mut r = Renderer::with_options(Options {
         hard_wraps: true,
