@@ -41,6 +41,11 @@ emoji = []
 # and `[^label]: …` block definitions (the remark-gfm grammar). Off, none of this
 # code is compiled — the parser stays byte-for-byte the pure-CommonMark fast path.
 footnotes = []
+# Definition-lists extension (opt-in, OFF by default): a `Term` line followed by
+# `: definition` lines renders as `<dl>`/`<dt>`/`<dd>` (pandoc / remark-definition-
+# list grammar). Off, none of this heavy code is compiled — the parser stays
+# byte-for-byte the pure-CommonMark fast path.
+deflist = []
 # Mirrors rostdown: opt-in scoped global bump allocator (src/arena.rs). An
 # embedder that enables it must install `sparkdown::ScopedAlloc` as its
 # `#[global_allocator]`. The local bump (src/bump.rs) is always on.

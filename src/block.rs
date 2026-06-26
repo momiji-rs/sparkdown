@@ -941,19 +941,25 @@ impl<'a> Parser<'a> {
                 #[cfg(feature = "ast")]
                 self.compute_spread(idx);
             }
+            // Arm stays compiled (keeps the hot finalize match stable); without
+            // the `deflist` feature no `DefList` node is ever created, so the body
+            // is gated out and the arm folds into the `_ => {}` catch-all.
             Kind::DefList => {
                 // A trailing plain paragraph is a dangling term candidate (no
                 // description ever followed it); evict it to become the list's
                 // next sibling so it renders as an ordinary paragraph.
-                let lc = self.nodes[idx].last_child;
-                if lc != NO_NODE && self.nodes[lc as usize].kind == Kind::Paragraph {
-                    self.unlink(lc as usize);
-                    let after = self.nodes[idx].next_sibling;
-                    self.nodes[lc as usize].parent = parent;
-                    self.nodes[lc as usize].next_sibling = after;
-                    self.nodes[idx].next_sibling = lc;
-                    if self.nodes[parent].last_child == idx as u32 {
-                        self.nodes[parent].last_child = lc;
+                #[cfg(feature = "deflist")]
+                {
+                    let lc = self.nodes[idx].last_child;
+                    if lc != NO_NODE && self.nodes[lc as usize].kind == Kind::Paragraph {
+                        self.unlink(lc as usize);
+                        let after = self.nodes[idx].next_sibling;
+                        self.nodes[lc as usize].parent = parent;
+                        self.nodes[lc as usize].next_sibling = after;
+                        self.nodes[idx].next_sibling = lc;
+                        if self.nodes[parent].last_child == idx as u32 {
+                            self.nodes[parent].last_child = lc;
+                        }
                     }
                 }
             }
@@ -1244,8 +1250,9 @@ impl<'a> Parser<'a> {
             // Definition-list markers and directives both start with `:` (not in
             // `maybe_special`); let `:` lines through to their matchers when
             // either extension is enabled.
-            let fast_skip =
-                fast_skip && !((self.opts.deflist || self.opts.directives) && first == Some(b':'));
+            let fast_skip = fast_skip
+                && !(((Options::DEFLIST && self.opts.deflist) || self.opts.directives)
+                    && first == Some(b':'));
             if fast_skip {
                 self.advance_next_nonspace();
                 break;
@@ -1522,7 +1529,13 @@ impl<'a> Parser<'a> {
             8 => self.start_footnote_def(container),
             #[cfg(not(feature = "footnotes"))]
             8 => 0,
+            // Deflist slot keeps main's index (9); its body is the only cfg'd
+            // part — a no-op `=> 0` without the feature, so the dispatch order is
+            // byte-identical to the proven-neutral baseline.
+            #[cfg(feature = "deflist")]
             9 => self.start_def_list(container),
+            #[cfg(not(feature = "deflist"))]
+            9 => 0,
             10 => self.start_directive(),
             #[cfg(feature = "gfm")]
             11 => self.start_table(container),
@@ -1810,6 +1823,7 @@ impl<'a> Parser<'a> {
     /// further markers add more descriptions (and intervening paragraphs add more
     /// terms) to the same list. A blank line before the marker makes the
     /// description *loose* (its body is wrapped in `<p>`).
+    #[cfg(feature = "deflist")]
     fn start_def_list(&mut self, container: usize) -> u8 {
         if !self.opts.deflist || self.indented || !self.is_def_marker() {
             return 0;
@@ -1863,6 +1877,7 @@ impl<'a> Parser<'a> {
 
     /// Splice a fresh `DefList` into `parent`'s child list where `para` sits, then
     /// move `para` (already retyped as a `DefTerm`) inside it. Returns the list.
+    #[cfg(feature = "deflist")]
     fn splice_def_list(&mut self, parent: usize, para: usize) -> usize {
         let dl = self.nodes.len();
         let mut node = Node::new(Kind::DefList, parent, self.nodes[para].start_line);

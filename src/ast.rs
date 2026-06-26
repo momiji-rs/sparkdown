@@ -70,11 +70,14 @@ pub enum Mdast {
         children: Vec<Mdast>,
     },
     /// Definition list container (remark-definition-list `defList`).
+    #[cfg(feature = "deflist")]
     DefList(Vec<Mdast>),
     /// One term of a definition list (`defListTerm`); children are inline.
+    #[cfg(feature = "deflist")]
     DefListTerm(Vec<Mdast>),
     /// One description of a definition list (`defListDescription`). `spread` is
     /// true when loose; children are block content (a wrapping `paragraph`).
+    #[cfg(feature = "deflist")]
     DefListDescription {
         spread: bool,
         children: Vec<Mdast>,
@@ -428,6 +431,13 @@ fn block(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> (Mdast
                 last.unwrap_or(se),
             )
         }
+        // The deflist variants stay compiled (to keep the hot block match
+        // stable), but a node only exists with the `deflist` feature.
+        #[cfg(not(feature = "deflist"))]
+        Kind::DefList | Kind::DefTerm | Kind::DefDesc => {
+            unreachable!("DefList nodes require the `deflist` feature")
+        }
+        #[cfg(feature = "deflist")]
         Kind::DefList => {
             // Build the custom remark-definition-list shape: each term line is a
             // `defListTerm`, each `: …` line a `defListDescription` wrapping a
@@ -485,6 +495,7 @@ fn block(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> (Mdast
         }
         // Term/description nodes are built inline by their `DefList` parent; these
         // arms keep the match exhaustive and are not reached in practice.
+        #[cfg(feature = "deflist")]
         Kind::DefTerm => {
             let eb = ctx.rtrim_nl(se);
             (
@@ -493,6 +504,7 @@ fn block(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> (Mdast
                 eb,
             )
         }
+        #[cfg(feature = "deflist")]
         Kind::DefDesc => {
             let eb = ctx.rtrim_nl(se);
             let para = Mdast::Positioned(
@@ -1142,6 +1154,13 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
             w_opt(&d.title, out);
             eb
         }
+        // The deflist variants stay compiled (to keep the hot block match
+        // stable), but a node only exists with the `deflist` feature.
+        #[cfg(not(feature = "deflist"))]
+        Kind::DefList | Kind::DefTerm | Kind::DefDesc => {
+            unreachable!("DefList nodes require the `deflist` feature")
+        }
+        #[cfg(feature = "deflist")]
         Kind::DefList => {
             // tag 24 = defList; children are built from the term/description
             // nodes the same way as `block()` (terms split per line).
@@ -1264,6 +1283,7 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
             last
         }
         // Built inline by their `DefList` parent; unreachable but kept exhaustive.
+        #[cfg(feature = "deflist")]
         Kind::DefTerm => {
             let eb = ctx.rtrim_nl(se);
             out.push(25);
@@ -1274,6 +1294,7 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
             w_u32_at(out, coff, n);
             eb
         }
+        #[cfg(feature = "deflist")]
         Kind::DefDesc => {
             let eb = ctx.rtrim_nl(se);
             out.push(26);
@@ -1821,16 +1842,19 @@ fn write_json_pos(node: &Mdast, pos: Option<&Pos>, out: &mut String) {
             key("children", out);
             json_children(children, out);
         }
+        #[cfg(feature = "deflist")]
         Mdast::DefList(c) => {
             out.push_str("\"defList\",");
             key("children", out);
             json_children(c, out);
         }
+        #[cfg(feature = "deflist")]
         Mdast::DefListTerm(c) => {
             out.push_str("\"defListTerm\",");
             key("children", out);
             json_children(c, out);
         }
+        #[cfg(feature = "deflist")]
         Mdast::DefListDescription { spread, children } => {
             out.push_str("\"defListDescription\",");
             key("spread", out);
@@ -2028,14 +2052,17 @@ pub fn node_count(node: &Mdast) -> usize {
     let kids = |c: &[Mdast]| c.iter().map(node_count).sum::<usize>();
     match node {
         Root(c) | Paragraph(c) | Blockquote(c) | Emphasis(c) | Strong(c) | Delete(c)
-        | DefList(c) | DefListTerm(c) | DirectiveLabel(c) => 1 + kids(c),
+        | DirectiveLabel(c) => 1 + kids(c),
+        #[cfg(feature = "deflist")]
+        DefList(c) | DefListTerm(c) => 1 + kids(c),
+        #[cfg(feature = "deflist")]
+        DefListDescription { children, .. } => 1 + kids(children),
         #[cfg(feature = "footnotes")]
         FootnoteDefinition { children, .. } => 1 + kids(children),
         Heading { children, .. }
         | List { children, .. }
         | ListItem { children, .. }
         | Link { children, .. }
-        | DefListDescription { children, .. }
         | ContainerDirective { children, .. }
         | LeafDirective { children, .. }
         | TextDirective { children, .. }

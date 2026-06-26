@@ -99,6 +99,15 @@ impl Options {
     #[cfg(not(feature = "footnotes"))]
     pub(crate) const FOOTNOTES: bool = false;
 
+    /// `true` iff the `deflist` Cargo feature is compiled in. Used as
+    /// `Options::DEFLIST && opts.deflist` so that, without the feature, every
+    /// definition-list check folds to `false` and its code is eliminated — the
+    /// default build is byte-for-byte the pure-CommonMark fast path.
+    #[cfg(feature = "deflist")]
+    pub(crate) const DEFLIST: bool = true;
+    #[cfg(not(feature = "deflist"))]
+    pub(crate) const DEFLIST: bool = false;
+
     /// GitHub Flavored Markdown: every GFM extension enabled. (Effective only
     /// when the crate is built with the `gfm` feature.)
     pub const fn gfm() -> Self {

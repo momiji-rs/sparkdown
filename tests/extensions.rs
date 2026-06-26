@@ -140,6 +140,7 @@ mod frontmatter {
     }
 }
 
+#[cfg(feature = "deflist")]
 mod definition_lists {
     use sparkdown::{Options, to_html_with};
 
@@ -223,7 +224,7 @@ mod definition_lists {
     }
 }
 
-#[cfg(feature = "ast")]
+#[cfg(all(feature = "ast", feature = "deflist"))]
 mod definition_lists_mdast {
     use sparkdown::Options;
     use sparkdown::ast::to_mdast_json_opts;

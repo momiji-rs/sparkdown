@@ -403,15 +403,21 @@ fn render_node(tree: &Tree, idx: usize, out: &mut String, scratch: &mut Scratch)
         // Arm stays compiled (keeps the hot match stable; no node exists without
         // the feature anyway).
         Kind::FootnoteDef => {}
+        // Deflist arms stay compiled (keep the hot render match stable); without
+        // the `deflist` feature no such node exists, so the bodies are gated out.
         Kind::DefList => {
-            cr(out);
-            out.push_str("<dl>\n");
-            children(tree, idx, out, scratch);
-            out.push_str("</dl>");
-            cr(out);
+            #[cfg(feature = "deflist")]
+            {
+                cr(out);
+                out.push_str("<dl>\n");
+                children(tree, idx, out, scratch);
+                out.push_str("</dl>");
+                cr(out);
+            }
         }
         Kind::DefTerm => {
             // Each source line of the term holder renders as its own <dt>.
+            #[cfg(feature = "deflist")]
             for line in tree.content(idx).split('\n') {
                 let line = line.trim_matches([' ', '\t', '\r']);
                 if line.is_empty() {
@@ -455,16 +461,19 @@ fn render_node(tree: &Tree, idx: usize, out: &mut String, scratch: &mut Scratch)
             cr(out);
         }
         Kind::DefDesc => {
-            let body = tree.content(idx).trim_matches([' ', '\t', '\n', '\r']);
-            if node.level == 1 {
-                // Loose: a blank line preceded the marker, so wrap the body in <p>.
-                out.push_str("<dd>\n<p>");
-                render_inline(body, out, &tree.refmap, scratch, tree.opts);
-                out.push_str("</p>\n</dd>\n");
-            } else {
-                out.push_str("<dd>");
-                render_inline(body, out, &tree.refmap, scratch, tree.opts);
-                out.push_str("\n</dd>\n");
+            #[cfg(feature = "deflist")]
+            {
+                let body = tree.content(idx).trim_matches([' ', '\t', '\n', '\r']);
+                if node.level == 1 {
+                    // Loose: a blank line preceded the marker, so wrap the body in <p>.
+                    out.push_str("<dd>\n<p>");
+                    render_inline(body, out, &tree.refmap, scratch, tree.opts);
+                    out.push_str("</p>\n</dd>\n");
+                } else {
+                    out.push_str("<dd>");
+                    render_inline(body, out, &tree.refmap, scratch, tree.opts);
+                    out.push_str("\n</dd>\n");
+                }
             }
         }
         Kind::BlockQuote => {
