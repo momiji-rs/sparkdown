@@ -26,10 +26,72 @@ pub enum Kind {
     ThematicBreak,
     CodeBlock,
     HtmlBlock,
+    /// YAML (`---`) / TOML (`+++`) frontmatter at the very start of the document
+    /// (opt-in via [`Options::frontmatter`]). Renders to nothing; `level` is 0
+    /// for YAML, 1 for TOML. The content range covers the lines between the
+    /// fences (used for the mdast `yaml`/`toml` node's `value`).
+    Frontmatter,
+    /// GFM footnote definition `[^label]: …` (opt-in via [`Options::footnotes`]).
+    /// A block container (fixed 4-space content indent, lazy paragraph
+    /// continuation) carrying its label via `Node::fn_idx` → [`Tree::fn_defs`].
+    FootnoteDef,
+    /// Definition list container (`<dl>`), opt-in via [`Options::deflist`]. Holds
+    /// an alternating sequence of [`Kind::DefTerm`] and [`Kind::DefDesc`] children.
+    DefList,
+    /// Definition-list term holder: a former [`Kind::Paragraph`] reinterpreted as
+    /// the term(s) when a `: definition` line follows it. Its content may span
+    /// several lines; each line renders as one `<dt>`.
+    DefTerm,
+    /// One definition-list description (`<dd>`). A leaf that accepts lazy
+    /// continuation lines like a paragraph; `level` is 1 when loose (a blank line
+    /// preceded the `:` marker, so the body is wrapped in `<p>`), 0 when tight.
+    DefDesc,
+    /// Leaf directive `::name[label]{attrs}` (one line). Carries its payload via
+    /// `Node::fn_idx` → [`Tree::directives`]; the `[label]` is inline content.
+    LeafDirective,
+    /// Container directive `:::name[label]{attrs}` … `:::` — a block container
+    /// (its content parses as markdown). Colon-fenced like a code block
+    /// (`fence_char`/`fence_len`); payload via `Node::fn_idx`.
+    ContainerDirective,
+    /// SPIKE (`ast` feature): a link reference definition `[label]: url "title"`.
+    /// Renders to nothing (HTML output unchanged); carries an index into
+    /// [`Tree::defs`] via `Node::def` for the mdast `definition` node.
+    #[cfg(feature = "ast")]
+    Definition,
     /// GFM pipe table (opt-in). Content holds the raw rows (header, delimiter,
     /// then data rows), each `\n`-terminated; cells are parsed at render time.
     #[cfg(feature = "gfm")]
     Table,
+}
+
+/// SPIKE (`ast` feature): payload for a `definition` mdast node — all fields
+/// already decoded/normalized to match `mdast-util-from-markdown`.
+#[cfg(feature = "ast")]
+#[derive(Clone)]
+pub struct DefData {
+    pub label: String,
+    pub identifier: String,
+    pub url: String,
+    pub title: Option<String>,
+}
+
+/// Payload for a GFM `footnoteDefinition` — the raw label and its lowercased
+/// identifier (the matching key, mirroring mdast's `label`/`identifier`).
+#[derive(Clone)]
+pub struct FnDef {
+    pub label: String,
+    pub identifier: String,
+}
+
+/// Payload for a block directive (`leafDirective` / `containerDirective`): its
+/// `name`, ordered `attributes`, and the source byte range of its `[label]`
+/// content (if any). Indexed by `Node::fn_idx` (reused — a node is never both a
+/// footnote definition and a directive) into [`Tree::directives`].
+#[derive(Clone)]
+pub struct DirData {
+    pub name: String,
+    pub attrs: Vec<(String, String)>,
+    pub label: Option<(u32, u32)>,
 }
 
 #[derive(Clone)]
@@ -41,6 +103,11 @@ pub struct ListData {
     pub padding: usize,
     pub marker_offset: usize,
     pub tight: bool,
+    /// SPIKE (`ast` feature): mdast `list.spread` — a blank line occurs *between
+    /// items* (distinct from CommonMark's combined `tight`, which also folds in
+    /// blanks *within* an item; see [`Node::item_spread`]).
+    #[cfg(feature = "ast")]
+    pub spread: bool,
 }
 
 pub struct Node {
@@ -71,7 +138,35 @@ pub struct Node {
     info_start: u32,
     info_end: u32,
     html_kind: u8,
+    /// GFM footnote definition: index into [`Tree::fn_defs`] (`u32::MAX` = not a
+    /// footnote definition). Always compiled; only set for `Kind::FootnoteDef`.
+    fn_idx: u32,
     pub list: Option<ListData>,
+    /// SPIKE (`ast` feature): index into [`Tree::defs`] for `Kind::Definition`
+    /// nodes (meaningless otherwise).
+    #[cfg(feature = "ast")]
+    pub def: u32,
+    /// SPIKE (`ast` feature): mdast `listItem.spread` for `Kind::Item` nodes — a
+    /// blank line occurs between this item's own block children.
+    #[cfg(feature = "ast")]
+    pub item_spread: bool,
+    /// SPIKE (`ast` feature): end offset of an `Kind::HtmlBlock`'s mdast `value`
+    /// (which differs from the HTML-render `cend`: mdast keeps the trailing
+    /// newline for a type-1 block ended by EOF, and drops exactly one otherwise).
+    #[cfg(feature = "ast")]
+    html_ast_cend: u32,
+    /// SPIKE (`ast` feature): set when a `Kind::HtmlBlock` closed via its explicit
+    /// end condition (types 1–5) rather than EOF / a blank line.
+    #[cfg(feature = "ast")]
+    html_closed_by_cond: bool,
+    /// SPIKE (`ast` feature): the node's raw source span `[start, end)`, tracked
+    /// even after the content is materialized/de-indented into `buf`. Used to
+    /// recover reference-definition labels with their original indentation
+    /// (mdast keeps it; the de-indented buffer does not). `u32::MAX` start = unset.
+    #[cfg(feature = "ast")]
+    src_start: u32,
+    #[cfg(feature = "ast")]
+    src_end: u32,
 }
 
 impl Node {
@@ -96,7 +191,20 @@ impl Node {
             info_start: 0,
             info_end: 0,
             html_kind: 0,
+            fn_idx: u32::MAX,
             list: None,
+            #[cfg(feature = "ast")]
+            def: 0,
+            #[cfg(feature = "ast")]
+            item_spread: false,
+            #[cfg(feature = "ast")]
+            html_ast_cend: 0,
+            #[cfg(feature = "ast")]
+            html_closed_by_cond: false,
+            #[cfg(feature = "ast")]
+            src_start: u32::MAX,
+            #[cfg(feature = "ast")]
+            src_end: 0,
         }
     }
 }
@@ -111,6 +219,21 @@ pub struct Tree<'a> {
     source: &'a str,
     /// Buffer for assembled text (block quotes, lists, code/HTML literals).
     buf: String,
+    /// GFM footnote-definition payloads, indexed by `Node::fn_idx`.
+    pub fn_defs: Vec<FnDef>,
+    /// GFM footnote labels (lowercased) that have ≥1 definition — the set a
+    /// `[^label]` reference must hit to be a `footnoteReference`.
+    pub footnote_ids: std::collections::HashSet<String>,
+    /// Block-directive payloads (`Kind::LeafDirective`/`ContainerDirective`),
+    /// indexed by `Node::fn_idx`.
+    pub directives: Vec<DirData>,
+    /// SPIKE (`ast` feature): payloads for `Kind::Definition` nodes; indexed by
+    /// `Node::def`.
+    #[cfg(feature = "ast")]
+    pub defs: Vec<DefData>,
+    /// SPIKE (`ast` feature): piecewise `buf`→source map (see the parser field).
+    #[cfg(feature = "ast")]
+    pub buf_segs: Vec<(u32, u32)>,
 }
 
 impl Tree<'_> {
@@ -123,6 +246,22 @@ impl Tree<'_> {
             &self.buf
         };
         &store[n.cstart as usize..n.cend as usize]
+    }
+
+    /// GFM footnote-definition payload (label + identifier) for a
+    /// `Kind::FootnoteDef` node.
+    pub fn fn_def(&self, idx: usize) -> &FnDef {
+        &self.fn_defs[self.nodes[idx].fn_idx as usize]
+    }
+
+    /// Block-directive payload for a `Kind::LeafDirective`/`ContainerDirective`.
+    pub fn directive(&self, idx: usize) -> &DirData {
+        &self.directives[self.nodes[idx].fn_idx as usize]
+    }
+
+    /// A raw slice of the original source by byte range (e.g. a directive label).
+    pub fn source_range(&self, start: u32, end: u32) -> &str {
+        &self.source[start as usize..end as usize]
     }
 
     /// Consume the tree, returning its buffers for reuse by `parse_with`.
@@ -151,6 +290,70 @@ impl Tree<'_> {
             &self.buf
         };
         &store[n.info_start as usize..n.info_end as usize]
+    }
+
+    /// SPIKE: the 1-based source line on which node `idx` opened (0 for the
+    /// document root). Used to attach unist `position` to block nodes.
+    pub fn start_line(&self, idx: usize) -> u32 {
+        self.nodes[idx].start_line
+    }
+
+    /// SPIKE (`ast` feature): the `definition` payload of a `Kind::Definition`
+    /// node.
+    #[cfg(feature = "ast")]
+    pub fn definition(&self, idx: usize) -> &DefData {
+        &self.defs[self.nodes[idx].def as usize]
+    }
+
+    /// SPIKE (`ast` feature): map a content byte offset (relative to node `idx`'s
+    /// content) to a source byte offset. For source-borrowed content this is just
+    /// `cstart + off`; for buffered content (blockquote/list) it walks the
+    /// `buf`→source segment map.
+    #[cfg(feature = "ast")]
+    pub fn content_to_src(&self, idx: usize, off: u32) -> u32 {
+        let n = &self.nodes[idx];
+        let buf_off = n.cstart + off;
+        if n.content_src {
+            return buf_off;
+        }
+        // Largest segment whose buf_off <= buf_off; source advances 1:1 within it.
+        let i = self.buf_segs.partition_point(|&(b, _)| b <= buf_off);
+        if i == 0 {
+            return buf_off; // before any segment (shouldn't happen)
+        }
+        let (b, s) = self.buf_segs[i - 1];
+        s + (buf_off - b)
+    }
+
+    /// SPIKE (`ast` feature): a node's raw source byte span `(start, end)`.
+    /// `start == u32::MAX` means unset (e.g. a synthesized container before its
+    /// children resolve it). `end` may include a trailing newline (callers trim).
+    #[cfg(feature = "ast")]
+    pub fn src_span(&self, idx: usize) -> (u32, u32) {
+        (self.nodes[idx].src_start, self.nodes[idx].src_end)
+    }
+
+    /// SPIKE (`ast` feature): the mdast `value` of a `Kind::HtmlBlock` (keeps the
+    /// trailing newline per mdast's rule, unlike the HTML-render [`Self::content`]).
+    #[cfg(feature = "ast")]
+    pub fn html_value(&self, idx: usize) -> &str {
+        let n = &self.nodes[idx];
+        let store = if n.content_src {
+            self.source
+        } else {
+            &self.buf
+        };
+        &store[n.cstart as usize..n.html_ast_cend as usize]
+    }
+
+    /// SPIKE (`ast` feature): the mdast `position.end` source offset of a
+    /// `Kind::HtmlBlock` — where its `value` ends, mapped from content space to
+    /// source (buffered when inside a blockquote/list). The block's `src_end`
+    /// may over-include trailing blank lines, so prefer this.
+    #[cfg(feature = "ast")]
+    pub fn html_ast_end(&self, idx: usize) -> u32 {
+        let n = &self.nodes[idx];
+        self.content_to_src(idx, n.html_ast_cend - n.cstart)
     }
 }
 
@@ -208,8 +411,36 @@ struct Parser<'a> {
     indent: usize,
     indented: bool,
     blank: bool,
+    /// Whether the immediately-preceding line was blank. Used by the definition
+    /// list grammar to mark a `: definition` loose (its body wrapped in `<p>`)
+    /// when a blank line separates it from the term.
+    prev_blank: bool,
     partially_consumed_tab: bool,
     opts: Options,
+    /// GFM footnote-definition payloads, in creation order; a node's
+    /// `Node::fn_idx` indexes here.
+    fn_defs: Vec<FnDef>,
+    /// GFM footnote labels (lowercased) seen as definitions — the reference set.
+    footnote_ids: std::collections::HashSet<String>,
+    /// Block-directive payloads, in creation order; a node's `Node::fn_idx`
+    /// indexes here.
+    directives: Vec<DirData>,
+    /// SPIKE (`ast` feature): payloads for `Kind::Definition` nodes, in creation
+    /// order; a node's `Node::def` indexes here.
+    #[cfg(feature = "ast")]
+    defs: Vec<DefData>,
+    /// SPIKE (`ast` feature): piecewise `buf`→source map for buffered content
+    /// (blockquote/list, where prefixes are stripped). Each `(buf_off, src_off)`
+    /// means buf bytes from `buf_off` onward map 1:1 to source from `src_off`
+    /// (until the next entry). Lets inline nodes in buffered blocks recover exact
+    /// source positions.
+    #[cfg(feature = "ast")]
+    buf_segs: Vec<(u32, u32)>,
+    /// SPIKE (`ast` feature): set during the end-of-document finalize sweep. An
+    /// unclosed fenced code block keeps its trailing newline only when it ends at
+    /// EOF; one ended mid-document (blank line / container exit) drops it.
+    #[cfg(feature = "ast")]
+    at_eof: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -239,8 +470,18 @@ impl<'a> Parser<'a> {
             indent: 0,
             indented: false,
             blank: false,
+            prev_blank: false,
             partially_consumed_tab: false,
             opts,
+            fn_defs: Vec::new(),
+            footnote_ids: std::collections::HashSet::new(),
+            directives: Vec::new(),
+            #[cfg(feature = "ast")]
+            defs: Vec::new(),
+            #[cfg(feature = "ast")]
+            buf_segs: Vec::new(),
+            #[cfg(feature = "ast")]
+            at_eof: false,
         }
     }
 
@@ -322,9 +563,18 @@ impl<'a> Parser<'a> {
         let mut node = Node::new(kind, parent, self.line_number);
         // Paragraphs try to borrow a contiguous source slice; other leaves
         // (ATX heading, code, HTML) assemble into `buf`. Set the buffered start.
-        node.content_src = matches!(kind, Kind::Paragraph | Kind::CodeBlock | Kind::HtmlBlock);
+        node.content_src = matches!(
+            kind,
+            Kind::Paragraph | Kind::CodeBlock | Kind::HtmlBlock | Kind::DefDesc
+        );
         node.cstart = self.buf.len() as u32;
         node.cend = node.cstart;
+        // SPIKE (`ast`): the block's mdast `position.start` is its first non-space
+        // (marker for containers/atx/fences, first char for paragraphs).
+        #[cfg(feature = "ast")]
+        {
+            node.src_start = (self.line_src_start + self.next_nonspace) as u32;
+        }
         self.nodes.push(node);
         // Append to the parent's intrusive child list.
         let last = self.nodes[parent].last_child;
@@ -338,8 +588,111 @@ impl<'a> Parser<'a> {
         idx
     }
 
+    /// SPIKE (`ast` feature): create a new leaf node and splice it into the child
+    /// list immediately *before* `sibling` (same parent), preserving source
+    /// order. Used to emit `Kind::Definition` nodes ahead of the paragraph they
+    /// were stripped from. Does not touch `tip`.
+    #[cfg(feature = "ast")]
+    fn insert_before(&mut self, sibling: usize, kind: Kind) -> usize {
+        let parent = self.nodes[sibling].parent;
+        let idx = self.nodes.len();
+        self.nodes.push(Node::new(kind, parent, self.line_number));
+        let sib32 = sibling as u32;
+        if self.nodes[parent].first_child == sib32 {
+            self.nodes[parent].first_child = idx as u32;
+        } else {
+            let mut prev = self.nodes[parent].first_child;
+            while self.nodes[prev as usize].next_sibling != sib32 {
+                prev = self.nodes[prev as usize].next_sibling;
+            }
+            self.nodes[prev as usize].next_sibling = idx as u32;
+        }
+        self.nodes[idx].next_sibling = sib32;
+        idx
+    }
+
+    /// SPIKE (`ast` feature): register the leading reference definitions of a
+    /// paragraph/heading — insert each into the [`RefMap`] (first wins) and, as a
+    /// side effect, emit a `Kind::Definition` node before `before` for each.
+    /// SPIKE (`ast` feature): replace each def's label (de-indented by the buffer)
+    /// with its raw source form, so mdast's `label` keeps the original
+    /// continuation-line indentation. Only safe for **top-level** paragraphs,
+    /// whose source span is contiguous (no stripped container prefixes); nested
+    /// defs keep the buffer label (correct `identifier`, rare label-whitespace
+    /// divergence). No-op unless the source re-parse yields the same def count.
+    #[cfg(feature = "ast")]
+    fn recover_raw_labels(&self, node: usize, defs: &mut [(String, String, Option<String>)]) {
+        if self.nodes[node].parent != 0 {
+            return;
+        }
+        let (ss, se) = (self.nodes[node].src_start, self.nodes[node].src_end);
+        if ss == u32::MAX || ss >= se || (se as usize) > self.source.len() {
+            return;
+        }
+        let src_defs = take_ref_defs(&self.source[ss as usize..se as usize]).1;
+        if src_defs.len() == defs.len() {
+            for (d, sd) in defs.iter_mut().zip(src_defs) {
+                d.0 = sd.0;
+            }
+        }
+    }
+
+    #[cfg(feature = "ast")]
+    fn emit_defs(&mut self, before: usize, defs: Vec<(String, String, Option<String>)>) {
+        // For a top-level paragraph (contiguous in source), recover each def's
+        // exact source span; otherwise approximate with the paragraph's span.
+        let (ss, se) = (self.nodes[before].src_start, self.nodes[before].src_end);
+        let spans = if self.nodes[before].parent == 0
+            && ss != u32::MAX
+            && ss < se
+            && (se as usize) <= self.source.len()
+        {
+            let s = crate::inline::take_ref_def_spans(&self.source[ss as usize..se as usize]);
+            (s.len() == defs.len()).then_some(s)
+        } else {
+            None
+        };
+        for (i, (label, dest, title)) in defs.into_iter().enumerate() {
+            let identifier = crate::inline::normalize_label(&label).into_owned();
+            let di = self.defs.len() as u32;
+            self.defs.push(DefData {
+                label: crate::inline::unescape_string(&label).into_owned(),
+                identifier: identifier.clone(),
+                url: crate::inline::unescape_string(&dest).into_owned(),
+                title: title
+                    .as_deref()
+                    .map(|t| crate::inline::unescape_string(t).into_owned()),
+            });
+            let dn = self.insert_before(before, Kind::Definition);
+            self.nodes[dn].def = di;
+            match &spans {
+                Some(sp) => {
+                    self.nodes[dn].src_start = ss + sp[i].0 as u32;
+                    self.nodes[dn].src_end = ss + sp[i].1 as u32;
+                }
+                None => {
+                    self.nodes[dn].src_start = self.nodes[before].src_start;
+                    self.nodes[dn].src_end = self.nodes[before].src_end;
+                }
+            }
+            self.refmap.entry(identifier).or_insert((dest, title));
+        }
+    }
+
     fn add_line(&mut self) {
         let tip = self.tip;
+        // SPIKE (`ast`): remember the raw source span (survives materialization),
+        // for recovering ref-def labels with their original indentation.
+        #[cfg(feature = "ast")]
+        {
+            let line_end = self.line_src_start + self.line.len();
+            let nl = (line_end < self.source.len() && self.source.as_bytes()[line_end] == b'\n')
+                as usize;
+            if self.nodes[tip].src_start == u32::MAX {
+                self.nodes[tip].src_start = (self.line_src_start + self.offset) as u32;
+            }
+            self.nodes[tip].src_end = (line_end + nl) as u32;
+        }
         // Try to (keep) borrowing a contiguous slice of the source. Borrowed
         // ranges include each line's trailing newline (so code/HTML literals,
         // which need it, work); the contiguous next line begins exactly at the
@@ -371,6 +724,14 @@ impl<'a> Parser<'a> {
                 self.buf.push(' ');
             }
         }
+        // SPIKE (`ast`): `rest` (after prefix stripping) maps 1:1 to source from
+        // `line_src_start + offset` — record the breakpoint so inline nodes in
+        // buffered blocks recover source positions.
+        #[cfg(feature = "ast")]
+        self.buf_segs.push((
+            self.buf.len() as u32,
+            (self.line_src_start + self.offset) as u32,
+        ));
         let rest = &self.line[self.offset..];
         // line never contains an embedded NUL; push as UTF-8.
         self.buf.push_str(std::str::from_utf8(rest).unwrap_or(""));
@@ -388,11 +749,25 @@ impl<'a> Parser<'a> {
         );
         let start = self.buf.len();
         if s != e {
+            // SPIKE (`ast`): the copied prefix maps 1:1 to source `[s, e)`.
+            #[cfg(feature = "ast")]
+            self.buf_segs.push((start as u32, s as u32));
             self.buf.push_str(&self.source[s..e]);
         }
         self.nodes[tip].content_src = false;
         self.nodes[tip].cstart = start as u32;
         self.nodes[tip].cend = self.buf.len() as u32;
+    }
+
+    /// SPIKE (`ast`): map a `buf` byte offset to source via the segment map.
+    #[cfg(feature = "ast")]
+    fn map_buf_off(&self, buf_off: u32) -> u32 {
+        let i = self.buf_segs.partition_point(|&(b, _)| b <= buf_off);
+        if i == 0 {
+            return buf_off;
+        }
+        let (b, s) = self.buf_segs[i - 1];
+        s + (buf_off - b)
     }
 
     fn close_unmatched_blocks(&mut self) {
@@ -434,8 +809,17 @@ impl<'a> Parser<'a> {
                     let empty = body.trim_matches(['\n', ' ', '\t']).is_empty();
                     (lead, off, defs, empty, hl, inner.len())
                 };
+                #[cfg(feature = "ast")]
+                {
+                    let mut defs = defs;
+                    self.recover_raw_labels(idx, &mut defs);
+                    self.emit_defs(idx, defs);
+                }
+                #[cfg(not(feature = "ast"))]
                 for (label, dest, title) in defs {
-                    self.refmap.entry(label).or_insert((dest, title));
+                    self.refmap
+                        .entry(crate::inline::normalize_label(&label).into_owned())
+                        .or_insert((dest, title));
                 }
                 let bs = s + lead + off;
                 if empty {
@@ -443,6 +827,13 @@ impl<'a> Parser<'a> {
                 } else {
                     self.nodes[idx].cstart = (bs + hl) as u32;
                     self.nodes[idx].cend = (bs + hl + inner_len) as u32;
+                    // SPIKE (`ast`): leading defs shift the paragraph's start past
+                    // the (now-stripped) definition lines.
+                    #[cfg(feature = "ast")]
+                    {
+                        let cs = (bs + hl) as u32;
+                        self.nodes[idx].src_start = if csrc { cs } else { self.map_buf_off(cs) };
+                    }
                 }
             }
             Kind::Heading => {
@@ -473,6 +864,21 @@ impl<'a> Parser<'a> {
                     self.nodes[idx].info_start = ts as u32;
                     self.nodes[idx].info_end = te as u32;
                     self.nodes[idx].cstart = (s + nl + 1).min(e) as u32;
+                    // SPIKE (`ast`): an unclosed fenced block ended mid-document
+                    // (blank line / container exit) drops its trailing newline;
+                    // one ended at EOF (or by its closing fence) keeps its span.
+                    #[cfg(feature = "ast")]
+                    if !self.at_eof {
+                        let se = self.nodes[idx].src_end as usize;
+                        let b = self.source.as_bytes();
+                        if se > 0 && b[se - 1] == b'\n' {
+                            let mut x = se - 1;
+                            if x > 0 && b[x - 1] == b'\r' {
+                                x -= 1;
+                            }
+                            self.nodes[idx].src_end = x as u32;
+                        }
+                    }
                 } else {
                     let keep = {
                         let store: &str = if csrc { self.source } else { &self.buf };
@@ -487,12 +893,53 @@ impl<'a> Parser<'a> {
                     let store: &str = if csrc { self.source } else { &self.buf };
                     html_trim_end(&store[s..e])
                 };
+                // mdast `value` differs from the trimmed HTML-render content: a
+                // type-1 block (`<script>`/`<style>`/`<pre>`) ended by EOF keeps
+                // its raw span verbatim; every other block drops exactly the
+                // final line ending.
+                #[cfg(feature = "ast")]
+                {
+                    let store: &str = if csrc { self.source } else { &self.buf };
+                    let bytes = store.as_bytes();
+                    let ast_end =
+                        if self.nodes[idx].html_kind == 1 && !self.nodes[idx].html_closed_by_cond {
+                            e
+                        } else {
+                            let mut x = e;
+                            if x > s && bytes[x - 1] == b'\n' {
+                                x -= 1;
+                                if x > s && bytes[x - 1] == b'\r' {
+                                    x -= 1;
+                                }
+                            }
+                            x
+                        };
+                    self.nodes[idx].html_ast_cend = ast_end as u32;
+                }
                 self.nodes[idx].cend = (s + keep) as u32;
             }
             Kind::List => {
                 let tight = self.compute_tight(idx);
                 if let Some(ld) = &mut self.nodes[idx].list {
                     ld.tight = tight;
+                }
+                #[cfg(feature = "ast")]
+                self.compute_spread(idx);
+            }
+            Kind::DefList => {
+                // A trailing plain paragraph is a dangling term candidate (no
+                // description ever followed it); evict it to become the list's
+                // next sibling so it renders as an ordinary paragraph.
+                let lc = self.nodes[idx].last_child;
+                if lc != NO_NODE && self.nodes[lc as usize].kind == Kind::Paragraph {
+                    self.unlink(lc as usize);
+                    let after = self.nodes[idx].next_sibling;
+                    self.nodes[lc as usize].parent = parent;
+                    self.nodes[lc as usize].next_sibling = after;
+                    self.nodes[idx].next_sibling = lc;
+                    if self.nodes[parent].last_child == idx as u32 {
+                        self.nodes[parent].last_child = lc;
+                    }
                 }
             }
             _ => {}
@@ -545,6 +992,40 @@ impl<'a> Parser<'a> {
         true
     }
 
+    /// SPIKE (`ast` feature): split CommonMark's combined looseness into mdast's
+    /// two spread bits — `list.spread` (blank *between* items) on the list, and
+    /// `listItem.spread` (blank *between an item's own block children*) on each
+    /// item. The disjunction `list.spread || any(item.spread)` equals
+    /// `!compute_tight`, so HTML rendering (which uses `tight`) is unaffected.
+    #[cfg(feature = "ast")]
+    fn compute_spread(&mut self, list: usize) {
+        let mut list_spread = false;
+        let mut item = self.nodes[list].first_child;
+        while item != NO_NODE {
+            let iu = item as usize;
+            let item_last = self.nodes[iu].next_sibling == NO_NODE;
+            // A blank after a non-last item ⇒ the list is spread.
+            if !item_last && self.ends_with_blank_line(iu) {
+                list_spread = true;
+            }
+            // A blank between two of an item's own block children ⇒ item spread.
+            let mut item_spread = false;
+            let mut sub = self.nodes[iu].first_child;
+            while sub != NO_NODE {
+                let sub_last = self.nodes[sub as usize].next_sibling == NO_NODE;
+                if !sub_last && self.ends_with_blank_line(sub as usize) {
+                    item_spread = true;
+                }
+                sub = self.nodes[sub as usize].next_sibling;
+            }
+            self.nodes[iu].item_spread = item_spread;
+            item = self.nodes[iu].next_sibling;
+        }
+        if let Some(ld) = &mut self.nodes[list].list {
+            ld.spread = list_spread;
+        }
+    }
+
     fn ends_with_blank_line(&self, mut idx: usize) -> bool {
         loop {
             if self.nodes[idx].last_line_blank {
@@ -562,6 +1043,74 @@ impl<'a> Parser<'a> {
         }
     }
 
+    // ---- frontmatter (document-prefix grammar) --------------------------
+
+    /// Detect and consume a leading YAML (`---`) / TOML (`+++`) frontmatter
+    /// block. Returns the byte offset to resume the block loop at (just past the
+    /// closing fence line), or `None` if the input does not open with a
+    /// *complete* frontmatter block — in which case nothing is consumed and the
+    /// fence text parses normally (an unmatched `---` becomes a thematic break).
+    fn try_frontmatter(&mut self, bytes: &[u8]) -> Option<usize> {
+        // The opening fence is the very first line, unindented, exactly three
+        // `-`/`+` markers then only trailing spaces/tabs.
+        let first_end = memchr1(bytes, b'\n').map_or(bytes.len(), |p| p);
+        let first = trim_cr(&bytes[..first_end]);
+        let marker = match first.first()? {
+            b'-' => b'-',
+            b'+' => b'+',
+            _ => return None,
+        };
+        if !is_fm_fence(first, marker) {
+            return None;
+        }
+        // A closing fence is required; without a newline after the opener there
+        // can be no second line, so this is not frontmatter.
+        if first_end >= bytes.len() {
+            return None;
+        }
+        let content_start = first_end + 1;
+        let mut pos = content_start;
+        let mut lines = 1u32; // the opening fence line
+        while pos < bytes.len() {
+            let end = memchr1(&bytes[pos..], b'\n').map_or(bytes.len(), |p| pos + p);
+            let line = trim_cr(&bytes[pos..end]);
+            lines += 1;
+            if is_fm_fence(line, marker) {
+                // `cend` is the raw start of the closing line; `src_end` is the
+                // end of the closing fence's content (incl. trailing spaces,
+                // excl. the line ending) — mdast keeps a frontmatter's trailing
+                // spaces but not its newline.
+                self.push_frontmatter(marker, content_start, pos, pos + line.len());
+                self.line_number = lines;
+                return Some((end + 1).min(bytes.len()));
+            }
+            pos = end + 1;
+        }
+        None
+    }
+
+    /// Create the frontmatter node as the document's (already empty) first child.
+    /// It is born closed — block phase 1 never descends into it.
+    fn push_frontmatter(&mut self, marker: u8, cstart: usize, cend: usize, src_end: usize) {
+        let idx = self.nodes.len();
+        let mut node = Node::new(Kind::Frontmatter, 0, 1);
+        node.open = false;
+        node.content_src = true;
+        node.cstart = cstart as u32;
+        node.cend = cend as u32;
+        node.level = if marker == b'+' { 1 } else { 0 }; // 0 = yaml, 1 = toml
+        #[cfg(feature = "ast")]
+        {
+            node.src_start = 0;
+            node.src_end = src_end as u32;
+        }
+        #[cfg(not(feature = "ast"))]
+        let _ = src_end;
+        self.nodes.push(node);
+        self.nodes[0].first_child = idx as u32;
+        self.nodes[0].last_child = idx as u32;
+    }
+
     // ---- main loop ------------------------------------------------------
 
     fn parse(mut self, src: &'a str) -> Tree<'a> {
@@ -574,11 +1123,24 @@ impl<'a> Parser<'a> {
         // a Vec of every line — no big allocation, one pass, vectorized split.
         let bytes = src.as_bytes();
         let mut start = 0;
+        // Frontmatter is a document-prefix grammar: a `---`/`+++` fence pair at
+        // the very first byte. Consumed before the block loop so the rest parses
+        // normally (and `---` only becomes a thematic break when there is no
+        // matching close).
+        if self.opts.frontmatter
+            && let Some(resume) = self.try_frontmatter(bytes)
+        {
+            start = resume;
+        }
         while start < bytes.len() {
             let end = memchr1(&bytes[start..], b'\n').map_or(bytes.len(), |p| start + p);
             self.line_src_start = start;
             self.incorporate_line(&bytes[start..end]);
             start = end + 1;
+        }
+        #[cfg(feature = "ast")]
+        {
+            self.at_eof = true;
         }
         while self.tip != 0 {
             let t = self.tip;
@@ -593,6 +1155,13 @@ impl<'a> Parser<'a> {
             opts: self.opts,
             source: src,
             buf: self.buf,
+            fn_defs: self.fn_defs,
+            footnote_ids: self.footnote_ids,
+            directives: self.directives,
+            #[cfg(feature = "ast")]
+            defs: self.defs,
+            #[cfg(feature = "ast")]
+            buf_segs: self.buf_segs,
         }
     }
 
@@ -619,7 +1188,10 @@ impl<'a> Parser<'a> {
                 1 => {
                     all_matched = false;
                 }
-                2 => return, // line fully consumed (code block)
+                2 => {
+                    self.prev_blank = self.blank; // line fully consumed (code block)
+                    return;
+                }
                 _ => unreachable!(),
             }
             if !all_matched {
@@ -647,6 +1219,14 @@ impl<'a> Parser<'a> {
             #[cfg(feature = "gfm")]
             let fast_skip =
                 fast_skip && !(self.opts.tables && matches!(first, Some(b'|') | Some(b':')));
+            // A footnote definition starts with `[` (not in `maybe_special`); keep
+            // the fast skip on for `[` lines unless footnotes are enabled.
+            let fast_skip = fast_skip && !(self.opts.footnotes && first == Some(b'['));
+            // Definition-list markers and directives both start with `:` (not in
+            // `maybe_special`); let `:` lines through to their matchers when
+            // either extension is enabled.
+            let fast_skip =
+                fast_skip && !((self.opts.deflist || self.opts.directives) && first == Some(b':'));
             if fast_skip {
                 self.advance_next_nonspace();
                 break;
@@ -684,6 +1264,29 @@ impl<'a> Parser<'a> {
             {
                 self.nodes[lc].last_line_blank = true;
             }
+            // SPIKE (`ast`): a blank line carrying blockquote markers (e.g. ">>")
+            // is absorbed by an open ancestor list — mdast extends the list's
+            // position through it. (A bare blank line at the top level is not.)
+            #[cfg(feature = "ast")]
+            if self.blank {
+                let mut list = usize::MAX;
+                let mut in_bq = false;
+                let mut n = self.tip;
+                loop {
+                    match self.nodes[n].kind {
+                        Kind::List if list == usize::MAX => list = n,
+                        Kind::BlockQuote => in_bq = true,
+                        _ => {}
+                    }
+                    if n == 0 {
+                        break;
+                    }
+                    n = self.nodes[n].parent;
+                }
+                if list != usize::MAX && in_bq {
+                    self.nodes[list].src_end = (self.line_src_start + self.line.len()) as u32;
+                }
+            }
             let t = self.nodes[container].kind;
             let last_line_blank = self.blank
                 && !(t == Kind::BlockQuote
@@ -704,6 +1307,10 @@ impl<'a> Parser<'a> {
                 self.add_line();
                 if t == Kind::HtmlBlock && self.html_block_closes(container) {
                     let cur = container;
+                    #[cfg(feature = "ast")]
+                    {
+                        self.nodes[cur].html_closed_by_cond = true;
+                    }
                     self.finalize(cur);
                 }
             } else if self.offset < self.line.len() && !self.blank {
@@ -712,6 +1319,7 @@ impl<'a> Parser<'a> {
                 self.add_line();
             }
         }
+        self.prev_blank = self.blank;
     }
 
     // ---- continuation per block kind ------------------------------------
@@ -720,12 +1328,39 @@ impl<'a> Parser<'a> {
     fn continue_block(&mut self, c: usize) -> u8 {
         match self.nodes[c].kind {
             Kind::Document => 0,
+            // Frontmatter is consumed in a pre-pass and born closed, so it is
+            // never an open container here; treat as not-matched defensively.
+            Kind::Frontmatter => 1,
+            // Footnote definition: a block container with a fixed 4-space content
+            // indent (one tab stop), lazy paragraph continuation, and blank lines
+            // tolerated once it has content (mirrors a list item with padding 4).
+            Kind::FootnoteDef => {
+                if self.blank {
+                    if self.nodes[c].first_child == NO_NODE {
+                        1
+                    } else {
+                        self.advance_next_nonspace();
+                        0
+                    }
+                } else if self.indent >= 4 {
+                    self.advance_offset(4, true);
+                    0
+                } else {
+                    1
+                }
+            }
             Kind::BlockQuote => {
                 if !self.indented && peek(self.line, self.next_nonspace) == Some(b'>') {
                     self.advance_next_nonspace();
                     self.advance_offset(1, false);
                     if is_space_or_tab(peek(self.line, self.offset)) {
                         self.advance_offset(1, true);
+                    }
+                    // SPIKE (`ast`): the blockquote spans through its last
+                    // `>`-marked line (incl. trailing blank `>` lines).
+                    #[cfg(feature = "ast")]
+                    {
+                        self.nodes[c].src_end = (self.line_src_start + self.line.len()) as u32;
                     }
                     0
                 } else {
@@ -759,7 +1394,46 @@ impl<'a> Parser<'a> {
                     0
                 }
             }
+            // A definition list stays open across blanks and intervening term
+            // paragraphs; it closes only when a block that cannot be its child
+            // forces it shut (handled by `add_child`) or at EOF.
+            Kind::DefList => 0,
+            // A description accepts lazy continuation lines like a paragraph, but
+            // a blank line or a fresh `:` marker ends it (the marker then opens a
+            // sibling description via `start_def_list`).
+            Kind::DefDesc => {
+                if self.blank || self.is_def_marker() {
+                    1
+                } else {
+                    0
+                }
+            }
+            // Term holders are closed the moment their description is attached, so
+            // they are never re-entered as an open container.
+            Kind::DefTerm => 1,
+            // A container directive runs until its closing colon fence (a line of
+            // ≥ the opening colon count); otherwise its content flows in as
+            // markdown with no prefix stripping.
+            Kind::ContainerDirective => {
+                if !self.indented
+                    && is_colon_close(self.line, self.next_nonspace, self.nodes[c].fence_len)
+                {
+                    let cur = c;
+                    #[cfg(feature = "ast")]
+                    {
+                        self.nodes[cur].src_end = (self.line_src_start + self.line.len()) as u32;
+                    }
+                    self.finalize(cur);
+                    return 2;
+                }
+                0
+            }
+            // Leaf directives are single-line, born closed; never re-entered.
+            Kind::LeafDirective => 1,
             Kind::Heading | Kind::ThematicBreak => 1,
+            // Definitions are inserted already-closed (never an open container).
+            #[cfg(feature = "ast")]
+            Kind::Definition => 1,
             Kind::CodeBlock => {
                 if self.nodes[c].fenced {
                     let fc = self.nodes[c].fence_char;
@@ -767,6 +1441,13 @@ impl<'a> Parser<'a> {
                     let fo = self.nodes[c].fence_offset;
                     if !self.indented && is_closing_fence(self.line, self.next_nonspace, fc, fl) {
                         let cur = c;
+                        // SPIKE (`ast`): a fenced block spans through its closing
+                        // fence line (mdast includes the closing fence).
+                        #[cfg(feature = "ast")]
+                        {
+                            self.nodes[cur].src_end =
+                                (self.line_src_start + self.line.len()) as u32;
+                        }
                         self.finalize(cur);
                         return 2;
                     }
@@ -814,8 +1495,11 @@ impl<'a> Parser<'a> {
             5 => self.start_thematic_break(),
             6 => self.start_list_item(container),
             7 => self.start_indented_code(),
+            8 => self.start_footnote_def(container),
+            9 => self.start_def_list(container),
+            10 => self.start_directive(),
             #[cfg(feature = "gfm")]
-            8 => self.start_table(container),
+            11 => self.start_table(container),
             _ => 0,
         }
     }
@@ -828,7 +1512,12 @@ impl<'a> Parser<'a> {
                 self.advance_offset(1, true);
             }
             self.close_unmatched_blocks();
-            self.add_child(Kind::BlockQuote);
+            let bq = self.add_child(Kind::BlockQuote);
+            #[cfg(feature = "ast")]
+            {
+                self.nodes[bq].src_end = (self.line_src_start + self.line.len()) as u32;
+            }
+            let _ = bq;
             1
         } else {
             0
@@ -858,9 +1547,22 @@ impl<'a> Parser<'a> {
         let after = std::str::from_utf8(&self.line[self.offset..]).unwrap_or("");
         let content = atx_content(after);
         let start = self.buf.len() as u32;
+        // SPIKE (`ast`): the heading text maps 1:1 to its source slice; record the
+        // breakpoint (content is a subslice of `self.line`).
+        #[cfg(feature = "ast")]
+        if !content.is_empty() {
+            let coff = content.as_ptr() as usize - self.line.as_ptr() as usize;
+            self.buf_segs
+                .push((start, (self.line_src_start + coff) as u32));
+        }
         self.buf.push_str(content);
         self.nodes[h].cstart = start;
         self.nodes[h].cend = self.buf.len() as u32;
+        // SPIKE (`ast`): atx heading spans the whole line (markers included).
+        #[cfg(feature = "ast")]
+        {
+            self.nodes[h].src_end = (self.line_src_start + self.line.len()) as u32;
+        }
         self.advance_offset(self.line.len() - self.offset, false);
         2
     }
@@ -896,6 +1598,11 @@ impl<'a> Parser<'a> {
         self.close_unmatched_blocks();
         let h = self.add_child(Kind::HtmlBlock);
         self.nodes[h].html_kind = kind;
+        // mdast html block starts at the line content region (incl. leading indent).
+        #[cfg(feature = "ast")]
+        {
+            self.nodes[h].src_start = (self.line_src_start + self.offset) as u32;
+        }
         2
     }
 
@@ -920,16 +1627,31 @@ impl<'a> Parser<'a> {
                 .is_empty();
             (lead, off, defs, empty)
         };
-        for (label, dest, title) in defs {
-            self.refmap.entry(label).or_insert((dest, title));
-        }
         if empty {
-            return 0; // only reference definitions; not a heading
+            // Only reference definitions: not a heading. Leave them in place —
+            // the paragraph's `finalize` registers/emits them (emitting here too
+            // would duplicate the `definition` node).
+            return 0;
+        }
+        // Becomes a heading: the defs are stripped from the heading content
+        // below, so register/emit them now (finalize won't see them).
+        #[cfg(feature = "ast")]
+        self.emit_defs(container, defs);
+        #[cfg(not(feature = "ast"))]
+        for (label, dest, title) in defs {
+            self.refmap
+                .entry(crate::inline::normalize_label(&label).into_owned())
+                .or_insert((dest, title));
         }
         // Reuse the paragraph node as the heading (its finalize trims the range).
         self.nodes[container].kind = Kind::Heading;
         self.nodes[container].level = level;
         self.nodes[container].cstart = (s + lead + off) as u32;
+        // SPIKE (`ast`): a setext heading spans through its underline line.
+        #[cfg(feature = "ast")]
+        {
+            self.nodes[container].src_end = (self.line_src_start + self.line.len()) as u32;
+        }
         self.advance_offset(self.line.len() - self.offset, false);
         2
     }
@@ -966,7 +1688,12 @@ impl<'a> Parser<'a> {
         }
         if is_thematic_break(&self.line[self.next_nonspace..]) {
             self.close_unmatched_blocks();
-            self.add_child(Kind::ThematicBreak);
+            let tb = self.add_child(Kind::ThematicBreak);
+            #[cfg(feature = "ast")]
+            {
+                self.nodes[tb].src_end = (self.line_src_start + self.line.len()) as u32;
+            }
+            let _ = tb;
             self.advance_offset(self.line.len() - self.offset, false);
             2
         } else {
@@ -995,15 +1722,228 @@ impl<'a> Parser<'a> {
         }
         let item = self.add_child(Kind::Item);
         self.nodes[item].list = Some(data);
+        // SPIKE (`ast`): default an empty item's end to the end of its marker
+        // line (mdast keeps trailing spaces after the marker, e.g. "-   ").
+        // Non-empty items override this with their last child's end.
+        #[cfg(feature = "ast")]
+        {
+            self.nodes[item].src_end = (self.line_src_start + self.line.len()) as u32;
+        }
         1
+    }
+
+    /// GFM footnote definition `[^label]: …`. A flow construct: it interrupts an
+    /// open paragraph. Opens a `FootnoteDef` container; the remaining line content
+    /// flows into it as a paragraph via the normal machinery.
+    fn start_footnote_def(&mut self, _container: usize) -> u8 {
+        if !self.opts.footnotes || self.indented {
+            return 0;
+        }
+        let rest = &self.line[self.next_nonspace..];
+        let Some((label, consumed)) = parse_footnote_label_def(rest) else {
+            return 0;
+        };
+        self.close_unmatched_blocks();
+        #[cfg(feature = "ast")]
+        let src_start = (self.line_src_start + self.next_nonspace) as u32;
+        let fnode = self.add_child(Kind::FootnoteDef);
+        let identifier = label.to_lowercase();
+        let fi = self.fn_defs.len() as u32;
+        self.fn_defs.push(FnDef {
+            label,
+            identifier: identifier.clone(),
+        });
+        self.nodes[fnode].fn_idx = fi;
+        self.footnote_ids.insert(identifier);
+        #[cfg(feature = "ast")]
+        {
+            self.nodes[fnode].src_start = src_start;
+            self.nodes[fnode].src_end = (self.line_src_start + self.line.len()) as u32;
+        }
+        // Consume `[^label]:` and a single optional following space/tab; the rest
+        // of the line becomes the definition's first paragraph.
+        self.advance_next_nonspace();
+        self.advance_offset(consumed, false);
+        if is_space_or_tab(peek(self.line, self.offset)) {
+            self.advance_offset(1, true);
+        }
+        1
+    }
+
+    /// Is the current line a definition-list marker — `:` (≤3 spaces indent)
+    /// followed by a space or tab?
+    fn is_def_marker(&self) -> bool {
+        !self.indented
+            && peek(self.line, self.next_nonspace) == Some(b':')
+            && is_space_or_tab(peek(self.line, self.next_nonspace + 1))
+    }
+
+    /// Definition list (pandoc / remark-definition-list). A `: definition` line
+    /// attaches a description to the preceding term paragraph, opening a `<dl>`;
+    /// further markers add more descriptions (and intervening paragraphs add more
+    /// terms) to the same list. A blank line before the marker makes the
+    /// description *loose* (its body is wrapped in `<p>`).
+    fn start_def_list(&mut self, container: usize) -> u8 {
+        if !self.opts.deflist || self.indented || !self.is_def_marker() {
+            return 0;
+        }
+        let loose = self.prev_blank;
+        match self.nodes[container].kind {
+            // An open paragraph directly above the marker is the term (tight). It
+            // may already sit inside an open list (a second term/def group).
+            Kind::Paragraph => {
+                let para = container;
+                let parent = self.nodes[para].parent;
+                self.nodes[para].kind = Kind::DefTerm;
+                self.nodes[para].open = false;
+                self.tip = if self.nodes[parent].kind == Kind::DefList {
+                    parent
+                } else {
+                    self.splice_def_list(parent, para)
+                };
+            }
+            // The marker continues an open list (e.g. `Term\n: a\n: b`): another
+            // description for the most recent term.
+            Kind::DefList => {
+                self.close_unmatched_blocks();
+                self.tip = container;
+            }
+            // A blank line separated the term from the marker, so the term is the
+            // container's (closed) last-child paragraph — a loose description.
+            _ => {
+                let Some(lc) = self.last_child(container) else {
+                    return 0;
+                };
+                if self.nodes[lc].kind != Kind::Paragraph {
+                    return 0;
+                }
+                self.nodes[lc].kind = Kind::DefTerm;
+                self.nodes[lc].open = false;
+                self.tip = self.splice_def_list(container, lc);
+            }
+        }
+        let dd = self.add_child(Kind::DefDesc);
+        self.nodes[dd].level = u8::from(loose);
+        // Consume `:` and one optional space/tab; the rest of the line flows into
+        // the description as its first content line.
+        self.advance_next_nonspace();
+        self.advance_offset(1, false);
+        if is_space_or_tab(peek(self.line, self.offset)) {
+            self.advance_offset(1, true);
+        }
+        2
+    }
+
+    /// Splice a fresh `DefList` into `parent`'s child list where `para` sits, then
+    /// move `para` (already retyped as a `DefTerm`) inside it. Returns the list.
+    fn splice_def_list(&mut self, parent: usize, para: usize) -> usize {
+        let dl = self.nodes.len();
+        let mut node = Node::new(Kind::DefList, parent, self.nodes[para].start_line);
+        #[cfg(feature = "ast")]
+        {
+            node.src_start = self.nodes[para].src_start;
+            node.src_end = self.nodes[para].src_end;
+        }
+        node.first_child = para as u32;
+        node.last_child = para as u32;
+        node.next_sibling = self.nodes[para].next_sibling;
+        self.nodes.push(node);
+        let (dl32, para32) = (dl as u32, para as u32);
+        if self.nodes[parent].first_child == para32 {
+            self.nodes[parent].first_child = dl32;
+        } else {
+            let mut prev = self.nodes[parent].first_child;
+            while self.nodes[prev as usize].next_sibling != para32 {
+                prev = self.nodes[prev as usize].next_sibling;
+            }
+            self.nodes[prev as usize].next_sibling = dl32;
+        }
+        if self.nodes[parent].last_child == para32 {
+            self.nodes[parent].last_child = dl32;
+        }
+        self.nodes[para].parent = dl;
+        self.nodes[para].next_sibling = NO_NODE;
+        dl
+    }
+
+    /// Block directives (remark-directive): a leaf `::name…` (one line) or a
+    /// container `:::name…` … `:::`. The leading colon run selects the form (2 =
+    /// leaf, ≥3 = container). The header (`name[label]{attrs}`) is parsed once and
+    /// stashed in `directives`; the opening line must hold nothing but the header.
+    fn start_directive(&mut self) -> u8 {
+        if !self.opts.directives || self.indented {
+            return 0;
+        }
+        let line = self.line;
+        let rest = &line[self.next_nonspace..];
+        let mut colons = 0;
+        while colons < rest.len() && rest[colons] == b':' {
+            colons += 1;
+        }
+        if colons < 2 {
+            return 0;
+        }
+        let Some(h) = crate::directive::parse_header(&rest[colons..]) else {
+            return 0;
+        };
+        // The remainder of the opening line must be blank (header only).
+        if rest[colons + h.consumed..]
+            .iter()
+            .any(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+        {
+            return 0;
+        }
+        let name =
+            String::from_utf8_lossy(&rest[colons + h.name_start..colons + h.name_end]).into_owned();
+        let base = self.line_src_start + self.next_nonspace + colons;
+        let label = h.label.map(|(s, e)| ((base + s) as u32, (base + e) as u32));
+        let di = self.directives.len() as u32;
+        self.directives.push(DirData {
+            name,
+            attrs: h.attrs,
+            label,
+        });
+        self.close_unmatched_blocks();
+        #[cfg(feature = "ast")]
+        let src_start = (self.line_src_start + self.next_nonspace) as u32;
+        let kind = if colons == 2 {
+            Kind::LeafDirective
+        } else {
+            Kind::ContainerDirective
+        };
+        let node = self.add_child(kind);
+        self.nodes[node].fn_idx = di;
+        if colons >= 3 {
+            self.nodes[node].fenced = true;
+            self.nodes[node].fence_char = b':';
+            self.nodes[node].fence_len = colons;
+        }
+        #[cfg(feature = "ast")]
+        {
+            self.nodes[node].src_start = src_start;
+            self.nodes[node].src_end = (self.line_src_start + self.line.len()) as u32;
+        }
+        // Consume the whole opening line so it never becomes child content.
+        self.advance_offset(self.line.len() - self.offset, false);
+        if colons == 2 { 2 } else { 1 }
     }
 
     fn start_indented_code(&mut self) -> u8 {
         if self.indented && self.nodes[self.tip].kind != Kind::Paragraph && !self.blank {
+            // mdast indented code starts at the line content region (incl. indent).
+            // If a container marker left a tab partially consumed, the start
+            // rounds up past that tab byte (a position can't sit inside a byte).
+            #[cfg(feature = "ast")]
+            let content_start =
+                self.line_src_start + self.offset + self.partially_consumed_tab as usize;
             self.advance_offset(CODE_INDENT, true);
             self.close_unmatched_blocks();
             let cb = self.add_child(Kind::CodeBlock);
             self.nodes[cb].fenced = false;
+            #[cfg(feature = "ast")]
+            {
+                self.nodes[cb].src_start = content_start as u32;
+            }
             2
         } else {
             0
@@ -1023,6 +1963,8 @@ impl<'a> Parser<'a> {
             padding: 0,
             marker_offset: self.indent,
             tight: true,
+            #[cfg(feature = "ast")]
+            spread: false,
         };
         let marker_width;
         match rest.first() {
@@ -1117,7 +2059,7 @@ impl<'a> Parser<'a> {
     }
 }
 
-const NUM_STARTS: usize = if cfg!(feature = "gfm") { 9 } else { 8 };
+const NUM_STARTS: usize = if cfg!(feature = "gfm") { 12 } else { 11 };
 
 /// Could a line whose first non-space byte is `c` begin a block other than a
 /// paragraph? (`#` ATX, `>` quote, `` ` ``/`~` fence, `*+-_` thematic/list,
@@ -1130,16 +2072,69 @@ fn maybe_special(c: Option<u8>) -> bool {
     )
 }
 
+/// Drop a single trailing `\r` so CRLF fence lines test like LF ones.
+fn trim_cr(line: &[u8]) -> &[u8] {
+    if let [rest @ .., b'\r'] = line {
+        rest
+    } else {
+        line
+    }
+}
+
+/// Parse a GFM footnote-definition opener `[^label]:` at the start of `line`.
+/// Returns `(label, bytes_through_colon)`. The label is non-empty, contains no
+/// unescaped brackets and no whitespace (backslash escapes are kept verbatim, as
+/// remark does), and must be immediately followed by `]:`.
+fn parse_footnote_label_def(line: &[u8]) -> Option<(String, usize)> {
+    if line.len() < 4 || line[0] != b'[' || line[1] != b'^' {
+        return None;
+    }
+    let start = 2;
+    let mut i = start;
+    while i < line.len() {
+        match line[i] {
+            b']' => break,
+            b'[' => return None,
+            b' ' | b'\t' | b'\n' | b'\r' => return None,
+            b'\\' if i + 1 < line.len() => i += 2, // escaped char kept in the label
+            _ => i += 1,
+        }
+    }
+    if i >= line.len() || line[i] != b']' || i == start || line.get(i + 1) != Some(&b':') {
+        return None;
+    }
+    let label = std::str::from_utf8(&line[start..i]).ok()?.to_string();
+    Some((label, i + 2))
+}
+
+/// A frontmatter fence: exactly three `marker` bytes then only spaces/tabs
+/// (a trailing `\r` already trimmed). Four or more markers is not a fence.
+fn is_fm_fence(line: &[u8], marker: u8) -> bool {
+    line.len() >= 3
+        && line[0] == marker
+        && line[1] == marker
+        && line[2] == marker
+        && line[3..].iter().all(|&b| b == b' ' || b == b'\t')
+}
+
 fn can_contain(parent: Kind, child: Kind) -> bool {
     match parent {
-        Kind::Document | Kind::BlockQuote | Kind::Item => child != Kind::Item,
+        Kind::Document | Kind::BlockQuote | Kind::Item | Kind::FootnoteDef => child != Kind::Item,
+        Kind::ContainerDirective => child != Kind::Item,
         Kind::List => child == Kind::Item,
+        // A definition list holds term holders and descriptions; a plain
+        // paragraph child is a pending term candidate (a dangling one is evicted
+        // when the list finalizes).
+        Kind::DefList => matches!(child, Kind::DefTerm | Kind::DefDesc | Kind::Paragraph),
         _ => false,
     }
 }
 
 fn accepts_lines(kind: Kind) -> bool {
-    if matches!(kind, Kind::Paragraph | Kind::CodeBlock | Kind::HtmlBlock) {
+    if matches!(
+        kind,
+        Kind::Paragraph | Kind::CodeBlock | Kind::HtmlBlock | Kind::DefDesc
+    ) {
         return true;
     }
     #[cfg(feature = "gfm")]
@@ -1311,6 +2306,19 @@ fn is_closing_fence(line: &[u8], from: usize, fence_char: u8, fence_len: usize) 
     rest[run..]
         .iter()
         .all(|&b| b == b' ' || b == b'\t' || b == b'\n')
+}
+
+/// A container-directive closing fence: a run of `≥ max(fence_len, 3)` colons
+/// followed only by whitespace.
+fn is_colon_close(line: &[u8], from: usize, fence_len: usize) -> bool {
+    let rest = &line[from..];
+    let run = rest.iter().take_while(|&&b| b == b':').count();
+    if run < fence_len.max(3) {
+        return false;
+    }
+    rest[run..]
+        .iter()
+        .all(|&b| b == b' ' || b == b'\t' || b == b'\r' || b == b'\n')
 }
 
 /// Byte length of `s` after stripping a trailing `(\n *)+` run (HTML-block

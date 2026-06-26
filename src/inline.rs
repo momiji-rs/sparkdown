@@ -13,7 +13,7 @@ use crate::options::Options;
 use crate::render::escape_html;
 use crate::scan::{
     find_emph, find_emph_gfm, find_inline, find_inline_al, find_inline_gfm, find_inline_gfm_al,
-    find_stream, find_stream_al,
+    find_stream, find_stream_al, memchr1,
 };
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -220,6 +220,44 @@ fn try_code_span(src: &str, bytes: &[u8], i: usize, out: &mut String) -> Option<
             if run == open_len {
                 emit_code_span(&src[content_start..j], out);
                 return Some(j + run);
+            }
+            j += run;
+        } else {
+            j += 1;
+        }
+    }
+    None
+}
+
+/// SPIKE: code-span value (mdast `inlineCode.value`) — the raw, un-escaped
+/// interior as the mdast `inlineCode.value`. Unlike the HTML render path (which
+/// converts line endings to spaces), mdast keeps line endings **literal**; only
+/// the CommonMark code-span padding applies: strip one leading and one trailing
+/// space-or-line-ending when both ends are padded and the content is not entirely
+/// whitespace. Matches `mdast-util-from-markdown`. Returns the value + new index.
+/// Unconditional (dead without `ast`) so AST branches compile in every build.
+#[allow(dead_code)]
+fn code_span_value(src: &str, bytes: &[u8], i: usize) -> Option<(String, usize)> {
+    let open_len = bytes[i..].iter().take_while(|&&b| b == b'`').count();
+    let content_start = i + open_len;
+    let mut j = content_start;
+    while j < bytes.len() {
+        if bytes[j] == b'`' {
+            let run = bytes[j..].iter().take_while(|&&b| b == b'`').count();
+            if run == open_len {
+                let content = &src[content_start..j];
+                let b = content.as_bytes();
+                let pad = |c: u8| matches!(c, b' ' | b'\n' | b'\r');
+                let value = if b.len() >= 2
+                    && pad(b[0])
+                    && pad(b[b.len() - 1])
+                    && b.iter().any(|&c| !pad(c))
+                {
+                    content[1..content.len() - 1].to_owned()
+                } else {
+                    content.to_owned()
+                };
+                return Some((value, j + run));
             }
             j += run;
         } else {
@@ -539,7 +577,7 @@ fn norm_key<'a>(s: &'a str, buf: &'a mut String) -> &'a str {
 
 /// Normalize a link label: trim, collapse internal whitespace, case-fold.
 /// Borrows when the label is already normalized.
-fn normalize_label(s: &str) -> Cow<'_, str> {
+pub(crate) fn normalize_label(s: &str) -> Cow<'_, str> {
     if already_normalized(s) {
         return Cow::Borrowed(s);
     }
@@ -566,12 +604,430 @@ enum Node {
     },
     /// A static tag/literal: emphasis tags, `</a>`, or an unconsumed `[`/`![`/`]`.
     Tag(&'static str),
+    /// SPIKE (AST mode only): a semantic node indexing the `sem` side-table.
+    /// Dead in the HTML path (never set), so it is unreachable in `render_node`.
+    Sem(u32),
+    /// SPIKE (AST mode only): close of an mdast `link`.
+    LinkClose,
+}
+
+/// SPIKE: semantic payload for inline constructs that are *lossy* once rendered
+/// to HTML — captured at parse time (where the raw values still exist) and
+/// referenced by [`Node::Sem`]. Defined unconditionally (dead without `ast`) so
+/// it can flow through `look_for_link_or_image`'s signature without cfg-gating.
+#[derive(Debug, Clone)]
+enum Sem {
+    /// Inline code: the raw (un-escaped) value.
+    Code(String),
+    /// `[text](url "title")` opener. `url`/`title` are the resolved destination
+    /// (NOT the percent-encoded `href` — that is unrecoverable from the output).
+    LinkOpen { url: String, title: Option<String> },
+    /// `![alt](url "title")` — a leaf in mdast (alt is plain text).
+    Image {
+        url: String,
+        title: Option<String>,
+        alt: String,
+    },
+    /// `<url>` / `<email>` autolink → an mdast `link` with one text child.
+    Autolink { url: String, text: String },
+    /// Raw inline HTML, verbatim.
+    Html(String),
+    /// A hard line break.
+    Break,
+    /// `[text][label]` etc. → mdast `linkReference` opener (children = link text,
+    /// closed by [`Node::LinkClose`]). Carries the normalized `identifier`, the
+    /// raw `label`, and `reftype` (`"shortcut"`/`"collapsed"`/`"full"`).
+    LinkRef {
+        identifier: String,
+        label: String,
+        reftype: &'static str,
+    },
+    /// `![alt][label]` etc. → mdast `imageReference` (a leaf; alt is plain text).
+    ImageRef {
+        identifier: String,
+        label: String,
+        reftype: &'static str,
+        alt: String,
+    },
+    /// GFM `[^label]` → mdast `footnoteReference` (a leaf).
+    FootnoteRef { identifier: String, label: String },
+    /// remark-directive inline `:name[label]{attrs}` → mdast `textDirective`. The
+    /// `label` is a content byte range (re-tokenized into children at build time).
+    TextDirective {
+        name: String,
+        attrs: Vec<(String, String)>,
+        label: Option<(u32, u32)>,
+    },
+}
+
+/// SPIKE: reference-resolution metadata produced by [`parse_link_target`] in AST
+/// mode, so the emitter can build a `linkReference`/`imageReference` node instead
+/// of a resolved `link`/`image`. `None` for inline `(url)` targets.
+struct RefInfo {
+    identifier: String,
+    label: String,
+    reftype: &'static str,
+}
+
+/// SPIKE (`ast` feature): a flat, ordered stream of semantic inline tokens —
+/// emphasis/link nesting is expressed by `Open`/`Close` pairs (reconstructed
+/// into a tree by `ast.rs`). This is the lossless counterpart of the HTML the
+/// fast path would emit.
+#[cfg(feature = "ast")]
+#[derive(Debug, Clone)]
+pub enum InlineTok {
+    /// mdast `text` value (HTML-unescaped).
+    Text(String),
+    /// Open a container: `"emphasis"` | `"strong"` | `"delete"`.
+    Open(&'static str),
+    /// Close the matching container.
+    Close(&'static str),
+    /// Open an mdast `link`.
+    LinkOpen { url: String, title: Option<String> },
+    /// Close the matching `link`.
+    LinkClose,
+    /// mdast `image` (leaf).
+    Image {
+        url: String,
+        title: Option<String>,
+        alt: String,
+    },
+    /// mdast `inlineCode`.
+    Code(String),
+    /// mdast `link` from an autolink (single text child).
+    Autolink { url: String, text: String },
+    /// mdast `html` (raw inline).
+    Html(String),
+    /// mdast `break` (hard line break).
+    Break,
+    /// Open an mdast `linkReference` (closed by the matching [`LinkClose`]).
+    LinkRefOpen {
+        identifier: String,
+        label: String,
+        reftype: &'static str,
+    },
+    /// mdast `imageReference` (leaf).
+    ImageRef {
+        identifier: String,
+        label: String,
+        reftype: &'static str,
+        alt: String,
+    },
+    /// mdast `footnoteReference` (leaf).
+    FootnoteRef { identifier: String, label: String },
+    /// mdast `textDirective`. `label` is a content byte range whose inline content
+    /// becomes the directive's children (re-tokenized by the AST builder).
+    TextDirective {
+        name: String,
+        attrs: Vec<(String, String)>,
+        label: Option<(u32, u32)>,
+    },
+}
+
+/// SPIKE (`ast`): an [`InlineTok`] tagged with the content byte range
+/// `[start, end)` that produced it (for unist `position`). `start == u32::MAX`
+/// means the span is unknown (the consumer falls back to the block span).
+#[cfg(feature = "ast")]
+pub struct SpanTok {
+    pub tok: InlineTok,
+    pub start: u32,
+    pub end: u32,
+}
+
+/// SPIKE: reverse [`escape_html`] (`&amp;`/`&lt;`/`&gt;`/`&quot;` only) to recover
+/// an mdast `text` value from a rendered span. escape_html escapes exactly these
+/// four, after entity/backslash resolution — so this is exact, not heuristic.
+/// Returns a borrow when the span needs no unescaping (the overwhelming common
+/// case), so the sink path can stream it to the wire with zero allocation.
+/// Unconditional (dead without `ast`) so AST branches compile in every build.
+#[allow(dead_code)]
+fn unescape_html_text(s: &str) -> Cow<'_, str> {
+    if !s.contains('&') {
+        return Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let tail = &rest[amp..];
+        if let Some(after) = tail.strip_prefix("&amp;") {
+            out.push('&');
+            rest = after;
+        } else if let Some(after) = tail.strip_prefix("&lt;") {
+            out.push('<');
+            rest = after;
+        } else if let Some(after) = tail.strip_prefix("&gt;") {
+            out.push('>');
+            rest = after;
+        } else if let Some(after) = tail.strip_prefix("&quot;") {
+            out.push('"');
+            rest = after;
+        } else {
+            out.push('&');
+            rest = &tail[1..];
+        }
+    }
+    out.push_str(rest);
+    Cow::Owned(out)
+}
+
+/// SPIKE: convert the resolved slot list into the semantic [`InlineTok`] stream.
+/// Spans now hold *only* plain escaped text (every lossy construct is a
+/// [`Node::Sem`]/[`Node::LinkClose`]), so reconstruction is exact.
+#[cfg(feature = "ast")]
+fn list_to_tokens(list: &List, cur: &str, sem: &[Sem], out: &mut Vec<SpanTok>) {
+    let mut node = list.head;
+    while let Some(idx) = node {
+        let (s, e) = list.slots[idx].cspan;
+        let mut push = |tok| {
+            out.push(SpanTok {
+                tok,
+                start: s,
+                end: e,
+            })
+        };
+        match &list.slots[idx].node {
+            Node::Span { start, end } => {
+                let t = unescape_html_text(&cur[*start..*end]);
+                if !t.is_empty() {
+                    push(InlineTok::Text(t.into_owned()));
+                }
+            }
+            Node::Tag(t) => push(match *t {
+                "<em>" => InlineTok::Open("emphasis"),
+                "</em>" => InlineTok::Close("emphasis"),
+                "<strong>" => InlineTok::Open("strong"),
+                "</strong>" => InlineTok::Close("strong"),
+                "<del>" => InlineTok::Open("delete"),
+                "</del>" => InlineTok::Close("delete"),
+                // Unconsumed literal brackets stay as text.
+                lit => InlineTok::Text(lit.to_owned()),
+            }),
+            Node::Delim { ch, count, .. } => push(InlineTok::Text(
+                core::iter::repeat_n(*ch as char, *count).collect(),
+            )),
+            Node::Sem(i) => push(match &sem[*i as usize] {
+                Sem::Code(v) => InlineTok::Code(v.clone()),
+                Sem::LinkOpen { url, title } => InlineTok::LinkOpen {
+                    url: url.clone(),
+                    title: title.clone(),
+                },
+                Sem::Image { url, title, alt } => InlineTok::Image {
+                    url: url.clone(),
+                    title: title.clone(),
+                    alt: alt.clone(),
+                },
+                Sem::Autolink { url, text } => InlineTok::Autolink {
+                    url: url.clone(),
+                    text: text.clone(),
+                },
+                Sem::Html(h) => InlineTok::Html(h.clone()),
+                Sem::Break => InlineTok::Break,
+                Sem::LinkRef {
+                    identifier,
+                    label,
+                    reftype,
+                } => InlineTok::LinkRefOpen {
+                    identifier: identifier.clone(),
+                    label: label.clone(),
+                    reftype,
+                },
+                Sem::ImageRef {
+                    identifier,
+                    label,
+                    reftype,
+                    alt,
+                } => InlineTok::ImageRef {
+                    identifier: identifier.clone(),
+                    label: label.clone(),
+                    reftype,
+                    alt: alt.clone(),
+                },
+                Sem::FootnoteRef { identifier, label } => InlineTok::FootnoteRef {
+                    identifier: identifier.clone(),
+                    label: label.clone(),
+                },
+                Sem::TextDirective { name, attrs, label } => InlineTok::TextDirective {
+                    name: name.clone(),
+                    attrs: attrs.clone(),
+                    label: *label,
+                },
+            }),
+            Node::LinkClose => push(InlineTok::LinkClose),
+        }
+        node = list.slots[idx].next;
+    }
+}
+
+/// SPIKE (`ast` feature): a streaming visitor for the resolved inline list — the
+/// allocation-free counterpart of [`list_to_tokens`]. Where `list_to_tokens`
+/// materializes an owned [`SpanTok`] vector (one `String` per text span, cloned
+/// payloads), [`emit_inline`] walks the same slot list and hands the consumer
+/// *borrowed* `&str` slices, so a wire emitter can copy straight to its output
+/// with no intermediate token vector and no per-span allocation.
+///
+/// Container nesting is expressed as `open`/`close` pairs (emphasis/strong/delete
+/// and links alike); the consumer reconstructs the tree with its own stack.
+/// Positions are the content byte range `[start, end)` (`start == u32::MAX` =
+/// unknown → fall back to the block span). Adjacent text is already coalesced by
+/// [`emit_inline`], so every [`text`](InlineSink::text) call is one whole run.
+#[cfg(feature = "ast")]
+pub trait InlineSink {
+    fn text(&mut self, value: &str, start: u32, end: u32);
+    fn open(&mut self, kind: &'static str, start: u32, end: u32);
+    fn close(&mut self, start: u32, end: u32);
+    fn code(&mut self, value: &str, start: u32, end: u32);
+    fn html(&mut self, value: &str, start: u32, end: u32);
+    fn brk(&mut self, start: u32, end: u32);
+    fn image(&mut self, url: &str, title: Option<&str>, alt: &str, start: u32, end: u32);
+    fn autolink(&mut self, url: &str, text: &str, start: u32, end: u32);
+    fn link_open(&mut self, url: &str, title: Option<&str>, start: u32, end: u32);
+    fn linkref_open(
+        &mut self,
+        identifier: &str,
+        label: &str,
+        reftype: &'static str,
+        start: u32,
+        end: u32,
+    );
+    fn imageref(
+        &mut self,
+        identifier: &str,
+        label: &str,
+        reftype: &'static str,
+        alt: &str,
+        start: u32,
+        end: u32,
+    );
+    fn footnote_ref(&mut self, identifier: &str, label: &str, start: u32, end: u32);
+    /// A remark-directive `textDirective`. `label` is a content byte range whose
+    /// inline content forms the children (the wire emitter resolves it best-effort).
+    fn text_directive(
+        &mut self,
+        name: &str,
+        attrs: &[(String, String)],
+        label: Option<(u32, u32)>,
+        start: u32,
+        end: u32,
+    );
+}
+
+/// SPIKE (`ast`): drive an [`InlineSink`] over the resolved slot list, coalescing
+/// runs of adjacent text into a single borrowed (or, only when ≥2 pieces must be
+/// joined, buffered) `&str` — mirroring [`list_to_tokens`] node-for-node but
+/// without owning anything.
+#[cfg(feature = "ast")]
+fn emit_inline<S: InlineSink>(list: &List, cur: &str, sem: &[Sem], sink: &mut S) {
+    // The in-flight text run: borrowed while it stays a single piece, promoted to
+    // an owned buffer (via `Cow::to_mut`) only when a second adjacent piece joins.
+    let mut run: Option<(Cow<'_, str>, u32, u32)> = None;
+    macro_rules! flush {
+        () => {
+            if let Some((s, st, en)) = run.take() {
+                sink.text(&s, st, en); // non-empty: empty pieces never start a run
+            }
+        };
+    }
+    macro_rules! add_text {
+        ($piece:expr, $st:expr, $en:expr) => {{
+            let piece: Cow<'_, str> = $piece;
+            if !piece.is_empty() {
+                if let Some((buf, _, pe)) = run.as_mut() {
+                    buf.to_mut().push_str(&piece);
+                    *pe = $en;
+                } else {
+                    run = Some((piece, $st, $en));
+                }
+            }
+        }};
+    }
+
+    let mut node = list.head;
+    while let Some(idx) = node {
+        let (s, e) = list.slots[idx].cspan;
+        match &list.slots[idx].node {
+            Node::Span { start, end } => add_text!(unescape_html_text(&cur[*start..*end]), s, e),
+            Node::Tag(t) => match *t {
+                "<em>" => {
+                    flush!();
+                    sink.open("emphasis", s, e);
+                }
+                "</em>" => {
+                    flush!();
+                    sink.close(s, e);
+                }
+                "<strong>" => {
+                    flush!();
+                    sink.open("strong", s, e);
+                }
+                "</strong>" => {
+                    flush!();
+                    sink.close(s, e);
+                }
+                "<del>" => {
+                    flush!();
+                    sink.open("delete", s, e);
+                }
+                "</del>" => {
+                    flush!();
+                    sink.close(s, e);
+                }
+                // Unconsumed literal brackets stay as text.
+                lit => add_text!(Cow::Borrowed(lit), s, e),
+            },
+            Node::Delim { ch, count, .. } => {
+                let mut tmp = String::with_capacity(*count);
+                for _ in 0..*count {
+                    tmp.push(*ch as char);
+                }
+                add_text!(Cow::Owned(tmp), s, e);
+            }
+            Node::Sem(i) => {
+                flush!();
+                match &sem[*i as usize] {
+                    Sem::Code(v) => sink.code(v, s, e),
+                    Sem::LinkOpen { url, title } => sink.link_open(url, title.as_deref(), s, e),
+                    Sem::Image { url, title, alt } => sink.image(url, title.as_deref(), alt, s, e),
+                    Sem::Autolink { url, text } => sink.autolink(url, text, s, e),
+                    Sem::Html(h) => sink.html(h, s, e),
+                    Sem::Break => sink.brk(s, e),
+                    Sem::LinkRef {
+                        identifier,
+                        label,
+                        reftype,
+                    } => sink.linkref_open(identifier, label, reftype, s, e),
+                    Sem::ImageRef {
+                        identifier,
+                        label,
+                        reftype,
+                        alt,
+                    } => sink.imageref(identifier, label, reftype, alt, s, e),
+                    Sem::FootnoteRef { identifier, label } => {
+                        sink.footnote_ref(identifier, label, s, e)
+                    }
+                    Sem::TextDirective { name, attrs, label } => {
+                        sink.text_directive(name, attrs, *label, s, e)
+                    }
+                }
+            }
+            Node::LinkClose => {
+                flush!();
+                sink.close(s, e);
+            }
+        }
+        node = list.slots[idx].next;
+    }
+    flush!();
 }
 
 struct Slot {
     node: Node,
     prev: Option<usize>,
     next: Option<usize>,
+    /// SPIKE (`ast`): the content byte range `[start, end)` that produced this
+    /// node, for unist `position`. `(0, 0)` until set in AST mode.
+    #[cfg(feature = "ast")]
+    cspan: (u32, u32),
 }
 
 /// A doubly-linked list over an append-only slot arena (slots are never freed,
@@ -599,6 +1055,8 @@ impl List {
             node,
             prev: self.tail,
             next: None,
+            #[cfg(feature = "ast")]
+            cspan: (u32::MAX, 0),
         });
         match self.tail {
             Some(t) => self.slots[t].next = Some(idx),
@@ -608,34 +1066,40 @@ impl List {
         idx
     }
 
-    fn splice_after(&mut self, at: usize, node: Node) {
+    fn splice_after(&mut self, at: usize, node: Node) -> usize {
         let idx = self.slots.len();
         let next = self.slots[at].next;
         self.slots.push(Slot {
             node,
             prev: Some(at),
             next,
+            #[cfg(feature = "ast")]
+            cspan: (u32::MAX, 0),
         });
         self.slots[at].next = Some(idx);
         match next {
             Some(n) => self.slots[n].prev = Some(idx),
             None => self.tail = Some(idx),
         }
+        idx
     }
 
-    fn splice_before(&mut self, at: usize, node: Node) {
+    fn splice_before(&mut self, at: usize, node: Node) -> usize {
         let idx = self.slots.len();
         let prev = self.slots[at].prev;
         self.slots.push(Slot {
             node,
             prev,
             next: Some(at),
+            #[cfg(feature = "ast")]
+            cspan: (u32::MAX, 0),
         });
         self.slots[at].prev = Some(idx);
         match prev {
             Some(p) => self.slots[p].next = Some(idx),
             None => self.head = Some(idx),
         }
+        idx
     }
 
     fn unlink(&mut self, idx: usize) {
@@ -661,6 +1125,8 @@ fn render_node(node: &Node, cur: &str, out: &mut String) {
                 out.push(*ch as char);
             }
         }
+        // AST-mode only; never present on the HTML path.
+        Node::Sem(_) | Node::LinkClose => {}
     }
 }
 
@@ -748,6 +1214,37 @@ pub struct Scratch {
     cur: String,
     /// Reused scratch for normalized reference-link lookup keys.
     norm: String,
+    /// SPIKE: side-table for [`Node::Sem`] semantic payloads. Unconditional (dead
+    /// without `ast`) so `look_for_link_or_image`'s signature stays uncfg'd.
+    sem: Vec<Sem>,
+    /// SPIKE (`ast` feature): when `Some`, `render_inline` materializes owned
+    /// [`InlineTok`] nodes here instead of emitting HTML to `out`. `None` (the
+    /// default) is the unchanged fast path — the one extra branch it adds is only
+    /// compiled in `ast` builds.
+    /// PROTOTYPE (built-in heading-id transform): per-document slug→count map for
+    /// github-slugger-style de-duplication. Persists across the whole render
+    /// (cleared per document in `render_with`), unlike the per-paragraph `reset()`.
+    pub(crate) slugs: std::collections::HashMap<String, u32>,
+    /// GFM footnotes: the set of lowercased definition labels in the document
+    /// (populated per-document by the renderer/mdast builder before walking, like
+    /// `slugs`; survives `reset()`). A `[^label]` is a `footnoteReference` only if
+    /// its lowercased label is in here — otherwise it stays literal text.
+    pub(crate) footnote_ids: std::collections::HashSet<String>,
+    /// GFM footnotes (HTML path): identifiers in first-reference order — a ref's
+    /// number is its index here + 1. Document-level (cleared per document, like
+    /// `slugs`); the footnotes `<section>` is emitted in this order.
+    pub(crate) footnote_order: Vec<String>,
+    /// GFM footnotes (HTML path): per-identifier count of references emitted so
+    /// far, for the `fnref-id-2`, `-3`, … suffixes and the backref count.
+    pub(crate) footnote_seen: std::collections::HashMap<String, u32>,
+    #[cfg(feature = "ast")]
+    toks: Option<Vec<SpanTok>>,
+    /// SPIKE (`ast` feature): when `true`, `render_inline` resolves the inline
+    /// list as usual but emits nothing and *leaves* `list`/`cur`/`sem` populated,
+    /// so [`render_inline_to_sink`] can stream them through an [`InlineSink`] with
+    /// no intermediate [`SpanTok`] vector. Mutually exclusive with `toks`.
+    #[cfg(feature = "ast")]
+    resolve: bool,
 }
 
 impl Scratch {
@@ -757,6 +1254,15 @@ impl Scratch {
             stack: Vec::with_capacity(16),
             cur: String::with_capacity(1024),
             norm: String::with_capacity(48),
+            sem: Vec::new(),
+            slugs: std::collections::HashMap::new(),
+            footnote_ids: std::collections::HashSet::new(),
+            footnote_order: Vec::new(),
+            footnote_seen: std::collections::HashMap::new(),
+            #[cfg(feature = "ast")]
+            toks: None,
+            #[cfg(feature = "ast")]
+            resolve: false,
         }
     }
     fn reset(&mut self) {
@@ -765,7 +1271,105 @@ impl Scratch {
         self.list.tail = None;
         self.stack.clear();
         self.cur.clear();
+        self.sem.clear();
     }
+}
+
+/// Parse a GFM footnote reference `[^label]` at `bytes[i]` (`[`). Returns
+/// `(label, bytes_consumed)`. Same label rules as a definition opener: non-empty,
+/// no whitespace, no unescaped brackets (backslash escapes kept); ends at `]`.
+fn parse_footnote_ref(bytes: &[u8], i: usize) -> Option<(String, usize)> {
+    if bytes.get(i + 1) != Some(&b'^') {
+        return None;
+    }
+    let start = i + 2;
+    let mut j = start;
+    while j < bytes.len() {
+        match bytes[j] {
+            b']' => break,
+            b'[' => return None,
+            b' ' | b'\t' | b'\n' | b'\r' => return None,
+            b'\\' if j + 1 < bytes.len() => j += 2,
+            _ => j += 1,
+        }
+    }
+    if j >= bytes.len() || bytes[j] != b']' || j == start {
+        return None;
+    }
+    let label = std::str::from_utf8(&bytes[start..j]).ok()?.to_string();
+    Some((label, j + 1 - i))
+}
+
+/// `encodeURIComponent(identifier)` — the exact transform `mdast-util-to-hast`
+/// applies to a footnote identifier before building `fn-…`/`fnref-…` ids and
+/// hrefs (keeps `A-Za-z0-9-_.!~*'()`, percent-encodes the rest as UTF-8).
+pub(crate) fn encode_footnote_id(id: &str) -> String {
+    let mut out = String::with_capacity(id.len());
+    for &b in id.as_bytes() {
+        match b {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'!'
+            | b'~'
+            | b'*'
+            | b'\''
+            | b'('
+            | b')' => out.push(b as char),
+            _ => {
+                out.push('%');
+                out.push(
+                    char::from_digit((b >> 4) as u32, 16)
+                        .unwrap()
+                        .to_ascii_uppercase(),
+                );
+                out.push(
+                    char::from_digit((b & 0xf) as u32, 16)
+                        .unwrap()
+                        .to_ascii_uppercase(),
+                );
+            }
+        }
+    }
+    out
+}
+
+/// Emit the remark-rehype `<sup>` markup for a footnote reference: the
+/// document-order number (assigned on first sight) and the `-2`/`-3`… `fnref`
+/// suffix per repeat occurrence. Mirrors `mdast-util-to-hast`'s reference handler.
+fn footnote_ref_html(
+    id: &str,
+    cur: &mut String,
+    order: &mut Vec<String>,
+    seen: &mut std::collections::HashMap<String, u32>,
+) {
+    let num = match order.iter().position(|x| x == id) {
+        Some(p) => p + 1,
+        None => {
+            order.push(id.to_string());
+            order.len()
+        }
+    };
+    let count = {
+        let c = seen.entry(id.to_string()).or_insert(0);
+        *c += 1;
+        *c
+    };
+    let safe = encode_footnote_id(id);
+    cur.push_str("<sup><a href=\"#user-content-fn-");
+    cur.push_str(&safe);
+    cur.push_str("\" id=\"user-content-fnref-");
+    cur.push_str(&safe);
+    if count > 1 {
+        cur.push('-');
+        cur.push_str(&count.to_string());
+    }
+    cur.push_str("\" data-footnote-ref aria-describedby=\"footnote-label\">");
+    cur.push_str(&num.to_string());
+    cur.push_str("</a></sup>");
 }
 
 /// Stream inline content with no emphasis or link delimiters straight to
@@ -1133,15 +1737,78 @@ pub fn render_inline(
     // eliminated and the default build streams pure CommonMark.
     let tf = Options::GFM && opts.tagfilter;
     let al = Options::GFM && opts.autolink;
+    let fno = opts.footnotes;
+    let emo = Options::EMOJI && opts.emoji;
+    let dir = opts.directives;
     match (opts.hard_wraps, Options::GFM && opts.strikethrough) {
-        (false, false) => render_inline_impl::<false, false>(src, out, refmap, scratch, tf, al),
-        (false, true) => render_inline_impl::<false, true>(src, out, refmap, scratch, tf, al),
-        (true, false) => render_inline_impl::<true, false>(src, out, refmap, scratch, tf, al),
-        (true, true) => render_inline_impl::<true, true>(src, out, refmap, scratch, tf, al),
+        (false, false) => render_inline_impl::<false, false>(
+            src, out, refmap, scratch, tf, al, fno, emo, dir, opts,
+        ),
+        (false, true) => render_inline_impl::<false, true>(
+            src, out, refmap, scratch, tf, al, fno, emo, dir, opts,
+        ),
+        (true, false) => render_inline_impl::<true, false>(
+            src, out, refmap, scratch, tf, al, fno, emo, dir, opts,
+        ),
+        (true, true) => {
+            render_inline_impl::<true, true>(src, out, refmap, scratch, tf, al, fno, emo, dir, opts)
+        }
     }
 }
 
+/// Emoji shortcode lookup, present only with the `emoji` feature (folds to `None`
+/// otherwise so the call site compiles in every build).
+#[cfg(feature = "emoji")]
+#[inline]
+fn emoji_lookup(bytes: &[u8], i: usize) -> Option<(&'static str, usize)> {
+    crate::ext::emoji::lookup(bytes, i)
+}
+#[cfg(not(feature = "emoji"))]
+#[inline]
+fn emoji_lookup(_bytes: &[u8], _i: usize) -> Option<(&'static str, usize)> {
+    None
+}
+
+/// SPIKE (`ast` feature): parse `src`'s inline content into owned [`InlineTok`]
+/// nodes instead of HTML. Runs the exact same pipeline as [`render_inline`]
+/// (text/code/links, emphasis resolution) but captures the resolved node list.
+#[cfg(feature = "ast")]
+pub fn render_inline_to_tokens(
+    src: &str,
+    refmap: &RefMap,
+    scratch: &mut Scratch,
+    opts: Options,
+) -> Vec<SpanTok> {
+    scratch.toks = Some(Vec::new());
+    let mut sink = String::new(); // unused in token mode
+    render_inline(src, &mut sink, refmap, scratch, opts);
+    scratch.toks.take().unwrap_or_default()
+}
+
+/// SPIKE (`ast` feature): parse `src`'s inline content and stream it through
+/// `sink` with no intermediate [`SpanTok`] vector. Runs the same resolution as
+/// [`render_inline_to_tokens`], but instead of materializing owned tokens it
+/// leaves the resolved list in `scratch` and walks it with [`emit_inline`],
+/// handing the sink borrowed slices. This is the allocation-light path the binary
+/// wire emitter uses.
+#[cfg(feature = "ast")]
+pub fn render_inline_to_sink<S: InlineSink>(
+    src: &str,
+    refmap: &RefMap,
+    scratch: &mut Scratch,
+    opts: Options,
+    sink: &mut S,
+) {
+    scratch.resolve = true;
+    let mut unused = String::new(); // no HTML emitted in resolve mode
+    render_inline(src, &mut unused, refmap, scratch, opts);
+    scratch.resolve = false;
+    // `render_inline` left the resolved nodes in place; walk them into the sink.
+    emit_inline(&scratch.list, &scratch.cur, &scratch.sem, sink);
+}
+
 #[allow(unused_assignments)] // `seg` is updated at segment ends; the last is unused
+#[allow(clippy::too_many_arguments)] // hot inner loop; bundling args would add indirection
 fn render_inline_impl<const HW: bool, const ST: bool>(
     src: &str,
     out: &mut String,
@@ -1149,15 +1816,35 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
     scratch: &mut Scratch,
     tf: bool,
     al: bool,
+    fno: bool,
+    emo: bool,
+    dir: bool,
+    opts: Options,
 ) {
     let bytes = src.as_bytes();
+    // SPIKE: AST mode captures semantic nodes instead of HTML. `ast_mode` is a
+    // compile-time `false` without the `ast` feature, so every `if ast_mode {…}`
+    // branch below is dead-code-eliminated and the fast path is untouched.
+    #[cfg(feature = "ast")]
+    let ast_mode = scratch.toks.is_some() || scratch.resolve;
+    // Captured before the `list`/`cur`/`sem` borrows below so it can be read at the
+    // emission tail without re-borrowing `scratch`.
+    #[cfg(feature = "ast")]
+    let resolve = scratch.resolve;
+    #[cfg(not(feature = "ast"))]
+    let ast_mode = false;
     // Fast path: no emphasis/link (or `~` when ST) delimiters → stream directly.
+    // Skipped in AST mode: the streaming path emits HTML for code spans /
+    // autolinks / raw HTML, which we must instead capture as semantic nodes.
     let gate = if ST {
         find_emph_gfm(bytes)
     } else {
         find_emph(bytes)
     };
-    if gate.is_none() {
+    // Emoji and text directives need the node path only when a `:` is actually
+    // present; a `:`-free line still takes the fast stream path.
+    let emo_here = (emo || dir) && memchr1(bytes, b':').is_some();
+    if gate.is_none() && !ast_mode && !emo_here {
         if al {
             stream_autolink(src, out, HW, tf);
         } else {
@@ -1166,25 +1853,63 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
         return;
     }
     scratch.reset();
+    // GFM footnotes: the definition set (read-only) and document-order numbering
+    // state (HTML path). Distinct fields from the borrows below, so they coexist;
+    // untouched by `reset()` (document-level, like `slugs`).
+    let fn_ids = &scratch.footnote_ids;
+    let fn_order = &mut scratch.footnote_order;
+    let fn_seen = &mut scratch.footnote_seen;
     let list = &mut scratch.list;
     let stack = &mut scratch.stack;
     let cur = &mut scratch.cur;
     let norm = &mut scratch.norm;
+    let sem = &mut scratch.sem;
     let mut i = 0usize;
     let mut run = 0usize;
     let mut seg = 0usize; // start (in `cur`) of the open text segment
+    // SPIKE (`ast`): start (in `src` content) of the open text segment, for the
+    // text node's unist `position`.
+    #[cfg(feature = "ast")]
+    let mut cseg = 0usize;
 
-    // Close the open text segment into a Span node.
+    // Close the open text segment into a Span node. `$cend` is the content byte
+    // offset where the text ends (AST mode records `[cseg, $cend)` on the span;
+    // the HTML path ignores it).
     macro_rules! flush {
-        () => {
+        ($cend:expr) => {{
             if cur.len() > seg {
-                list.push(Node::Span {
+                let _id = list.push(Node::Span {
                     start: seg,
                     end: cur.len(),
                 });
+                #[cfg(feature = "ast")]
+                {
+                    list.slots[_id].cspan = (cseg as u32, ($cend) as u32);
+                }
                 seg = cur.len();
             }
-        };
+            #[cfg(feature = "ast")]
+            {
+                cseg = ($cend) as usize;
+            }
+        }};
+    }
+
+    // SPIKE (`ast`): set the content span on the node just pushed at `$idx` and
+    // advance the text-segment cursor. A no-op without the `ast` feature (the
+    // call sites live inside runtime `if ast_mode` blocks that still compile).
+    macro_rules! cspan {
+        ($idx:expr, $s:expr, $e:expr) => {{
+            #[cfg(feature = "ast")]
+            {
+                list.slots[$idx].cspan = ($s as u32, $e as u32);
+                cseg = ($e) as usize;
+            }
+            #[cfg(not(feature = "ast"))]
+            {
+                let _ = ($idx, $s, $e);
+            }
+        }};
     }
 
     while i < bytes.len() {
@@ -1192,8 +1917,23 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
             b'\\' => {
                 escape_html(&src[run..i], cur);
                 if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
-                    cur.push_str("<br />\n");
-                    i = skip_spaces(bytes, i + 2);
+                    if ast_mode {
+                        flush!(i);
+                        let si = sem.len() as u32;
+                        sem.push(Sem::Break);
+                        let bid = list.push(Node::Sem(si));
+                        // The break spans the `\` and the line ending.
+                        cspan!(bid, i, i + 2);
+                        seg = cur.len();
+                        i = skip_spaces(bytes, i + 2);
+                        #[cfg(feature = "ast")]
+                        {
+                            cseg = i;
+                        }
+                    } else {
+                        cur.push_str("<br />\n");
+                        i = skip_spaces(bytes, i + 2);
+                    }
                 } else if i + 1 < bytes.len() && is_ascii_punct(bytes[i + 1]) {
                     push_escaped_byte(cur, bytes[i + 1]);
                     i += 2;
@@ -1205,7 +1945,21 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
             }
             b'`' => {
                 escape_html(&src[run..i], cur);
-                if let Some(new_i) = try_code_span(src, bytes, i, cur) {
+                if ast_mode {
+                    if let Some((val, new_i)) = code_span_value(src, bytes, i) {
+                        flush!(i);
+                        let si = sem.len() as u32;
+                        sem.push(Sem::Code(val));
+                        let cid = list.push(Node::Sem(si));
+                        cspan!(cid, i, new_i);
+                        seg = cur.len();
+                        i = new_i;
+                    } else {
+                        let n = bytes[i..].iter().take_while(|&&b| b == b'`').count();
+                        cur.push_str(&src[i..i + n]);
+                        i += n;
+                    }
+                } else if let Some(new_i) = try_code_span(src, bytes, i, cur) {
                     i = new_i;
                 } else {
                     let n = bytes[i..].iter().take_while(|&&b| b == b'`').count();
@@ -1231,10 +1985,38 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
             b'<' => {
                 escape_html(&src[run..i], cur);
                 if let Some((consumed, html)) = try_autolink(src, bytes, i) {
-                    cur.push_str(&html);
+                    if ast_mode {
+                        // Recover url/text: href is percent-encoded (lossy), but
+                        // the visible text is the original (only HTML-escaped).
+                        let close = bytes[i + 1..].iter().position(|&b| b == b'>').unwrap();
+                        let content = &src[i + 1..i + 1 + close];
+                        let url = if is_uri_autolink(content) {
+                            content.to_owned()
+                        } else {
+                            format!("mailto:{content}")
+                        };
+                        flush!(i);
+                        let si = sem.len() as u32;
+                        sem.push(Sem::Autolink {
+                            url,
+                            text: content.to_owned(),
+                        });
+                        let aid = list.push(Node::Sem(si));
+                        cspan!(aid, i, i + consumed);
+                        seg = cur.len();
+                    } else {
+                        cur.push_str(&html);
+                    }
                     i += consumed;
                 } else if let Some(end) = try_raw_html(bytes, i) {
-                    if tf {
+                    if ast_mode {
+                        flush!(i);
+                        let si = sem.len() as u32;
+                        sem.push(Sem::Html(src[i..end].to_owned()));
+                        let hid = list.push(Node::Sem(si));
+                        cspan!(hid, i, end);
+                        seg = cur.len();
+                    } else if tf {
                         crate::render::filter_html(&src[i..end], cur);
                     } else {
                         cur.push_str(&src[i..end]); // verbatim
@@ -1249,7 +2031,7 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
             b'*' | b'_' => {
                 let ch = bytes[i];
                 escape_html(&src[run..i], cur);
-                flush!();
+                flush!(i);
                 let count = bytes[i..].iter().take_while(|&&b| b == ch).count();
                 let before = src[..i].chars().next_back();
                 let after = src[i + count..].chars().next();
@@ -1261,6 +2043,8 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                     can_open,
                     can_close,
                 });
+                #[cfg(feature = "ast")]
+                cspan!(idx, i, i + count);
                 stack.push(StackItem::Emph(idx));
                 i += count;
                 run = i;
@@ -1269,7 +2053,7 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
             // 3+ tildes are literal. Only reachable when ST is on.
             b'~' if ST => {
                 escape_html(&src[run..i], cur);
-                flush!();
+                flush!(i);
                 let count = bytes[i..].iter().take_while(|&&b| b == b'~').count();
                 if count <= 2 {
                     let before = src[..i].chars().next_back();
@@ -1282,6 +2066,11 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                         can_open,
                         can_close,
                     });
+                    // SPIKE (`ast`): record the run's byte span like `*`/`_` do —
+                    // the strikethrough match below shrinks it by `use_delims`,
+                    // which underflows if the span is left at its `(MAX, 0)` default.
+                    #[cfg(feature = "ast")]
+                    cspan!(idx, i, i + count);
                     stack.push(StackItem::Emph(idx));
                 } else {
                     cur.push_str(&src[i..i + count]);
@@ -1290,22 +2079,55 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                 run = i;
             }
             b'[' => {
-                escape_html(&src[run..i], cur);
-                flush!();
-                let node = list.push(Node::Tag("["));
-                stack.push(StackItem::Bracket {
-                    node,
-                    image: false,
-                    active: true,
-                    text_src: i + 1,
-                });
-                i += 1;
-                run = i;
+                // GFM footnote reference `[^label]` whose lowercased label has a
+                // matching definition; otherwise fall through to a link bracket.
+                let fnref = if fno {
+                    parse_footnote_ref(bytes, i).and_then(|(label, consumed)| {
+                        let id = label.to_lowercase();
+                        fn_ids.contains(&id).then_some((id, label, consumed))
+                    })
+                } else {
+                    None
+                };
+                if let Some((id, label, consumed)) = fnref {
+                    escape_html(&src[run..i], cur);
+                    if ast_mode {
+                        flush!(i);
+                        let si = sem.len() as u32;
+                        sem.push(Sem::FootnoteRef {
+                            identifier: id,
+                            label,
+                        });
+                        let fid = list.push(Node::Sem(si));
+                        cspan!(fid, i, i + consumed);
+                        seg = cur.len();
+                    } else {
+                        footnote_ref_html(&id, cur, fn_order, fn_seen);
+                    }
+                    i += consumed;
+                    run = i;
+                } else {
+                    escape_html(&src[run..i], cur);
+                    flush!(i);
+                    let node = list.push(Node::Tag("["));
+                    #[cfg(feature = "ast")]
+                    cspan!(node, i, i + 1);
+                    stack.push(StackItem::Bracket {
+                        node,
+                        image: false,
+                        active: true,
+                        text_src: i + 1,
+                    });
+                    i += 1;
+                    run = i;
+                }
             }
             b'!' if bytes.get(i + 1) == Some(&b'[') => {
                 escape_html(&src[run..i], cur);
-                flush!();
+                flush!(i);
                 let node = list.push(Node::Tag("!["));
+                #[cfg(feature = "ast")]
+                cspan!(node, i, i + 2);
                 stack.push(StackItem::Bracket {
                     node,
                     image: true,
@@ -1317,16 +2139,22 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
             }
             b']' => {
                 escape_html(&src[run..i], cur);
-                flush!();
+                flush!(i);
                 let rb = list.push(Node::Tag("]"));
+                #[cfg(feature = "ast")]
+                cspan!(rb, i, i + 1);
                 let rb_src = i;
                 i += 1;
                 look_for_link_or_image(
-                    src, bytes, &mut i, list, stack, cur, norm, refmap, rb, rb_src,
+                    src, bytes, &mut i, list, stack, cur, norm, refmap, rb, rb_src, ast_mode, sem,
                 );
                 // A resolved link/image appended its tag to `cur` and spanned it
                 // directly; the next text segment starts after it.
                 seg = cur.len();
+                #[cfg(feature = "ast")]
+                {
+                    cseg = i;
+                }
                 run = i;
             }
             b'\n' => {
@@ -1335,8 +2163,33 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                 let trimmed = line.trim_end_matches(' ');
                 let hard = line.len() - trimmed.len() >= 2;
                 escape_html(trimmed, cur);
-                cur.push_str(if hard || HW { "<br />\n" } else { "\n" });
-                i = skip_spaces(bytes, i + 1);
+                if (hard || HW) && ast_mode {
+                    // The text node ends before the trailing spaces; the break
+                    // spans them through the line ending.
+                    let text_end = run + trimmed.len();
+                    flush!(text_end);
+                    let si = sem.len() as u32;
+                    sem.push(Sem::Break);
+                    let brk = list.push(Node::Sem(si));
+                    cspan!(brk, text_end, i + 1);
+                    seg = cur.len();
+                    i = skip_spaces(bytes, i + 1);
+                    #[cfg(feature = "ast")]
+                    {
+                        cseg = i;
+                    }
+                } else {
+                    // Soft break stays as text "\n"; in AST mode it is folded into
+                    // the surrounding text node. When the segment is still empty,
+                    // any trailing spaces dropped here would otherwise become the
+                    // next text node's *leading* bytes — start it at the newline.
+                    #[cfg(feature = "ast")]
+                    if cur.len() == seg {
+                        cseg = i;
+                    }
+                    cur.push_str(if hard || HW { "<br />\n" } else { "\n" });
+                    i = skip_spaces(bytes, i + 1);
+                }
                 run = i;
             }
             // GFM autolinks in delimiter-run text (when on). The URL trigger
@@ -1362,11 +2215,61 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                     i += 1;
                 }
             }
-            b':' if al => {
-                if let Some((s, e)) = gfm_scan_url_at_colon(bytes, i) {
+            b':' if al || emo || dir => {
+                if al && let Some((s, e)) = gfm_scan_url_at_colon(bytes, i) {
                     escape_html(&src[run..s], cur);
                     emit_url(src, s, e, cur);
                     i = e;
+                    run = i;
+                } else if emo && let Some((emoji, e)) = emoji_lookup(bytes, i) {
+                    // Emoji is plain text in both HTML and AST mode: flush the
+                    // pending text and append the emoji to the current segment
+                    // (no node boundary), so it folds into the surrounding text.
+                    escape_html(&src[run..i], cur);
+                    cur.push_str(emoji);
+                    i = e;
+                    run = i;
+                } else if dir
+                    && !(i > 0 && bytes[i - 1] == b':')
+                    && bytes.get(i + 1) != Some(&b':')
+                    && let Some(h) = crate::directive::parse_header(&bytes[i + 1..])
+                    // A trailing `:` means this is a `:shortcode:`-shaped token, not
+                    // a text directive (matches micromark-extension-directive).
+                    && bytes.get(i + 1 + h.consumed) != Some(&b':')
+                {
+                    let ac = i + 1;
+                    let after = ac + h.consumed;
+                    let name = src[ac + h.name_start..ac + h.name_end].to_owned();
+                    let label = h.label.map(|(ls, le)| (ac + ls, ac + le));
+                    escape_html(&src[run..i], cur);
+                    if ast_mode {
+                        flush!(i);
+                        let si = sem.len() as u32;
+                        sem.push(Sem::TextDirective {
+                            name,
+                            attrs: h.attrs,
+                            label: label.map(|(s, e)| (s as u32, e as u32)),
+                        });
+                        let did = list.push(Node::Sem(si));
+                        cspan!(did, i, after);
+                        seg = cur.len();
+                    } else {
+                        // HTML convention: <name attrs>label</name>; the label is
+                        // inline content (sub-rendered with a scratch of its own).
+                        crate::render::directive_open_tag(&name, &h.attrs, cur);
+                        if let Some((ls, le)) = label {
+                            // The label is inline content; sub-render it with a
+                            // scratch of its own (the live one is mid-parse).
+                            let mut tmp = Scratch::new();
+                            let mut html = String::new();
+                            render_inline(&src[ls..le], &mut html, refmap, &mut tmp, opts);
+                            cur.push_str(&html);
+                        }
+                        cur.push_str("</");
+                        cur.push_str(&name);
+                        cur.push('>');
+                    }
+                    i = after;
                     run = i;
                 } else {
                     i += 1;
@@ -1388,16 +2291,43 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                 } else {
                     find_inline(rest)
                 };
-                i += 1 + skip.unwrap_or(bytes.len() - i - 1);
+                let mut adv = 1 + skip.unwrap_or(bytes.len() - i - 1);
+                // Emoji and text directives: `:` is not in the (non-autolink) scan
+                // set, so clamp the skip to the next `:` here when either is on.
+                if (emo || dir)
+                    && let Some(c) = memchr1(&bytes[i + 1..i + adv], b':')
+                {
+                    adv = 1 + c;
+                }
+                i += adv;
             }
         }
     }
     // Trailing spaces at the very end of a block are dropped (no following line
-    // to form a hard break).
-    escape_html(src[run..].trim_end_matches(' '), cur);
-    flush!();
+    // to form a hard break). The last text node ends before them (mdast trims
+    // trailing spaces from the final text node's value *and* position).
+    let block_text_end = run + src[run..].trim_end_matches(' ').len();
+    escape_html(&src[run..block_text_end], cur);
+    flush!(block_text_end);
 
     process_emphasis(list, stack, 0);
+    // SPIKE: in AST mode, capture semantic nodes instead of rendering to `out`.
+    #[cfg(feature = "ast")]
+    if ast_mode {
+        // Sink mode: leave `list`/`cur`/`sem` populated; the caller
+        // (`render_inline_to_sink`) streams them through an `InlineSink` with no
+        // owned token vector.
+        if resolve {
+            return;
+        }
+        // Token mode: materialize the owned `SpanTok` vector. The `list`/`cur`
+        // borrows end at the `list_to_tokens` call, so the disjoint `scratch.toks`
+        // field can be assigned right after.
+        let mut v = Vec::new();
+        list_to_tokens(list, cur, sem, &mut v);
+        scratch.toks = Some(v);
+        return;
+    }
     render_list(list, cur, out);
 }
 
@@ -1416,6 +2346,8 @@ fn look_for_link_or_image(
     refmap: &RefMap,
     rb_node: usize,
     rb_src: usize,
+    ast_mode: bool,
+    sem: &mut Vec<Sem>,
 ) {
     let Some(op) = stack
         .iter()
@@ -1438,7 +2370,9 @@ fn look_for_link_or_image(
     }
 
     let text = &src[text_src..rb_src];
-    let Some((dest_raw, title_raw, new_i)) = parse_link_target(src, bytes, *i, refmap, text, norm)
+    let mut ref_info: Option<RefInfo> = None;
+    let Some((dest_raw, title_raw, new_i)) =
+        parse_link_target(src, bytes, *i, refmap, text, norm, &mut ref_info)
     else {
         stack.remove(op);
         return; // ] stays literal
@@ -1448,33 +2382,58 @@ fn look_for_link_or_image(
     process_emphasis(list, stack, op + 1);
 
     if image {
-        // Alt text = the rendered link text with tags stripped.
-        let mut inner = String::new();
-        let mut node = list.slots[op_node].next;
-        while let Some(idx) = node {
-            if idx == rb_node {
-                break;
+        if ast_mode {
+            // mdast `image`/`imageReference` is a leaf whose `alt` is the
+            // *plain text* of the link text — including nested image alts (which
+            // are `Sem` nodes the HTML renderer would drop).
+            let alt = ast_image_alt(list, op_node, rb_node, cur, sem);
+            let si = sem.len() as u32;
+            sem.push(match ref_info {
+                Some(ri) => Sem::ImageRef {
+                    identifier: ri.identifier,
+                    label: ri.label,
+                    reftype: ri.reftype,
+                    alt,
+                },
+                None => Sem::Image {
+                    url: unescape_string(dest_raw).into_owned(),
+                    title: title_raw.map(|t| unescape_string(t).into_owned()),
+                    alt,
+                },
+            });
+            list.slots[op_node].node = Node::Sem(si);
+            #[cfg(feature = "ast")]
+            {
+                list.slots[op_node].cspan = ((text_src - 2) as u32, new_i as u32);
             }
-            render_node(&list.slots[idx].node, cur, &mut inner);
-            node = list.slots[idx].next;
-        }
-        let alt = strip_tags(&inner);
-
-        // Build the <img> tag into the shared buffer (no per-image allocation).
-        let start = cur.len();
-        cur.push_str("<img src=\"");
-        escape_href(unescape_string(dest_raw).as_ref(), cur);
-        cur.push_str("\" alt=\"");
-        cur.push_str(&alt);
-        cur.push('"');
-        if let Some(t) = title_raw {
-            cur.push_str(" title=\"");
-            escape_attr(unescape_string(t).as_ref(), cur);
+        } else {
+            // Alt text = the rendered link text with tags stripped.
+            let mut inner = String::new();
+            let mut node = list.slots[op_node].next;
+            while let Some(idx) = node {
+                if idx == rb_node {
+                    break;
+                }
+                render_node(&list.slots[idx].node, cur, &mut inner);
+                node = list.slots[idx].next;
+            }
+            let alt = strip_tags(&inner);
+            // Build the <img> tag into the shared buffer (no per-image allocation).
+            let start = cur.len();
+            cur.push_str("<img src=\"");
+            escape_href(unescape_string(dest_raw).as_ref(), cur);
+            cur.push_str("\" alt=\"");
+            cur.push_str(&alt);
             cur.push('"');
+            if let Some(t) = title_raw {
+                cur.push_str(" title=\"");
+                escape_attr(unescape_string(t).as_ref(), cur);
+                cur.push('"');
+            }
+            cur.push_str(" />");
+            let end = cur.len();
+            list.slots[op_node].node = Node::Span { start, end };
         }
-        cur.push_str(" />");
-        let end = cur.len();
-        list.slots[op_node].node = Node::Span { start, end };
 
         // Unlink the link text and the closing bracket.
         let mut c = list.slots[op_node].next;
@@ -1487,20 +2446,42 @@ fn look_for_link_or_image(
             c = nxt;
         }
     } else {
-        // Build the <a> open tag into the shared buffer (no per-link allocation).
-        let start = cur.len();
-        cur.push_str("<a href=\"");
-        escape_href(unescape_string(dest_raw).as_ref(), cur);
-        cur.push('"');
-        if let Some(t) = title_raw {
-            cur.push_str(" title=\"");
-            escape_attr(unescape_string(t).as_ref(), cur);
+        if ast_mode {
+            let si = sem.len() as u32;
+            sem.push(match ref_info {
+                Some(ri) => Sem::LinkRef {
+                    identifier: ri.identifier,
+                    label: ri.label,
+                    reftype: ri.reftype,
+                },
+                None => Sem::LinkOpen {
+                    url: unescape_string(dest_raw).into_owned(),
+                    title: title_raw.map(|t| unescape_string(t).into_owned()),
+                },
+            });
+            list.slots[op_node].node = Node::Sem(si);
+            list.slots[rb_node].node = Node::LinkClose;
+            #[cfg(feature = "ast")]
+            {
+                // The LinkOpen carries the whole link's span (`[`…end).
+                list.slots[op_node].cspan = ((text_src - 1) as u32, new_i as u32);
+            }
+        } else {
+            // Build the <a> open tag into the shared buffer (no per-link allocation).
+            let start = cur.len();
+            cur.push_str("<a href=\"");
+            escape_href(unescape_string(dest_raw).as_ref(), cur);
             cur.push('"');
+            if let Some(t) = title_raw {
+                cur.push_str(" title=\"");
+                escape_attr(unescape_string(t).as_ref(), cur);
+                cur.push('"');
+            }
+            cur.push('>');
+            let end = cur.len();
+            list.slots[op_node].node = Node::Span { start, end };
+            list.slots[rb_node].node = Node::Tag("</a>");
         }
-        cur.push('>');
-        let end = cur.len();
-        list.slots[op_node].node = Node::Span { start, end };
-        list.slots[rb_node].node = Node::Tag("</a>");
 
         // No links inside links: deactivate earlier `[` openers.
         for e in stack.iter_mut() {
@@ -1517,6 +2498,48 @@ fn look_for_link_or_image(
 
     stack.truncate(op); // drop the opener and any delimiters above it
     *i = new_i;
+}
+
+/// SPIKE (AST mode): the *plain text* of an image's link text (the slots between
+/// `op_node` and `rb_node`), for mdast `image.alt`. Mirrors [`list_to_tokens`]'s
+/// text projection: emphasis markers contribute nothing, `Sem` leaves contribute
+/// their plain value (a nested image its `alt`, code its value, …). Defined
+/// unconditionally (dead without `ast`) so the `if ast_mode` branch compiles.
+#[allow(dead_code)]
+fn ast_image_alt(list: &List, op_node: usize, rb_node: usize, cur: &str, sem: &[Sem]) -> String {
+    let mut s = String::new();
+    let mut node = list.slots[op_node].next;
+    while let Some(idx) = node {
+        if idx == rb_node {
+            break;
+        }
+        match &list.slots[idx].node {
+            Node::Span { start, end } => s.push_str(&unescape_html_text(&cur[*start..*end])),
+            Node::Tag(t) => match *t {
+                "<em>" | "</em>" | "<strong>" | "</strong>" | "<del>" | "</del>" => {}
+                lit => s.push_str(lit),
+            },
+            Node::Delim { ch, count, .. } => {
+                for _ in 0..*count {
+                    s.push(*ch as char);
+                }
+            }
+            Node::Sem(i) => match &sem[*i as usize] {
+                Sem::Image { alt, .. } | Sem::ImageRef { alt, .. } => s.push_str(alt),
+                Sem::Code(v) => s.push_str(v),
+                Sem::Autolink { text, .. } => s.push_str(text),
+                Sem::Html(h) => s.push_str(h),
+                Sem::LinkOpen { .. }
+                | Sem::LinkRef { .. }
+                | Sem::Break
+                | Sem::FootnoteRef { .. }
+                | Sem::TextDirective { .. } => {}
+            },
+            Node::LinkClose => {}
+        }
+        node = list.slots[idx].next;
+    }
+    s
 }
 
 /// Remove `<...>` tag spans from `s` to derive image alt text. A nested
@@ -1558,24 +2581,36 @@ fn parse_link_target<'a>(
     refmap: &'a RefMap,
     text: &'a str,
     norm: &mut String,
+    ref_out: &mut Option<RefInfo>,
 ) -> Option<(&'a str, Option<&'a str>, usize)> {
     if bytes.get(i) == Some(&b'(')
         && let Some(r) = parse_inline_paren(src, bytes, i)
     {
-        return Some(r);
+        return Some(r); // inline target: not a reference, `ref_out` stays None
     }
-    // Full reference: [label]
+    // Full/collapsed reference: [label] / []
     if bytes.get(i) == Some(&b'[') {
         if let Some((label, end)) = read_bracket_label(src, bytes, i) {
-            // collapsed [] uses the link text
-            let label = if label.trim().is_empty() { text } else { label };
-            let (d, t) = refmap.get(norm_key(label, norm))?;
+            // collapsed `[]` reuses the link text as the label.
+            let collapsed = label.trim().is_empty();
+            let lab = if collapsed { text } else { label };
+            let (d, t) = refmap.get(norm_key(lab, norm))?;
+            *ref_out = Some(RefInfo {
+                identifier: normalize_label(lab).into_owned(),
+                label: unescape_string(lab).into_owned(),
+                reftype: if collapsed { "collapsed" } else { "full" },
+            });
             return Some((d.as_str(), t.as_deref(), end));
         }
         return None;
     }
     // Shortcut reference: the link text itself is the label.
     let (d, t) = refmap.get(norm_key(text, norm))?;
+    *ref_out = Some(RefInfo {
+        identifier: normalize_label(text).into_owned(),
+        label: unescape_string(text).into_owned(),
+        reftype: "shortcut",
+    });
     Some((d.as_str(), t.as_deref(), i))
 }
 
@@ -1705,23 +2740,43 @@ fn parse_title<'a>(text: &'a str, bytes: &[u8], j: usize) -> Option<(&'a str, us
 
 /// Extract leading link reference definitions from a paragraph's text. Returns
 /// the offset where the remaining paragraph begins and the defs as
-/// `(normalized label, raw destination, raw title)`.
+/// `(raw label, raw destination, raw title)`. The caller normalizes the label
+/// for the [`RefMap`] key (and, in AST mode, keeps the raw label for the
+/// `definition` node).
 pub fn take_ref_defs(text: &str) -> (usize, Vec<(String, String, Option<String>)>) {
     let bytes = text.as_bytes();
     let mut pos = 0;
     let mut defs = Vec::new();
-    while let Some((end, label, dest, title)) = parse_ref_def(text, bytes, pos) {
-        defs.push((normalize_label(&label).into_owned(), dest, title));
+    while let Some((end, label, dest, title, _, _)) = parse_ref_def(text, bytes, pos) {
+        defs.push((label, dest, title));
         pos = end;
     }
     (pos, defs)
 }
 
+/// SPIKE (`ast`): the source byte span `(start, end)` of each leading reference
+/// definition (start at `[`, end after the last significant char — no trailing
+/// whitespace/newline), for the `definition` node's unist `position`.
+#[cfg(feature = "ast")]
+pub fn take_ref_def_spans(text: &str) -> Vec<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut pos = 0;
+    let mut spans = Vec::new();
+    while let Some((end, _, _, _, bracket, content_end)) = parse_ref_def(text, bytes, pos) {
+        spans.push((bracket, content_end));
+        pos = end;
+    }
+    spans
+}
+
+/// Returns `(end, label, dest, title, bracket_start, content_end)`. `bracket_start`
+/// is the `[`; `content_end` is just past the last significant byte (title, or
+/// dest when untitled) — both for AST `position`.
 fn parse_ref_def(
     text: &str,
     bytes: &[u8],
     start: usize,
-) -> Option<(usize, String, String, Option<String>)> {
+) -> Option<(usize, String, String, Option<String>, usize, usize)> {
     let mut j = start;
     let mut ind = 0;
     while ind < 3 && bytes.get(j) == Some(&b' ') {
@@ -1731,6 +2786,7 @@ fn parse_ref_def(
     if bytes.get(j) != Some(&b'[') {
         return None;
     }
+    let bracket = j;
     let (label, after) = read_bracket_label(text, bytes, j)?;
     if bytes.get(after) != Some(&b':') || normalize_label(label).is_empty() {
         return None;
@@ -1752,13 +2808,15 @@ fn parse_ref_def(
             label.to_string(),
             dest.to_string(),
             title.map(String::from),
+            bracket,
+            after_title,
         ));
     }
     // A trailing-junk title invalidates only the title, not the whole def.
     if title.is_some()
         && let Some(end) = ref_line_end(bytes, dj)
     {
-        return Some((end, label.to_string(), dest.to_string(), None));
+        return Some((end, label.to_string(), dest.to_string(), None, bracket, dj));
     }
     None
 }
@@ -1858,8 +2916,26 @@ fn process_emphasis(list: &mut List, stack: &mut Vec<StackItem>, start: usize) {
                         ("<em>", "</em>", 1)
                     }
                 };
-                list.splice_after(onode, Node::Tag(open_tag));
-                list.splice_before(cnode, Node::Tag(close_tag));
+                let otag = list.splice_after(onode, Node::Tag(open_tag));
+                let ctag = list.splice_before(cnode, Node::Tag(close_tag));
+                #[cfg(not(feature = "ast"))]
+                let _ = (otag, ctag);
+                // SPIKE (`ast`): markers are 1 byte each. The opener consumes its
+                // rightmost `use_delims` chars, the closer its leftmost; each tag
+                // gets the consumed chars, and the run's remaining span shrinks
+                // accordingly (so an unconsumed remainder, rendered as literal
+                // text, is positioned correctly). Operate on the *current* run
+                // bounds so repeated matches on the same run stay consistent.
+                #[cfg(feature = "ast")]
+                {
+                    let ud = use_delims as u32;
+                    let o_end = list.slots[onode].cspan.1;
+                    list.slots[otag].cspan = (o_end - ud, o_end);
+                    list.slots[onode].cspan.1 = o_end - ud;
+                    let c_start = list.slots[cnode].cspan.0;
+                    list.slots[ctag].cspan = (c_start, c_start + ud);
+                    list.slots[cnode].cspan.0 = c_start + ud;
+                }
                 set_count(list, onode, ocount - use_delims);
                 set_count(list, cnode, ccount - use_delims);
 

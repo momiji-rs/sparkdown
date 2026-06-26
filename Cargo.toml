@@ -31,12 +31,22 @@ gfm = []
 # element (`<pre class="mermaid">`) for a browser library to pick up, instead of
 # `<pre><code>`. Render-only, zero-dependency. The template for `src/ext/*`.
 diagram = []
+# Emoji extension (opt-in, OFF by default): inline `:shortcode:` → Unicode emoji,
+# matching remark-gemoji (the gemoji dataset, ~1900 codes). Carries a generated
+# data table (src/ext/emoji_data.rs), so it is Cargo-gated to keep it out of the
+# default build.
+emoji = []
 # Mirrors rostdown: opt-in scoped global bump allocator (src/arena.rs). An
 # embedder that enables it must install `sparkdown::ScopedAlloc` as its
 # `#[global_allocator]`. The local bump (src/bump.rs) is always on.
 arena = []
 # Exposes profile_phases() for benchmarks (parse-vs-render split). Diagnostic.
 profiling = []
+# SPIKE: materialize an owned, programmable MDAST (blocks + real inline nodes)
+# and render from it, to measure the cost of an AST/plugin layer vs the direct
+# source->HTML fast path. Off by default; nothing here compiles into the default
+# build. See src/ast.rs and benches/ast_tax.rs.
+ast = []
 # WASI-free WebAssembly interface: raw C-ABI exports (src/wasm.rs) for
 # `wasm32-unknown-unknown`. Zero dependencies — drives from any wasm host.
 wasm = []
@@ -51,6 +61,27 @@ criterion = { version = "5.0.0", package = "codspeed-criterion-compat" }
 [[bench]]
 name = "vs_pulldown"
 harness = false
+
+# Feature-tax: compare code paths (CommonMark / GFM / AST) on one corpus, and
+# the base `to_html` row across builds (does enabling a feature tax the hot
+# path?). Builds under any feature combo; gates each path internally.
+# Run: `cargo bench --bench feature_tax [--features "gfm ast"]`.
+[[bench]]
+name = "feature_tax"
+harness = false
+
+# SPIKE: AST-path tax (build + render an owned MDAST vs the direct fast path).
+# Run: `cargo bench --features ast --bench ast_tax`.
+[[bench]]
+name = "ast_tax"
+harness = false
+required-features = ["ast"]
+
+# SPIKE: emits the mdast JSON corpus consumed by the Node compat harness.
+# Run: `cargo run --features ast --example mdast_json`.
+[[example]]
+name = "mdast_json"
+required-features = ["ast"]
 
 [profile.release]
 opt-level = 3

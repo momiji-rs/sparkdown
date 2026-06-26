@@ -47,6 +47,31 @@ thread_local! {
         core::cell::RefCell::new(crate::Renderer::new());
 }
 
+/// Decode the extension `flags` bitmask shared by every `*_opts` export into an
+/// [`crate::Options`]. Bit layout (LSB first): 0 strikethrough, 1 task lists,
+/// 2 autolinks, 3 tag filter, 4 tables, 5 hard wraps, 6 diagram, 7 heading ids,
+/// 8 frontmatter, 9 footnotes, 10 emoji, 11 external links, 12 definition lists,
+/// 13 directives — 14 flags total. A bit takes effect only if its Cargo feature
+/// was compiled in.
+fn opts_from_flags(flags: u32) -> crate::Options {
+    crate::Options {
+        strikethrough: flags & 1 != 0,
+        tasklist: flags & 2 != 0,
+        autolink: flags & 4 != 0,
+        tagfilter: flags & 8 != 0,
+        tables: flags & 16 != 0,
+        hard_wraps: flags & 32 != 0,
+        diagram: flags & 64 != 0,
+        heading_ids: flags & 128 != 0,
+        frontmatter: flags & 256 != 0,
+        footnotes: flags & 512 != 0,
+        emoji: flags & 1024 != 0,
+        external_links: flags & 2048 != 0,
+        deflist: flags & 4096 != 0,
+        directives: flags & 8192 != 0,
+    }
+}
+
 /// Box `bytes` as a freshly-allocated `[u32 little-endian length][bytes]` buffer
 /// and leak it; the host reads the length then the bytes, and frees with
 /// [`sparkdown_free`]`(ret, 4 + length)`.
@@ -72,10 +97,83 @@ pub unsafe extern "C" fn sparkdown_to_html(ptr: *const u8, len: usize) -> *mut u
     RENDERER.with(|cell| box_html(cell.borrow_mut().render(&md).as_bytes()))
 }
 
+/// SPIKE (`ast` feature): parse `len` UTF-8 bytes at `ptr` and return the mdast
+/// as JSON, in the same `[u32 little-endian length][bytes]` framing as
+/// [`sparkdown_to_html`]. This is the payload the wasm→JS boundary spike moves
+/// across; the host does `JSON.parse` on the bytes to get a remark-shaped tree.
+///
+/// # Safety
+/// `ptr` must point to `len` readable, initialized bytes.
+#[cfg(feature = "ast")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sparkdown_to_mdast_json(ptr: *const u8, len: usize) -> *mut u8 {
+    let input = unsafe { core::slice::from_raw_parts(ptr, len) };
+    let md = String::from_utf8_lossy(input);
+    box_html(crate::ast::to_mdast_json(&md).as_bytes())
+}
+
+/// SPIKE (`ast` feature, route A): parse `len` UTF-8 bytes at `ptr` and return the
+/// mdast in the compact **binary wire format** (see [`crate::ast::to_mdast_wire`]),
+/// in the same `[u32 little-endian length][bytes]` framing as the others. The host
+/// reads the bytes directly out of linear memory into plain JS objects — no JSON.
+///
+/// # Safety
+/// `ptr` must point to `len` readable, initialized bytes.
+#[cfg(feature = "ast")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sparkdown_to_mdast_wire(ptr: *const u8, len: usize) -> *mut u8 {
+    let input = unsafe { core::slice::from_raw_parts(ptr, len) };
+    let md = String::from_utf8_lossy(input);
+    box_html(&crate::ast::to_mdast_wire(&md))
+}
+
+/// Like [`sparkdown_to_mdast_json`] but applies opt-in grammar extensions from a
+/// `flags` bitmask (same layout as [`sparkdown_to_html_opts`]). Returns JSON in
+/// the standard `[u32 length][bytes]` framing. The JSON path carries full inline
+/// children for every node (e.g. a `textDirective`'s `[label]`), so it is the
+/// path the directive alignment gate checks against remark-directive.
+///
+/// # Safety
+/// `ptr` must point to `len` readable, initialized bytes.
+#[cfg(feature = "ast")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sparkdown_to_mdast_json_opts(
+    ptr: *const u8,
+    len: usize,
+    flags: u32,
+) -> *mut u8 {
+    let input = unsafe { core::slice::from_raw_parts(ptr, len) };
+    let md = String::from_utf8_lossy(input);
+    let opts = opts_from_flags(flags);
+    box_html(crate::ast::to_mdast_json_opts(&md, opts).as_bytes())
+}
+
+/// Like [`sparkdown_to_mdast_wire`] but applies opt-in grammar extensions from a
+/// `flags` bitmask (same bit layout as [`sparkdown_to_html_opts`]; bit 8 =
+/// frontmatter). Lets the JS boundary request a frontmatter-aware mdast tree.
+///
+/// # Safety
+/// `ptr` must point to `len` readable, initialized bytes.
+#[cfg(feature = "ast")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sparkdown_to_mdast_wire_opts(
+    ptr: *const u8,
+    len: usize,
+    flags: u32,
+) -> *mut u8 {
+    let input = unsafe { core::slice::from_raw_parts(ptr, len) };
+    let md = String::from_utf8_lossy(input);
+    let opts = opts_from_flags(flags);
+    box_html(&crate::ast::to_mdast_wire_opts(&md, opts))
+}
+
 /// Like [`sparkdown_to_html`] but applies extension options from a bitmask: bit
 /// 0 strikethrough, 1 task lists, 2 autolinks, 3 tag filter, 4 tables, 5 hard
-/// wraps, 6 diagram. A bit only takes effect if the matching Cargo feature was
-/// compiled in. Built with the `gfm` feature.
+/// wraps, 6 diagram, 7 heading ids (built-in slug transform), 8 frontmatter
+/// (YAML `---` / TOML `+++`), 9 footnotes (GFM), 10 emoji, 11 external links,
+/// 12 definition lists, 13 directives. A bit only takes
+/// effect if the matching Cargo feature was compiled in. Built with the `gfm`
+/// feature.
 ///
 /// # Safety
 /// `ptr` must point to `len` readable, initialized bytes.
@@ -84,15 +182,7 @@ pub unsafe extern "C" fn sparkdown_to_html(ptr: *const u8, len: usize) -> *mut u
 pub unsafe extern "C" fn sparkdown_to_html_opts(ptr: *const u8, len: usize, flags: u32) -> *mut u8 {
     let input = unsafe { core::slice::from_raw_parts(ptr, len) };
     let md = String::from_utf8_lossy(input);
-    let opts = crate::Options {
-        strikethrough: flags & 1 != 0,
-        tasklist: flags & 2 != 0,
-        autolink: flags & 4 != 0,
-        tagfilter: flags & 8 != 0,
-        tables: flags & 16 != 0,
-        hard_wraps: flags & 32 != 0,
-        diagram: flags & 64 != 0,
-    };
+    let opts = opts_from_flags(flags);
     RENDERER.with(|cell| {
         let mut r = cell.borrow_mut();
         r.set_options(opts);

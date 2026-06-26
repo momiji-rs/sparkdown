@@ -5,7 +5,7 @@
 //! exact whitespace, including tight-vs-loose list items.
 
 use crate::block::{Kind, Tree};
-use crate::inline::{Scratch, render_inline};
+use crate::inline::{Scratch, encode_footnote_id, render_inline};
 use crate::options::Options;
 use crate::scan::{escape_block_mask, memchr1};
 #[cfg(feature = "gfm")]
@@ -25,7 +25,233 @@ pub fn render(tree: &Tree) -> String {
 /// Render `tree` into a caller-owned buffer with a caller-owned scratch — both
 /// reused across renders by [`crate::Renderer`]. The caller clears `out`.
 pub(crate) fn render_with(tree: &Tree, out: &mut String, scratch: &mut Scratch) {
+    // Per-document slug de-dup state for the built-in heading-id transform.
+    if tree.opts.heading_ids {
+        scratch.slugs.clear();
+    }
+    // Per-document footnote state: seed the reference set (so `[^x]` resolves) and
+    // reset the numbering accumulated while rendering references.
+    if tree.opts.footnotes {
+        scratch.footnote_ids.clone_from(&tree.footnote_ids);
+        scratch.footnote_order.clear();
+        scratch.footnote_seen.clear();
+    }
     children(tree, tree.root, out, scratch);
+    // The footnotes <section> (referenced definitions, in reference order) follows
+    // the document body — matching mdast-util-to-hast's footer.
+    if tree.opts.footnotes && !scratch.footnote_order.is_empty() {
+        render_footnote_section(tree, out, scratch);
+    }
+    // External-link transform: a single post-render pass over the finished HTML.
+    if tree.opts.external_links {
+        decorate_external_links(out);
+    }
+}
+
+/// Add `rel="nofollow"` to every `<a>` whose href begins with `http://`/`https://`
+/// (the rehype-external-links default). Safe as a post-pass because `<` is always
+/// escaped to `&lt;` in text/code, so the literal `<a href="` appears only in
+/// genuine link tags (inline links, autolinks, and raw-HTML links — which the
+/// rehype transform also decorates). `rel` is inserted before the tag's `>`, after
+/// any `href`/`title` (matching hast property order); the scan is quote-aware so a
+/// `>` inside an attribute value is not mistaken for the tag end.
+fn decorate_external_links(out: &mut String) {
+    const PAT: &str = "<a href=\"";
+    if !out.contains(PAT) {
+        return;
+    }
+    let src = std::mem::take(out);
+    let mut rest = src.as_str();
+    while let Some(p) = rest.find(PAT) {
+        out.push_str(&rest[..p]);
+        let tag = &rest[p..]; // starts with `<a href="`
+        let href_start = PAT.len();
+        let Some(q) = tag[href_start..].find('"') else {
+            out.push_str(tag);
+            return;
+        };
+        let href = &tag[href_start..href_start + q];
+        // Find the tag-closing `>` (quote-aware), starting past the href value.
+        let b = tag.as_bytes();
+        let mut j = href_start + q + 1;
+        let mut in_quote = false;
+        while j < b.len() {
+            match b[j] {
+                b'"' => in_quote = !in_quote,
+                b'>' if !in_quote => break,
+                _ => {}
+            }
+            j += 1;
+        }
+        out.push_str(&tag[..j]);
+        if href.starts_with("http://") || href.starts_with("https://") {
+            out.push_str(" rel=\"nofollow\"");
+        }
+        rest = &tag[j..]; // from the `>` onward
+    }
+    out.push_str(rest);
+}
+
+/// Render the GFM footnotes `<section>` exactly as remark-rehype does: an ordered
+/// list of the referenced definitions (in first-reference order), each with one
+/// backref per reference appended to its last paragraph (or as a bare anchor when
+/// the last block is not a paragraph).
+fn render_footnote_section(tree: &Tree, out: &mut String, scratch: &mut Scratch) {
+    // Map each referenced identifier to its first definition node (first wins).
+    let order: Vec<String> = scratch.footnote_order.clone();
+    cr(out);
+    out.push_str(
+        "<section data-footnotes class=\"footnotes\">\
+         <h2 class=\"sr-only\" id=\"footnote-label\">Footnotes</h2>\n<ol>\n",
+    );
+    for (i, id) in order.iter().enumerate() {
+        let num = i + 1;
+        let refcount = scratch.footnote_seen.get(id).copied().unwrap_or(1);
+        let enc = encode_footnote_id(id);
+        let Some(def) = first_footnote_def(tree, id) else {
+            continue;
+        };
+        out.push_str("<li id=\"user-content-fn-");
+        out.push_str(&enc);
+        out.push_str("\">\n");
+        render_footnote_def_body(tree, def, num, refcount, &enc, out, scratch);
+        out.push_str("</li>\n");
+    }
+    out.push_str("</ol>\n</section>");
+}
+
+/// The first `FootnoteDef` node whose identifier matches (definitions are matched
+/// first-wins, like link reference definitions).
+fn first_footnote_def(tree: &Tree, id: &str) -> Option<usize> {
+    (0..tree.nodes.len())
+        .find(|&n| tree.nodes[n].kind == Kind::FootnoteDef && tree.fn_def(n).identifier == id)
+}
+
+/// Append `↩` backref anchor(s) for footnote `num` (one per reference, `1..=count`).
+/// `nl` adds a trailing newline after each (used in the bare, non-paragraph case).
+fn footnote_backrefs(out: &mut String, enc: &str, num: usize, count: u32, nl: bool) {
+    for k in 1..=count {
+        out.push_str("<a href=\"#user-content-fnref-");
+        out.push_str(enc);
+        if k > 1 {
+            out.push('-');
+            out.push_str(&k.to_string());
+        }
+        out.push_str("\" data-footnote-backref=\"\" aria-label=\"Back to reference ");
+        out.push_str(&num.to_string());
+        if k > 1 {
+            out.push('-');
+            out.push_str(&k.to_string());
+        }
+        out.push_str("\" class=\"data-footnote-backref\">↩");
+        if k > 1 {
+            out.push_str("<sup>");
+            out.push_str(&k.to_string());
+            out.push_str("</sup>");
+        }
+        out.push_str("</a>");
+        if nl {
+            out.push('\n');
+        } else if k < count {
+            out.push(' ');
+        }
+    }
+}
+
+/// Render a footnote definition's blocks into the `<li>`, injecting backrefs into
+/// the last paragraph (or appending them as bare anchors after a non-paragraph
+/// last block).
+fn render_footnote_def_body(
+    tree: &Tree,
+    def: usize,
+    num: usize,
+    refcount: u32,
+    enc: &str,
+    out: &mut String,
+    scratch: &mut Scratch,
+) {
+    let mut c = tree.first_child(def);
+    while let Some(ci) = c {
+        let is_last = tree.next_sibling(ci).is_none();
+        if is_last && tree.nodes[ci].kind == Kind::Paragraph {
+            // Backrefs go inside the final paragraph, after a separating space.
+            cr(out);
+            out.push_str("<p>");
+            render_inline(tree.content(ci), out, &tree.refmap, scratch, tree.opts);
+            out.push(' ');
+            footnote_backrefs(out, enc, num, refcount, false);
+            out.push_str("</p>");
+            cr(out);
+        } else {
+            render_node(tree, ci, out, scratch);
+            if is_last {
+                // Last block is not a paragraph: backrefs follow as bare anchors.
+                cr(out);
+                footnote_backrefs(out, enc, num, refcount, true);
+            }
+        }
+        c = tree.next_sibling(ci);
+    }
+}
+
+/// PROTOTYPE built-in transform: derive a github-slugger-style id from a heading's
+/// already-rendered inline HTML (strip tags, unescape the four named entities,
+/// lowercase, keep `[a-z0-9_-]` + Unicode alphanumerics, spaces→`-`), then
+/// de-duplicate with a `-N` suffix. The Rust equivalent of rehype-slug, applied
+/// in the render walk so the common "headings get anchors" task never leaves wasm.
+fn heading_slug(html: &str, seen: &mut std::collections::HashMap<String, u32>) -> String {
+    // 1. strip tags + unescape entities -> plain text
+    let mut text = String::with_capacity(html.len());
+    let mut rest = html;
+    while !rest.is_empty() {
+        let b = rest.as_bytes()[0];
+        if b == b'<' {
+            rest = rest.find('>').map_or("", |p| &rest[p + 1..]);
+        } else if b == b'&' {
+            if let Some(r) = rest.strip_prefix("&amp;") {
+                text.push('&');
+                rest = r;
+            } else if let Some(r) = rest.strip_prefix("&lt;") {
+                text.push('<');
+                rest = r;
+            } else if let Some(r) = rest.strip_prefix("&gt;") {
+                text.push('>');
+                rest = r;
+            } else if let Some(r) = rest.strip_prefix("&quot;") {
+                text.push('"');
+                rest = r;
+            } else {
+                text.push('&');
+                rest = &rest[1..];
+            }
+        } else {
+            let c = rest.chars().next().unwrap();
+            text.push(c);
+            rest = &rest[c.len_utf8()..];
+        }
+    }
+    // 2. slugify
+    let mut slug = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c == ' ' {
+            slug.push('-');
+        } else if c == '-' || c == '_' {
+            slug.push(c);
+        } else if c.is_alphanumeric() {
+            slug.extend(c.to_lowercase());
+        }
+    }
+    // 3. de-duplicate (first wins as-is; repeats get -1, -2, … like github-slugger)
+    match seen.get_mut(&slug) {
+        Some(n) => {
+            *n += 1;
+            format!("{slug}-{n}")
+        }
+        None => {
+            seen.insert(slug.clone(), 0);
+            slug
+        }
+    }
 }
 
 /// Emit a newline unless `out` is empty or already ends with one. One byte
@@ -36,6 +262,23 @@ fn cr(out: &mut String) {
         None | Some(b'\n') => {}
         _ => out.push('\n'),
     }
+}
+
+/// Write a directive's opening tag `<name k="v" …>` (the remark-directive HTML
+/// convention: the name is the element, attributes become HTML attributes). The
+/// name is emitted verbatim; attribute values are HTML-escaped. Shared with the
+/// inline text-directive renderer.
+pub(crate) fn directive_open_tag(name: &str, attrs: &[(String, String)], out: &mut String) {
+    out.push('<');
+    out.push_str(name);
+    for (k, v) in attrs {
+        out.push(' ');
+        out.push_str(k);
+        out.push_str("=\"");
+        escape_html(v, out);
+        out.push('"');
+    }
+    out.push('>');
 }
 
 fn children(tree: &Tree, idx: usize, out: &mut String, scratch: &mut Scratch) {
@@ -82,8 +325,26 @@ fn render_node(tree: &Tree, idx: usize, out: &mut String, scratch: &mut Scratch)
             cr(out);
             out.push_str("<h");
             out.push((b'0' + level) as char);
-            out.push('>');
-            render_inline(tree.content(idx), out, &tree.refmap, scratch, tree.opts);
+            if tree.opts.heading_ids {
+                // Built-in transform: render the inline once into a scratch buffer,
+                // derive the id from it, then reuse the buffer (no double render).
+                let mut inner = String::new();
+                render_inline(
+                    tree.content(idx),
+                    &mut inner,
+                    &tree.refmap,
+                    scratch,
+                    tree.opts,
+                );
+                let slug = heading_slug(&inner, &mut scratch.slugs);
+                out.push_str(" id=\"");
+                out.push_str(&slug);
+                out.push_str("\">");
+                out.push_str(&inner);
+            } else {
+                out.push('>');
+                render_inline(tree.content(idx), out, &tree.refmap, scratch, tree.opts);
+            }
             out.push_str("</h");
             out.push((b'0' + level) as char);
             out.push('>');
@@ -123,6 +384,78 @@ fn render_node(tree: &Tree, idx: usize, out: &mut String, scratch: &mut Scratch)
                 out.push_str(tree.content(idx));
             }
             cr(out);
+        }
+        // SPIKE (`ast` feature): reference definitions produce no HTML.
+        #[cfg(feature = "ast")]
+        Kind::Definition => {}
+        // Frontmatter produces no HTML output (matching remark-frontmatter).
+        Kind::Frontmatter => {}
+        // A footnote definition emits nothing where it sits; referenced ones are
+        // collected and rendered as the footnotes <section> after the document.
+        Kind::FootnoteDef => {}
+        Kind::DefList => {
+            cr(out);
+            out.push_str("<dl>\n");
+            children(tree, idx, out, scratch);
+            out.push_str("</dl>");
+            cr(out);
+        }
+        Kind::DefTerm => {
+            // Each source line of the term holder renders as its own <dt>.
+            for line in tree.content(idx).split('\n') {
+                let line = line.trim_matches([' ', '\t', '\r']);
+                if line.is_empty() {
+                    continue;
+                }
+                out.push_str("<dt>");
+                render_inline(line, out, &tree.refmap, scratch, tree.opts);
+                out.push_str("</dt>\n");
+            }
+        }
+        Kind::LeafDirective => {
+            // Convention: the directive name is the element; the `[label]` is its
+            // inline content. (HTML is not the gate-able output; mdast is.)
+            let d = tree.directive(idx);
+            cr(out);
+            directive_open_tag(&d.name, &d.attrs, out);
+            if let Some((s, e)) = d.label {
+                render_inline(
+                    tree.source_range(s, e),
+                    out,
+                    &tree.refmap,
+                    scratch,
+                    tree.opts,
+                );
+            }
+            out.push_str("</");
+            out.push_str(&d.name);
+            out.push('>');
+            cr(out);
+        }
+        Kind::ContainerDirective => {
+            let d = tree.directive(idx);
+            cr(out);
+            directive_open_tag(&d.name, &d.attrs, out);
+            cr(out);
+            children(tree, idx, out, scratch);
+            cr(out);
+            out.push_str("</");
+            out.push_str(&d.name);
+            out.push('>');
+            cr(out);
+        }
+        Kind::DefDesc => {
+            let body = tree.content(idx).trim_matches([' ', '\t', '\n', '\r']);
+            if node.level == 1 {
+                // Loose: a blank line preceded the marker, so wrap the body in <p>.
+                out.push_str("<dd>\n<p>");
+                render_inline(body, out, &tree.refmap, scratch, tree.opts);
+                out.push_str("</p>\n</dd>\n");
+            } else {
+                out.push_str("<dd>");
+                render_inline(body, out, &tree.refmap, scratch, tree.opts);
+                out.push_str("\n</dd>\n");
+            }
         }
         Kind::BlockQuote => {
             cr(out);

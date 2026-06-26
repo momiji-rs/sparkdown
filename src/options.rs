@@ -26,6 +26,41 @@ pub struct Options {
     /// Diagram extension: render `mermaid` fenced code blocks as a client-side
     /// `<pre class="mermaid">` wrapper. Effective only with the `diagram` feature.
     pub diagram: bool,
+    /// Built-in transform (PROTOTYPE): emit a github-slugger-style `id` on every
+    /// heading during the render walk (the Rust equivalent of rehype-slug), so the
+    /// common "headings get anchors" task stays on the all-wasm fast path instead
+    /// of crossing into a JS plugin. Applied in `render.rs`; not GFM-gated.
+    pub heading_ids: bool,
+    /// Frontmatter: a YAML (`---`) or TOML (`+++`) fenced block at the very start
+    /// of the document (the remark-frontmatter grammar). Renders to nothing; with
+    /// the `ast` feature it becomes a `yaml`/`toml` mdast node. Not GFM-gated.
+    pub frontmatter: bool,
+    /// Emoji shortcodes: inline `:smile:` → 😄 (the remark-gemoji dataset).
+    /// Effective only with the `emoji` Cargo feature (it carries the data table).
+    pub emoji: bool,
+    /// External-link transform (the rehype-external-links default): add
+    /// `rel="nofollow"` to every link whose href begins with `http://`/`https://`
+    /// (inline links and autolinks alike; `mailto:`/relative/fragment untouched).
+    /// A post-render pass — `<a href="` only ever appears in real link tags.
+    pub external_links: bool,
+    /// GFM footnotes: inline `[^label]` references and `[^label]: …` block
+    /// definitions (the remark-gfm grammar). References resolve only when a
+    /// matching definition exists. mdast: `footnoteReference`/`footnoteDefinition`;
+    /// HTML: the remark-rehype footnotes `<section>` with numbered backrefs. The
+    /// label set is collected in the block pass, so forward references work.
+    pub footnotes: bool,
+    /// Definition lists (the pandoc / remark-definition-list grammar): a term
+    /// paragraph followed by one or more `: definition` lines becomes
+    /// `<dl><dt>…</dt><dd>…</dd></dl>`. A blank line before a `:` marker makes
+    /// that definition loose (its body is wrapped in `<p>`). Not GFM-gated.
+    pub deflist: bool,
+    /// Directives (the remark-directive grammar): inline `:name[label]{attrs}`
+    /// (text), `::name[label]{attrs}` (leaf), and `:::name[label]{attrs}` … `:::`
+    /// (container). mdast emits `textDirective`/`leafDirective`/`containerDirective`
+    /// with a `name` and an `attributes` object (the canonical, gate-able output);
+    /// HTML follows the common convention (the name becomes the element, with
+    /// `#id`/`.class`/`key=val` as its attributes). Not GFM-gated.
+    pub directives: bool,
 }
 
 impl Options {
@@ -47,6 +82,14 @@ impl Options {
     #[cfg(not(feature = "diagram"))]
     pub(crate) const DIAGRAM: bool = false;
 
+    /// `true` iff the `emoji` Cargo feature is compiled in. Used as
+    /// `Options::EMOJI && opts.emoji` so the lookup and its data table fold away
+    /// entirely without the feature.
+    #[cfg(feature = "emoji")]
+    pub(crate) const EMOJI: bool = true;
+    #[cfg(not(feature = "emoji"))]
+    pub(crate) const EMOJI: bool = false;
+
     /// GitHub Flavored Markdown: every GFM extension enabled. (Effective only
     /// when the crate is built with the `gfm` feature.)
     pub const fn gfm() -> Self {
@@ -58,6 +101,13 @@ impl Options {
             tables: true,
             hard_wraps: false,
             diagram: false,
+            heading_ids: false,
+            frontmatter: false,
+            emoji: false,
+            external_links: false,
+            footnotes: false,
+            deflist: false,
+            directives: false,
         }
     }
 }

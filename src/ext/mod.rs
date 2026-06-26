@@ -18,3 +18,6 @@
 
 #[cfg(feature = "diagram")]
 pub(crate) mod diagram;
+
+#[cfg(feature = "emoji")]
+pub(crate) mod emoji;

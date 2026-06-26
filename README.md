@@ -194,6 +194,56 @@ RUSTFLAGS="-C target-feature=+simd128,+bulk-memory" \
   cargo build --release --features wasm --target wasm32-unknown-unknown
 ```
 
+## mdast & the unified ecosystem (experimental)
+
+Behind the opt-in `ast` Cargo feature, sparkdown can emit a full **[mdast](https://github.com/syntax-tree/mdast)**
+syntax tree — the exact shape `remark-parse` produces — so it drops into the
+unified / remark / rehype ecosystem as a parser:
+
+```js
+const html = String(await unified()
+  .use(sparkdown)        // parse markdown → mdast IN WASM
+  .use(remarkToc)        // ↓ any existing remark/rehype plugin, unmodified
+  .use(remarkRehype)
+  .use(rehypeStringify)
+  .process(markdown))
+```
+
+It emits **plain unist objects**, not opaque handles, so every existing remark
+plugin works without rewriting. Verified against the reference: sparkdown's tree
+**deep-equals `mdast-util-from-markdown` on all 652** CommonMark examples —
+*including* `position` (line/column/offset) — and a unified pipeline with real
+plugins (remark-toc, remark-emoji, rehype-slug, remark-lint) produces HTML
+**identical to the same pipeline on `remark-parse` for all 652** (compared after
+normalizing the single trailing-newline difference between cmark and rehype).
+
+The tree crosses the wasm→JS boundary as a compact **binary wire format** read
+straight out of linear memory into plain objects — no JSON serialize, no
+`JSON.parse`. On a fully-materialized mdast tree (the whole tree walked, so no
+lazy backend is skipping work) it's the fastest markdown→mdast path we've
+measured — ahead of [Sätteri](https://github.com/bruits/satteri) (the native
+Rust+JS competitor) and an order of magnitude past pure-JS remark:
+
+| engine                              |     time | relative |
+| ----------------------------------- | -------: | -------: |
+| **sparkdown — mdast (wire)**        | **~2.8 ms** |  1.00×  |
+| Sätteri (Rust core, napi native)    |  ~4.0 ms |   ~1.4×  |
+| sparkdown — mdast (JSON boundary)   |  ~7.5 ms |   ~2.7×  |
+| remark (`mdast-util-from-markdown`) | ~73 ms |    ~26×  |
+
+<sub>CommonMark spec (198 KB), best-of-15, fully materialized, Apple Mac Studio,
+measured in Node. Ratios are the portable part; absolute times are
+machine-specific. Sätteri's native binding varies run-to-run (~3.9–4.3 ms); the
+lead is ~1.4–1.5×. Sätteri keeps the tree in a Rust arena behind a handle (fast
+when you *never* read it); sparkdown materializes plain objects every time, yet
+still wins once the tree is actually traversed — and stays drop-in for any remark
+plugin and any wasm host.</sub>
+
+This path is **experimental** — behind the `ast` feature and not yet exposed in
+the npm package. The harness under `harness/` builds it and runs the
+compatibility gates and benchmarks (`cargo build --release --features wasm,ast
+--target wasm32-unknown-unknown`, then `npm run gate` / `npm run e2e`).
+
 ## What was reused from rostdown (and what wasn't)
 
 The performance substrate is grammar-agnostic and lifted **verbatim**:
