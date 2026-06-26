@@ -119,12 +119,12 @@ function readWire(ex, markdown, flags, withPos) {
   };
   const str = () => {
     const hdr = u32();
-    const n = hdr & 0x7fffffff;
+    const n = hdr & 0x7fffffff; // high bit (Rust's is-ASCII hint) is unused — see below
     const end = p + n;
-    const s =
-      hdr >>> 31 && n <= 512
-        ? String.fromCharCode.apply(null, u8.subarray(p, end))
-        : decoder.decode(u8.subarray(p, end));
+    // Measured: V8's native TextDecoder beats `String.fromCharCode.apply(subarray)`
+    // (the argument-spread dominates) for this mix of mostly-short strings. Skip the
+    // call entirely for empty strings (common: blank opt()s, empty code).
+    const s = n === 0 ? "" : decoder.decode(u8.subarray(p, end));
     p = end;
     return s;
   };
