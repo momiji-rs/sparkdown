@@ -36,6 +36,29 @@ jobs:
       - name: Test (full + ast) — every extension + mdast + 652 conformance
         run: cargo test --features full,ast --verbose
 
+  # Each extension is cfg-gated by keeping its Kind variants compiled while
+  # cfg-ing out producers + adding `#[cfg(not(feature))]` companion arms. The
+  # failure mode (a forgotten companion → non-exhaustive match, or a wrong gate)
+  # only surfaces in a build where exactly that feature is on/off — configs the
+  # `test` job above never builds. This matrix builds each feature in isolation
+  # (and the cross-feature `ast` pairs, where companions matter most), with
+  # `-D warnings`, so a missing/misplaced gate fails CI.
+  feature-matrix:
+    name: feature matrix (each extension compiles in isolation)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-hack
+      - name: check each feature alone + the ast/shared-marker pairs
+        run: |
+          cargo hack check --each-feature --no-dev-deps
+          for f in footnotes deflist directives frontmatter external_links emoji diagram; do
+            cargo check --features "ast,$f"
+          done
+          cargo check --features deflist,directives
+
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
