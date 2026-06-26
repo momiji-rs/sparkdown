@@ -63,6 +63,7 @@ pub enum Mdast {
     /// TOML frontmatter (`+++`); `value` is the text between the fences.
     Toml(String),
     /// GFM footnote definition `[^label]: …` — a block container.
+    #[cfg(feature = "footnotes")]
     FootnoteDefinition {
         identifier: String,
         label: String,
@@ -123,6 +124,7 @@ pub enum Mdast {
         alt: String,
     },
     /// GFM footnote reference `[^label]` (inline leaf).
+    #[cfg(feature = "footnotes")]
     FootnoteReference {
         identifier: String,
         label: String,
@@ -267,8 +269,12 @@ pub fn to_mdast_opts(src: &str, opts: crate::Options) -> Mdast {
 /// A fresh [`Scratch`] seeded with the tree's footnote labels, so inline
 /// `[^label]` references resolve while building the mdast (forward refs work
 /// because the label set is collected in the block pass).
-fn fn_scratch(tree: &Tree) -> Scratch {
+fn fn_scratch(
+    #[cfg_attr(not(feature = "footnotes"), allow(unused_variables))] tree: &Tree,
+) -> Scratch {
+    #[cfg_attr(not(feature = "footnotes"), allow(unused_mut))]
     let mut scratch = Scratch::new();
+    #[cfg(feature = "footnotes")]
     if tree.opts.footnotes {
         scratch.footnote_ids.clone_from(&tree.footnote_ids);
     }
@@ -363,6 +369,11 @@ fn block(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> (Mdast
             };
             (inner, sb, se)
         }
+        // The `FootnoteDef` variant is always compiled (to keep the hot block
+        // matches stable), but a node only exists with the `footnotes` feature.
+        #[cfg(not(feature = "footnotes"))]
+        Kind::FootnoteDef => unreachable!("FootnoteDef node requires the `footnotes` feature"),
+        #[cfg(feature = "footnotes")]
         Kind::FootnoteDef => {
             let d = tree.fn_def(idx);
             let (identifier, label) = (d.identifier.clone(), d.label.clone());
@@ -744,6 +755,7 @@ fn build_inline(
                     }),
                 ));
             }
+            #[cfg(feature = "footnotes")]
             InlineTok::FootnoteRef { identifier, label } => {
                 let p = mkpos(start, end);
                 stack.last_mut().unwrap().1.push(Mdast::Positioned(
@@ -1099,6 +1111,11 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
             w_str(value, out);
             se
         }
+        // The `FootnoteDef` variant is always compiled (to keep the hot block
+        // matches stable), but a node only exists with the `footnotes` feature.
+        #[cfg(not(feature = "footnotes"))]
+        Kind::FootnoteDef => unreachable!("FootnoteDef node requires the `footnotes` feature"),
+        #[cfg(feature = "footnotes")]
         Kind::FootnoteDef => {
             let d = tree.fn_def(idx);
             out.push(22);
@@ -1514,6 +1531,7 @@ impl InlineSink for WireSink<'_> {
         w_str(alt, self.out);
         self.bump();
     }
+    #[cfg(feature = "footnotes")]
     fn footnote_ref(&mut self, identifier: &str, label: &str, start: u32, end: u32) {
         self.leaf(23, start, end);
         w_str(identifier, self.out);
@@ -1787,6 +1805,7 @@ fn write_json_pos(node: &Mdast, pos: Option<&Pos>, out: &mut String) {
             key("value", out);
             json_str(v, out);
         }
+        #[cfg(feature = "footnotes")]
         Mdast::FootnoteDefinition {
             identifier,
             label,
@@ -1871,6 +1890,7 @@ fn write_json_pos(node: &Mdast, pos: Option<&Pos>, out: &mut String) {
             key("children", out);
             json_children(children, out);
         }
+        #[cfg(feature = "footnotes")]
         Mdast::FootnoteReference { identifier, label } => {
             out.push_str("\"footnoteReference\",");
             key("identifier", out);
@@ -2009,16 +2029,19 @@ pub fn node_count(node: &Mdast) -> usize {
     match node {
         Root(c) | Paragraph(c) | Blockquote(c) | Emphasis(c) | Strong(c) | Delete(c)
         | DefList(c) | DefListTerm(c) | DirectiveLabel(c) => 1 + kids(c),
+        #[cfg(feature = "footnotes")]
+        FootnoteDefinition { children, .. } => 1 + kids(children),
         Heading { children, .. }
         | List { children, .. }
         | ListItem { children, .. }
         | Link { children, .. }
-        | FootnoteDefinition { children, .. }
         | DefListDescription { children, .. }
         | ContainerDirective { children, .. }
         | LeafDirective { children, .. }
         | TextDirective { children, .. }
         | LinkReference { children, .. } => 1 + kids(children),
+        #[cfg(feature = "footnotes")]
+        FootnoteReference { .. } => 1,
         ThematicBreak
         | Code { .. }
         | Definition { .. }
@@ -2029,7 +2052,6 @@ pub fn node_count(node: &Mdast) -> usize {
         | InlineCode(_)
         | Break
         | Image { .. }
-        | FootnoteReference { .. }
         | ImageReference { .. } => 1,
         Positioned(_, inner) => node_count(inner),
     }

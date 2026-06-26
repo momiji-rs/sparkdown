@@ -650,6 +650,7 @@ enum Sem {
         alt: String,
     },
     /// GFM `[^label]` → mdast `footnoteReference` (a leaf).
+    #[cfg(feature = "footnotes")]
     FootnoteRef { identifier: String, label: String },
     /// remark-directive inline `:name[label]{attrs}` → mdast `textDirective`. The
     /// `label` is a content byte range (re-tokenized into children at build time).
@@ -714,6 +715,7 @@ pub enum InlineTok {
         alt: String,
     },
     /// mdast `footnoteReference` (leaf).
+    #[cfg(feature = "footnotes")]
     FootnoteRef { identifier: String, label: String },
     /// mdast `textDirective`. `label` is a content byte range whose inline content
     /// becomes the directive's children (re-tokenized by the AST builder).
@@ -843,6 +845,7 @@ fn list_to_tokens(list: &List, cur: &str, sem: &[Sem], out: &mut Vec<SpanTok>) {
                     reftype,
                     alt: alt.clone(),
                 },
+                #[cfg(feature = "footnotes")]
                 Sem::FootnoteRef { identifier, label } => InlineTok::FootnoteRef {
                     identifier: identifier.clone(),
                     label: label.clone(),
@@ -899,6 +902,7 @@ pub trait InlineSink {
         start: u32,
         end: u32,
     );
+    #[cfg(feature = "footnotes")]
     fn footnote_ref(&mut self, identifier: &str, label: &str, start: u32, end: u32);
     /// A remark-directive `textDirective`. `label` is a content byte range whose
     /// inline content forms the children (the wire emitter resolves it best-effort).
@@ -1002,6 +1006,7 @@ fn emit_inline<S: InlineSink>(list: &List, cur: &str, sem: &[Sem], sink: &mut S)
                         reftype,
                         alt,
                     } => sink.imageref(identifier, label, reftype, alt, s, e),
+                    #[cfg(feature = "footnotes")]
                     Sem::FootnoteRef { identifier, label } => {
                         sink.footnote_ref(identifier, label, s, e)
                     }
@@ -1229,13 +1234,16 @@ pub struct Scratch {
     /// (populated per-document by the renderer/mdast builder before walking, like
     /// `slugs`; survives `reset()`). A `[^label]` is a `footnoteReference` only if
     /// its lowercased label is in here — otherwise it stays literal text.
+    #[cfg(feature = "footnotes")]
     pub(crate) footnote_ids: std::collections::HashSet<String>,
     /// GFM footnotes (HTML path): identifiers in first-reference order — a ref's
     /// number is its index here + 1. Document-level (cleared per document, like
     /// `slugs`); the footnotes `<section>` is emitted in this order.
+    #[cfg(feature = "footnotes")]
     pub(crate) footnote_order: Vec<String>,
     /// GFM footnotes (HTML path): per-identifier count of references emitted so
     /// far, for the `fnref-id-2`, `-3`, … suffixes and the backref count.
+    #[cfg(feature = "footnotes")]
     pub(crate) footnote_seen: std::collections::HashMap<String, u32>,
     #[cfg(feature = "ast")]
     toks: Option<Vec<SpanTok>>,
@@ -1256,8 +1264,11 @@ impl Scratch {
             norm: String::with_capacity(48),
             sem: Vec::new(),
             slugs: std::collections::HashMap::new(),
+            #[cfg(feature = "footnotes")]
             footnote_ids: std::collections::HashSet::new(),
+            #[cfg(feature = "footnotes")]
             footnote_order: Vec::new(),
+            #[cfg(feature = "footnotes")]
             footnote_seen: std::collections::HashMap::new(),
             #[cfg(feature = "ast")]
             toks: None,
@@ -1278,6 +1289,7 @@ impl Scratch {
 /// Parse a GFM footnote reference `[^label]` at `bytes[i]` (`[`). Returns
 /// `(label, bytes_consumed)`. Same label rules as a definition opener: non-empty,
 /// no whitespace, no unescaped brackets (backslash escapes kept); ends at `]`.
+#[cfg(feature = "footnotes")]
 fn parse_footnote_ref(bytes: &[u8], i: usize) -> Option<(String, usize)> {
     if bytes.get(i + 1) != Some(&b'^') {
         return None;
@@ -1303,6 +1315,7 @@ fn parse_footnote_ref(bytes: &[u8], i: usize) -> Option<(String, usize)> {
 /// `encodeURIComponent(identifier)` — the exact transform `mdast-util-to-hast`
 /// applies to a footnote identifier before building `fn-…`/`fnref-…` ids and
 /// hrefs (keeps `A-Za-z0-9-_.!~*'()`, percent-encodes the rest as UTF-8).
+#[cfg(feature = "footnotes")]
 pub(crate) fn encode_footnote_id(id: &str) -> String {
     let mut out = String::with_capacity(id.len());
     for &b in id.as_bytes() {
@@ -1340,6 +1353,7 @@ pub(crate) fn encode_footnote_id(id: &str) -> String {
 /// Emit the remark-rehype `<sup>` markup for a footnote reference: the
 /// document-order number (assigned on first sight) and the `-2`/`-3`… `fnref`
 /// suffix per repeat occurrence. Mirrors `mdast-util-to-hast`'s reference handler.
+#[cfg(feature = "footnotes")]
 fn footnote_ref_html(
     id: &str,
     cur: &mut String,
@@ -1737,7 +1751,7 @@ pub fn render_inline(
     // eliminated and the default build streams pure CommonMark.
     let tf = Options::GFM && opts.tagfilter;
     let al = Options::GFM && opts.autolink;
-    let fno = opts.footnotes;
+    let fno = Options::FOOTNOTES && opts.footnotes;
     let emo = Options::EMOJI && opts.emoji;
     let dir = opts.directives;
     match (opts.hard_wraps, Options::GFM && opts.strikethrough) {
@@ -1816,7 +1830,9 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
     scratch: &mut Scratch,
     tf: bool,
     al: bool,
-    fno: bool,
+    // Without the `footnotes` feature its only consumer (the `[^…]` detection in
+    // the `b'['` arm) is cfg'd out, so the bool is threaded but unread.
+    #[cfg_attr(not(feature = "footnotes"), allow(unused_variables))] fno: bool,
     emo: bool,
     dir: bool,
     opts: Options,
@@ -1856,8 +1872,11 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
     // GFM footnotes: the definition set (read-only) and document-order numbering
     // state (HTML path). Distinct fields from the borrows below, so they coexist;
     // untouched by `reset()` (document-level, like `slugs`).
+    #[cfg(feature = "footnotes")]
     let fn_ids = &scratch.footnote_ids;
+    #[cfg(feature = "footnotes")]
     let fn_order = &mut scratch.footnote_order;
+    #[cfg(feature = "footnotes")]
     let fn_seen = &mut scratch.footnote_seen;
     let list = &mut scratch.list;
     let stack = &mut scratch.stack;
@@ -2081,6 +2100,9 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
             b'[' => {
                 // GFM footnote reference `[^label]` whose lowercased label has a
                 // matching definition; otherwise fall through to a link bracket.
+                // Without the `footnotes` feature this whole detection is cfg'd
+                // out and every `[` falls straight through to the link bracket.
+                #[cfg(feature = "footnotes")]
                 let fnref = if fno {
                     parse_footnote_ref(bytes, i).and_then(|(label, consumed)| {
                         let id = label.to_lowercase();
@@ -2089,7 +2111,8 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                 } else {
                     None
                 };
-                if let Some((id, label, consumed)) = fnref {
+                #[cfg(feature = "footnotes")]
+                let handled = if let Some((id, label, consumed)) = fnref {
                     escape_html(&src[run..i], cur);
                     if ast_mode {
                         flush!(i);
@@ -2106,7 +2129,13 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                     }
                     i += consumed;
                     run = i;
+                    true
                 } else {
+                    false
+                };
+                #[cfg(not(feature = "footnotes"))]
+                let handled = false;
+                if !handled {
                     escape_html(&src[run..i], cur);
                     flush!(i);
                     let node = list.push(Node::Tag("["));
@@ -2529,10 +2558,11 @@ fn ast_image_alt(list: &List, op_node: usize, rb_node: usize, cur: &str, sem: &[
                 Sem::Code(v) => s.push_str(v),
                 Sem::Autolink { text, .. } => s.push_str(text),
                 Sem::Html(h) => s.push_str(h),
+                #[cfg(feature = "footnotes")]
+                Sem::FootnoteRef { .. } => {}
                 Sem::LinkOpen { .. }
                 | Sem::LinkRef { .. }
                 | Sem::Break
-                | Sem::FootnoteRef { .. }
                 | Sem::TextDirective { .. } => {}
             },
             Node::LinkClose => {}

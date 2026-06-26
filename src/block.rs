@@ -34,6 +34,13 @@ pub enum Kind {
     /// GFM footnote definition `[^label]: …` (opt-in via [`Options::footnotes`]).
     /// A block container (fixed 4-space content indent, lazy paragraph
     /// continuation) carrying its label via `Node::fn_idx` → [`Tree::fn_defs`].
+    ///
+    /// The variant stays compiled even without the `footnotes` feature (only its
+    /// *producer* `start_footnote_def` and the heavy footnote code are cfg'd out,
+    /// so no such node is ever created): removing a variant shrinks the hot
+    /// `continue_block`/`can_contain` matches and perturbs their codegen (measured
+    /// +2% on the default path). Keeping the variant + its small arms keeps those
+    /// matches byte-identical to the proven-neutral baseline.
     FootnoteDef,
     /// Definition list container (`<dl>`), opt-in via [`Options::deflist`]. Holds
     /// an alternating sequence of [`Kind::DefTerm`] and [`Kind::DefDesc`] children.
@@ -77,6 +84,7 @@ pub struct DefData {
 
 /// Payload for a GFM `footnoteDefinition` — the raw label and its lowercased
 /// identifier (the matching key, mirroring mdast's `label`/`identifier`).
+#[cfg(feature = "footnotes")]
 #[derive(Clone)]
 pub struct FnDef {
     pub label: String,
@@ -220,9 +228,11 @@ pub struct Tree<'a> {
     /// Buffer for assembled text (block quotes, lists, code/HTML literals).
     buf: String,
     /// GFM footnote-definition payloads, indexed by `Node::fn_idx`.
+    #[cfg(feature = "footnotes")]
     pub fn_defs: Vec<FnDef>,
     /// GFM footnote labels (lowercased) that have ≥1 definition — the set a
     /// `[^label]` reference must hit to be a `footnoteReference`.
+    #[cfg(feature = "footnotes")]
     pub footnote_ids: std::collections::HashSet<String>,
     /// Block-directive payloads (`Kind::LeafDirective`/`ContainerDirective`),
     /// indexed by `Node::fn_idx`.
@@ -250,6 +260,7 @@ impl Tree<'_> {
 
     /// GFM footnote-definition payload (label + identifier) for a
     /// `Kind::FootnoteDef` node.
+    #[cfg(feature = "footnotes")]
     pub fn fn_def(&self, idx: usize) -> &FnDef {
         &self.fn_defs[self.nodes[idx].fn_idx as usize]
     }
@@ -419,8 +430,10 @@ struct Parser<'a> {
     opts: Options,
     /// GFM footnote-definition payloads, in creation order; a node's
     /// `Node::fn_idx` indexes here.
+    #[cfg(feature = "footnotes")]
     fn_defs: Vec<FnDef>,
     /// GFM footnote labels (lowercased) seen as definitions — the reference set.
+    #[cfg(feature = "footnotes")]
     footnote_ids: std::collections::HashSet<String>,
     /// Block-directive payloads, in creation order; a node's `Node::fn_idx`
     /// indexes here.
@@ -473,7 +486,9 @@ impl<'a> Parser<'a> {
             prev_blank: false,
             partially_consumed_tab: false,
             opts,
+            #[cfg(feature = "footnotes")]
             fn_defs: Vec::new(),
+            #[cfg(feature = "footnotes")]
             footnote_ids: std::collections::HashSet::new(),
             directives: Vec::new(),
             #[cfg(feature = "ast")]
@@ -1155,7 +1170,9 @@ impl<'a> Parser<'a> {
             opts: self.opts,
             source: src,
             buf: self.buf,
+            #[cfg(feature = "footnotes")]
             fn_defs: self.fn_defs,
+            #[cfg(feature = "footnotes")]
             footnote_ids: self.footnote_ids,
             directives: self.directives,
             #[cfg(feature = "ast")]
@@ -1165,6 +1182,7 @@ impl<'a> Parser<'a> {
         }
     }
 
+    #[inline(always)]
     fn incorporate_line(&mut self, line: &'a [u8]) {
         let mut container = 0;
         self.oldtip = self.tip;
@@ -1221,6 +1239,7 @@ impl<'a> Parser<'a> {
                 fast_skip && !(self.opts.tables && matches!(first, Some(b'|') | Some(b':')));
             // A footnote definition starts with `[` (not in `maybe_special`); keep
             // the fast skip on for `[` lines unless footnotes are enabled.
+            #[cfg(feature = "footnotes")]
             let fast_skip = fast_skip && !(self.opts.footnotes && first == Some(b'['));
             // Definition-list markers and directives both start with `:` (not in
             // `maybe_special`); let `:` lines through to their matchers when
@@ -1334,6 +1353,7 @@ impl<'a> Parser<'a> {
             // Footnote definition: a block container with a fixed 4-space content
             // indent (one tab stop), lazy paragraph continuation, and blank lines
             // tolerated once it has content (mirrors a list item with padding 4).
+            // Arm stays compiled (self-contained) so the match doesn't perturb.
             Kind::FootnoteDef => {
                 if self.blank {
                     if self.nodes[c].first_child == NO_NODE {
@@ -1495,7 +1515,13 @@ impl<'a> Parser<'a> {
             5 => self.start_thematic_break(),
             6 => self.start_list_item(container),
             7 => self.start_indented_code(),
+            // Footnote slot keeps main's index (8); its body is the only cfg'd
+            // part — a no-op `=> 0` without the feature, so the dispatch order is
+            // byte-identical to the proven-neutral baseline.
+            #[cfg(feature = "footnotes")]
             8 => self.start_footnote_def(container),
+            #[cfg(not(feature = "footnotes"))]
+            8 => 0,
             9 => self.start_def_list(container),
             10 => self.start_directive(),
             #[cfg(feature = "gfm")]
@@ -1735,6 +1761,7 @@ impl<'a> Parser<'a> {
     /// GFM footnote definition `[^label]: …`. A flow construct: it interrupts an
     /// open paragraph. Opens a `FootnoteDef` container; the remaining line content
     /// flows into it as a paragraph via the normal machinery.
+    #[cfg(feature = "footnotes")]
     fn start_footnote_def(&mut self, _container: usize) -> u8 {
         if !self.opts.footnotes || self.indented {
             return 0;
@@ -2059,6 +2086,10 @@ impl<'a> Parser<'a> {
     }
 }
 
+// Keep main's exact index map regardless of `footnotes` — the footnote slot
+// (8) stays counted; without the feature its `try_start` arm is a no-op `=> 0`.
+// (Renumbering the slots to drop the footnote index perturbs the hot block-start
+// dispatch — measured +3% on the default path — so we don't.)
 const NUM_STARTS: usize = if cfg!(feature = "gfm") { 12 } else { 11 };
 
 /// Could a line whose first non-space byte is `c` begin a block other than a
@@ -2085,6 +2116,7 @@ fn trim_cr(line: &[u8]) -> &[u8] {
 /// Returns `(label, bytes_through_colon)`. The label is non-empty, contains no
 /// unescaped brackets and no whitespace (backslash escapes are kept verbatim, as
 /// remark does), and must be immediately followed by `]:`.
+#[cfg(feature = "footnotes")]
 fn parse_footnote_label_def(line: &[u8]) -> Option<(String, usize)> {
     if line.len() < 4 || line[0] != b'[' || line[1] != b'^' {
         return None;
@@ -2119,7 +2151,9 @@ fn is_fm_fence(line: &[u8], marker: u8) -> bool {
 
 fn can_contain(parent: Kind, child: Kind) -> bool {
     match parent {
-        Kind::Document | Kind::BlockQuote | Kind::Item | Kind::FootnoteDef => child != Kind::Item,
+        Kind::Document | Kind::BlockQuote | Kind::Item => child != Kind::Item,
+        #[cfg(feature = "footnotes")]
+        Kind::FootnoteDef => child != Kind::Item,
         Kind::ContainerDirective => child != Kind::Item,
         Kind::List => child == Kind::Item,
         // A definition list holds term holders and descriptions; a plain

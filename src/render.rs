@@ -5,7 +5,9 @@
 //! exact whitespace, including tight-vs-loose list items.
 
 use crate::block::{Kind, Tree};
-use crate::inline::{Scratch, encode_footnote_id, render_inline};
+#[cfg(feature = "footnotes")]
+use crate::inline::encode_footnote_id;
+use crate::inline::{Scratch, render_inline};
 use crate::options::Options;
 use crate::scan::{escape_block_mask, memchr1};
 #[cfg(feature = "gfm")]
@@ -31,7 +33,8 @@ pub(crate) fn render_with(tree: &Tree, out: &mut String, scratch: &mut Scratch) 
     }
     // Per-document footnote state: seed the reference set (so `[^x]` resolves) and
     // reset the numbering accumulated while rendering references.
-    if tree.opts.footnotes {
+    #[cfg(feature = "footnotes")]
+    if Options::FOOTNOTES && tree.opts.footnotes {
         scratch.footnote_ids.clone_from(&tree.footnote_ids);
         scratch.footnote_order.clear();
         scratch.footnote_seen.clear();
@@ -39,7 +42,8 @@ pub(crate) fn render_with(tree: &Tree, out: &mut String, scratch: &mut Scratch) 
     children(tree, tree.root, out, scratch);
     // The footnotes <section> (referenced definitions, in reference order) follows
     // the document body — matching mdast-util-to-hast's footer.
-    if tree.opts.footnotes && !scratch.footnote_order.is_empty() {
+    #[cfg(feature = "footnotes")]
+    if Options::FOOTNOTES && tree.opts.footnotes && !scratch.footnote_order.is_empty() {
         render_footnote_section(tree, out, scratch);
     }
     // External-link transform: a single post-render pass over the finished HTML.
@@ -96,6 +100,7 @@ fn decorate_external_links(out: &mut String) {
 /// list of the referenced definitions (in first-reference order), each with one
 /// backref per reference appended to its last paragraph (or as a bare anchor when
 /// the last block is not a paragraph).
+#[cfg(feature = "footnotes")]
 fn render_footnote_section(tree: &Tree, out: &mut String, scratch: &mut Scratch) {
     // Map each referenced identifier to its first definition node (first wins).
     let order: Vec<String> = scratch.footnote_order.clone();
@@ -120,6 +125,7 @@ fn render_footnote_section(tree: &Tree, out: &mut String, scratch: &mut Scratch)
     out.push_str("</ol>\n</section>");
 }
 
+#[cfg(feature = "footnotes")]
 /// The first `FootnoteDef` node whose identifier matches (definitions are matched
 /// first-wins, like link reference definitions).
 fn first_footnote_def(tree: &Tree, id: &str) -> Option<usize> {
@@ -129,6 +135,7 @@ fn first_footnote_def(tree: &Tree, id: &str) -> Option<usize> {
 
 /// Append `↩` backref anchor(s) for footnote `num` (one per reference, `1..=count`).
 /// `nl` adds a trailing newline after each (used in the bare, non-paragraph case).
+#[cfg(feature = "footnotes")]
 fn footnote_backrefs(out: &mut String, enc: &str, num: usize, count: u32, nl: bool) {
     for k in 1..=count {
         out.push_str("<a href=\"#user-content-fnref-");
@@ -158,6 +165,7 @@ fn footnote_backrefs(out: &mut String, enc: &str, num: usize, count: u32, nl: bo
     }
 }
 
+#[cfg(feature = "footnotes")]
 /// Render a footnote definition's blocks into the `<li>`, injecting backrefs into
 /// the last paragraph (or appending them as bare anchors after a non-paragraph
 /// last block).
@@ -392,6 +400,8 @@ fn render_node(tree: &Tree, idx: usize, out: &mut String, scratch: &mut Scratch)
         Kind::Frontmatter => {}
         // A footnote definition emits nothing where it sits; referenced ones are
         // collected and rendered as the footnotes <section> after the document.
+        // Arm stays compiled (keeps the hot match stable; no node exists without
+        // the feature anyway).
         Kind::FootnoteDef => {}
         Kind::DefList => {
             cr(out);

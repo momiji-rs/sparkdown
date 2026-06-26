@@ -374,7 +374,7 @@ mod directives_mdast {
     }
 }
 
-#[cfg(feature = "ast")]
+#[cfg(all(feature = "ast", feature = "footnotes"))]
 mod footnotes {
     use sparkdown::Options;
     use sparkdown::ast::to_mdast_json_opts;

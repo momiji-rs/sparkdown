@@ -90,6 +90,15 @@ impl Options {
     #[cfg(not(feature = "emoji"))]
     pub(crate) const EMOJI: bool = false;
 
+    /// `true` iff the `footnotes` Cargo feature is compiled in. Used as
+    /// `Options::FOOTNOTES && opts.footnotes` so that, without the feature, every
+    /// footnote check folds to `false` and its code is eliminated — the default
+    /// build is byte-for-byte the pure-CommonMark fast path.
+    #[cfg(feature = "footnotes")]
+    pub(crate) const FOOTNOTES: bool = true;
+    #[cfg(not(feature = "footnotes"))]
+    pub(crate) const FOOTNOTES: bool = false;
+
     /// GitHub Flavored Markdown: every GFM extension enabled. (Effective only
     /// when the crate is built with the `gfm` feature.)
     pub const fn gfm() -> Self {

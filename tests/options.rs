@@ -96,6 +96,7 @@ fn frontmatter() {
     );
 }
 
+#[cfg(feature = "footnotes")]
 #[test]
 fn footnotes() {
     let on = Options {
