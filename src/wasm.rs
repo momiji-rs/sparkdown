@@ -47,6 +47,16 @@ thread_local! {
         core::cell::RefCell::new(crate::Renderer::new());
 }
 
+#[cfg(feature = "ast")]
+thread_local! {
+    // A persistent context for the string-pooled mdast wire fast path: its parse
+    // arena, text buffer, refmap, inline scratch, and string pool stay warm across
+    // calls, so a long-lived wasm instance emitting many trees avoids re-allocating
+    // them on dlmalloc each time. Mirrors `RENDERER`.
+    static WIRE_FAST: core::cell::RefCell<crate::ast::WireFast> =
+        core::cell::RefCell::new(crate::ast::WireFast::new());
+}
+
 /// Decode the extension `flags` bitmask shared by every `*_opts` export into an
 /// [`crate::Options`]. Bit layout (LSB first): 0 strikethrough, 1 task lists,
 /// 2 autolinks, 3 tag filter, 4 tables, 5 hard wraps, 6 diagram, 7 heading ids,
@@ -246,7 +256,7 @@ pub unsafe extern "C" fn sparkdown_to_mdast_wire_fast_opts(
     let input = unsafe { core::slice::from_raw_parts(ptr, len) };
     let md = input_str(input);
     let opts = opts_from_flags(flags);
-    box_html(&crate::ast::to_mdast_wire_fast_opts(&md, opts))
+    WIRE_FAST.with(|c| box_html(&c.borrow_mut().emit(&md, opts)))
 }
 
 /// Like [`sparkdown_to_html`] but applies extension options from a bitmask: bit

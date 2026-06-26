@@ -219,13 +219,21 @@ impl PosCtx {
     /// their UTF-8 bytes are accumulated into the shared `pool` in DFS emit order.
     /// Used by `to_mdast_wire_fast_opts`.
     fn pooled() -> Self {
+        Self::pooled_with(Vec::new())
+    }
+
+    /// Like [`PosCtx::pooled`] but seeds the string pool with a caller-provided
+    /// (recycled) `Vec<u8>` instead of allocating a fresh one — used by
+    /// [`WireFast`] to reuse the pool buffer across calls. The caller is expected
+    /// to have `clear()`ed it; capacity is retained.
+    fn pooled_with(pool: Vec<u8>) -> Self {
         PosCtx {
             line_off: Vec::new(),
             u16: Vec::new(),
             src_len: 0,
             src: Vec::new(),
             enabled: false,
-            pool: Some(std::cell::RefCell::new(Vec::new())),
+            pool: Some(std::cell::RefCell::new(pool)),
         }
     }
 
@@ -1751,6 +1759,97 @@ pub fn to_mdast_wire_nopos_opts(src: &str, opts: crate::Options) -> Vec<u8> {
 /// the structure in order, tracking a running UTF-16 offset, recovers each string
 /// as `pool[runningOff .. runningOff + u16Len]` (offsets and lengths in UTF-16
 /// units, which is what JS `String.prototype.slice` uses).
+/// A reusable context for the string-pooled wire fast path
+/// ([`to_mdast_wire_fast_opts`]) that keeps the recyclable working buffers — the
+/// block node arena, text buffer, reference map, inline `Scratch`, and string
+/// pool — warm across calls, mirroring [`crate::Renderer`] for the HTML path.
+///
+/// Use it instead of [`to_mdast_wire_fast_opts`] for repeated emits (a long-lived
+/// wasm instance handling many documents) to avoid re-allocating those buffers on
+/// every call. The returned wire `Vec<u8>` is always freshly allocated (it is
+/// leaked across the wasm→JS boundary), but every internal scratch is reused.
+#[cfg(feature = "ast")]
+pub struct WireFast {
+    nodes: Vec<crate::block::Node>,
+    buf: String,
+    refmap: crate::inline::RefMap,
+    scratch: Scratch,
+    pool: Vec<u8>,
+}
+
+#[cfg(feature = "ast")]
+impl Default for WireFast {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "ast")]
+impl WireFast {
+    /// Create an empty context; its buffers grow to fit the first emit and are
+    /// reused thereafter.
+    pub fn new() -> Self {
+        WireFast {
+            nodes: Vec::new(),
+            buf: String::new(),
+            refmap: crate::inline::RefMap::new(),
+            scratch: Scratch::new(),
+            pool: Vec::new(),
+        }
+    }
+
+    /// Parse `src` and serialize the string-pooled wire, reusing the held buffers.
+    /// Byte-identical to [`to_mdast_wire_fast_opts`]`(src, opts)`.
+    pub fn emit(&mut self, src: &str, opts: crate::Options) -> Vec<u8> {
+        let nodes = core::mem::take(&mut self.nodes);
+        let buf = core::mem::take(&mut self.buf);
+        let refmap = core::mem::take(&mut self.refmap);
+        let tree = crate::block::parse_with(src, opts, nodes, buf, refmap);
+
+        // Reuse the held Scratch in place of a fresh `fn_scratch(&tree)`: clear any
+        // document-level state that a fresh `Scratch::new()` would start empty, and
+        // re-seed the footnote id set exactly as `fn_scratch` does. The transient
+        // inline state (list/stack/cur/sem) is reset inside `render_inline` per
+        // inline run; `resolve`/`toks` are toggled there too. Clearing the rest here
+        // makes the reused Scratch byte-identical to a fresh one.
+        self.scratch.slugs.clear();
+        #[cfg(feature = "footnotes")]
+        {
+            self.scratch.footnote_order.clear();
+            self.scratch.footnote_seen.clear();
+            if tree.opts.footnotes {
+                self.scratch.footnote_ids.clone_from(&tree.footnote_ids);
+            } else {
+                self.scratch.footnote_ids.clear();
+            }
+        }
+
+        let mut pool = core::mem::take(&mut self.pool);
+        pool.clear();
+        pool.reserve(src.len());
+        let ctx = PosCtx::pooled_with(pool);
+
+        // Same layout as `to_mdast_wire_fast_opts`: a 4-byte poolStart placeholder,
+        // then the structure, then the pool appended, then backpatch poolStart.
+        let mut out = Vec::<u8>::with_capacity(src.len() * 2 + 64);
+        out.extend_from_slice(&[0u8; 4]);
+        bwire(&tree, tree.root, &mut self.scratch, &ctx, &mut out);
+        let pool = ctx
+            .pool
+            .expect("pooled ctx always carries a pool")
+            .into_inner();
+        let pool_start = out.len() as u32;
+        out.extend_from_slice(&pool);
+        w_u32_at(&mut out, 0, pool_start);
+
+        // Recycle: store the pool back, reclaim the block buffers from the tree, and
+        // keep the Scratch (it was reused in place).
+        self.pool = pool;
+        (self.nodes, self.buf, self.refmap) = tree.recycle();
+        out
+    }
+}
+
 pub fn to_mdast_wire_fast_opts(src: &str, opts: crate::Options) -> Vec<u8> {
     let tree = crate::block::parse_with_opts(src, opts);
     let mut scratch = fn_scratch(&tree);
@@ -3544,6 +3643,40 @@ mod wire_pooled_tests {
             let a = to_mdast_wire_fast_opts(src, crate::Options::default());
             let b = to_mdast_wire_fast_opts(src, crate::Options::default());
             assert_eq!(a, b, "pooled wire not deterministic for {src:?}");
+        }
+    }
+
+    /// The reused [`WireFast`] context must produce byte-identical output to the
+    /// standalone [`to_mdast_wire_fast_opts`] across many *different* docs driven
+    /// through ONE context — a missed clear leaks stale scratch state between
+    /// parses. Interleaving footnote-on and footnote-off docs is the critical case
+    /// for the reused `Scratch.footnote_ids`.
+    #[test]
+    fn wirefast_reuse_byte_identical() {
+        let mut wf = WireFast::new();
+        let opt_sets = [
+            crate::Options::default(),
+            crate::Options {
+                footnotes: true,
+                ..crate::Options::default()
+            },
+        ];
+        // A footnote doc (seeds footnote_ids) plus plain docs, interleaved so a
+        // stale id set from a previous footnote parse would surface.
+        let fn_doc = "a ref[^x] and [^y]\n\n[^x]: def x\n[^y]: def y\n";
+        for round in 0..3 {
+            for &opts in &opt_sets {
+                let docs: &[&str] = &[fn_doc];
+                for &src in docs.iter().chain(SAMPLES) {
+                    let want = to_mdast_wire_fast_opts(src, opts);
+                    let got = wf.emit(src, opts);
+                    assert_eq!(
+                        want, got,
+                        "WireFast reuse diverged (round {round}, footnotes={}) for {src:?}",
+                        opts.footnotes
+                    );
+                }
+            }
         }
     }
 }
