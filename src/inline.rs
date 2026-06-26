@@ -636,6 +636,8 @@ enum Sem {
     LinkRef { identifier: String, label: String, reftype: &'static str },
     /// `![alt][label]` etc. → mdast `imageReference` (a leaf; alt is plain text).
     ImageRef { identifier: String, label: String, reftype: &'static str, alt: String },
+    /// GFM `[^label]` → mdast `footnoteReference` (a leaf).
+    FootnoteRef { identifier: String, label: String },
 }
 
 /// SPIKE: reference-resolution metadata produced by [`parse_link_target`] in AST
@@ -678,6 +680,8 @@ pub enum InlineTok {
     LinkRefOpen { identifier: String, label: String, reftype: &'static str },
     /// mdast `imageReference` (leaf).
     ImageRef { identifier: String, label: String, reftype: &'static str, alt: String },
+    /// mdast `footnoteReference` (leaf).
+    FootnoteRef { identifier: String, label: String },
 }
 
 /// SPIKE (`ast`): an [`InlineTok`] tagged with the content byte range
@@ -784,6 +788,10 @@ fn list_to_tokens(list: &List, cur: &str, sem: &[Sem], out: &mut Vec<SpanTok>) {
                     reftype,
                     alt: alt.clone(),
                 },
+                Sem::FootnoteRef { identifier, label } => InlineTok::FootnoteRef {
+                    identifier: identifier.clone(),
+                    label: label.clone(),
+                },
             }),
             Node::LinkClose => push(InlineTok::LinkClose),
         }
@@ -824,6 +832,7 @@ pub trait InlineSink {
         start: u32,
         end: u32,
     );
+    fn footnote_ref(&mut self, identifier: &str, label: &str, start: u32, end: u32);
 }
 
 /// SPIKE (`ast`): drive an [`InlineSink`] over the resolved slot list, coalescing
@@ -910,6 +919,9 @@ fn emit_inline<S: InlineSink>(list: &List, cur: &str, sem: &[Sem], sink: &mut S)
                     }
                     Sem::ImageRef { identifier, label, reftype, alt } => {
                         sink.imageref(identifier, label, reftype, alt, s, e)
+                    }
+                    Sem::FootnoteRef { identifier, label } => {
+                        sink.footnote_ref(identifier, label, s, e)
                     }
                 }
             }
@@ -1128,6 +1140,18 @@ pub struct Scratch {
     /// github-slugger-style de-duplication. Persists across the whole render
     /// (cleared per document in `render_with`), unlike the per-paragraph `reset()`.
     pub(crate) slugs: std::collections::HashMap<String, u32>,
+    /// GFM footnotes: the set of lowercased definition labels in the document
+    /// (populated per-document by the renderer/mdast builder before walking, like
+    /// `slugs`; survives `reset()`). A `[^label]` is a `footnoteReference` only if
+    /// its lowercased label is in here — otherwise it stays literal text.
+    pub(crate) footnote_ids: std::collections::HashSet<String>,
+    /// GFM footnotes (HTML path): identifiers in first-reference order — a ref's
+    /// number is its index here + 1. Document-level (cleared per document, like
+    /// `slugs`); the footnotes `<section>` is emitted in this order.
+    pub(crate) footnote_order: Vec<String>,
+    /// GFM footnotes (HTML path): per-identifier count of references emitted so
+    /// far, for the `fnref-id-2`, `-3`, … suffixes and the backref count.
+    pub(crate) footnote_seen: std::collections::HashMap<String, u32>,
     #[cfg(feature = "ast")]
     toks: Option<Vec<SpanTok>>,
     /// SPIKE (`ast` feature): when `true`, `render_inline` resolves the inline
@@ -1147,6 +1171,9 @@ impl Scratch {
             norm: String::with_capacity(48),
             sem: Vec::new(),
             slugs: std::collections::HashMap::new(),
+            footnote_ids: std::collections::HashSet::new(),
+            footnote_order: Vec::new(),
+            footnote_seen: std::collections::HashMap::new(),
             #[cfg(feature = "ast")]
             toks: None,
             #[cfg(feature = "ast")]
@@ -1161,6 +1188,95 @@ impl Scratch {
         self.cur.clear();
         self.sem.clear();
     }
+}
+
+/// Parse a GFM footnote reference `[^label]` at `bytes[i]` (`[`). Returns
+/// `(label, bytes_consumed)`. Same label rules as a definition opener: non-empty,
+/// no whitespace, no unescaped brackets (backslash escapes kept); ends at `]`.
+fn parse_footnote_ref(bytes: &[u8], i: usize) -> Option<(String, usize)> {
+    if bytes.get(i + 1) != Some(&b'^') {
+        return None;
+    }
+    let start = i + 2;
+    let mut j = start;
+    while j < bytes.len() {
+        match bytes[j] {
+            b']' => break,
+            b'[' => return None,
+            b' ' | b'\t' | b'\n' | b'\r' => return None,
+            b'\\' if j + 1 < bytes.len() => j += 2,
+            _ => j += 1,
+        }
+    }
+    if j >= bytes.len() || bytes[j] != b']' || j == start {
+        return None;
+    }
+    let label = std::str::from_utf8(&bytes[start..j]).ok()?.to_string();
+    Some((label, j + 1 - i))
+}
+
+/// `encodeURIComponent(identifier)` — the exact transform `mdast-util-to-hast`
+/// applies to a footnote identifier before building `fn-…`/`fnref-…` ids and
+/// hrefs (keeps `A-Za-z0-9-_.!~*'()`, percent-encodes the rest as UTF-8).
+pub(crate) fn encode_footnote_id(id: &str) -> String {
+    let mut out = String::with_capacity(id.len());
+    for &b in id.as_bytes() {
+        match b {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'!'
+            | b'~'
+            | b'*'
+            | b'\''
+            | b'('
+            | b')' => out.push(b as char),
+            _ => {
+                out.push('%');
+                out.push(char::from_digit((b >> 4) as u32, 16).unwrap().to_ascii_uppercase());
+                out.push(char::from_digit((b & 0xf) as u32, 16).unwrap().to_ascii_uppercase());
+            }
+        }
+    }
+    out
+}
+
+/// Emit the remark-rehype `<sup>` markup for a footnote reference: the
+/// document-order number (assigned on first sight) and the `-2`/`-3`… `fnref`
+/// suffix per repeat occurrence. Mirrors `mdast-util-to-hast`'s reference handler.
+fn footnote_ref_html(
+    id: &str,
+    cur: &mut String,
+    order: &mut Vec<String>,
+    seen: &mut std::collections::HashMap<String, u32>,
+) {
+    let num = match order.iter().position(|x| x == id) {
+        Some(p) => p + 1,
+        None => {
+            order.push(id.to_string());
+            order.len()
+        }
+    };
+    let count = {
+        let c = seen.entry(id.to_string()).or_insert(0);
+        *c += 1;
+        *c
+    };
+    let safe = encode_footnote_id(id);
+    cur.push_str("<sup><a href=\"#user-content-fn-");
+    cur.push_str(&safe);
+    cur.push_str("\" id=\"user-content-fnref-");
+    cur.push_str(&safe);
+    if count > 1 {
+        cur.push('-');
+        cur.push_str(&count.to_string());
+    }
+    cur.push_str("\" data-footnote-ref aria-describedby=\"footnote-label\">");
+    cur.push_str(&num.to_string());
+    cur.push_str("</a></sup>");
 }
 
 /// Stream inline content with no emphasis or link delimiters straight to
@@ -1528,11 +1644,12 @@ pub fn render_inline(
     // eliminated and the default build streams pure CommonMark.
     let tf = Options::GFM && opts.tagfilter;
     let al = Options::GFM && opts.autolink;
+    let fno = opts.footnotes;
     match (opts.hard_wraps, Options::GFM && opts.strikethrough) {
-        (false, false) => render_inline_impl::<false, false>(src, out, refmap, scratch, tf, al),
-        (false, true) => render_inline_impl::<false, true>(src, out, refmap, scratch, tf, al),
-        (true, false) => render_inline_impl::<true, false>(src, out, refmap, scratch, tf, al),
-        (true, true) => render_inline_impl::<true, true>(src, out, refmap, scratch, tf, al),
+        (false, false) => render_inline_impl::<false, false>(src, out, refmap, scratch, tf, al, fno),
+        (false, true) => render_inline_impl::<false, true>(src, out, refmap, scratch, tf, al, fno),
+        (true, false) => render_inline_impl::<true, false>(src, out, refmap, scratch, tf, al, fno),
+        (true, true) => render_inline_impl::<true, true>(src, out, refmap, scratch, tf, al, fno),
     }
 }
 
@@ -1582,6 +1699,7 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
     scratch: &mut Scratch,
     tf: bool,
     al: bool,
+    fno: bool,
 ) {
     let bytes = src.as_bytes();
     // SPIKE: AST mode captures semantic nodes instead of HTML. `ast_mode` is a
@@ -1612,6 +1730,12 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
         return;
     }
     scratch.reset();
+    // GFM footnotes: the definition set (read-only) and document-order numbering
+    // state (HTML path). Distinct fields from the borrows below, so they coexist;
+    // untouched by `reset()` (document-level, like `slugs`).
+    let fn_ids = &scratch.footnote_ids;
+    let fn_order = &mut scratch.footnote_order;
+    let fn_seen = &mut scratch.footnote_seen;
     let list = &mut scratch.list;
     let stack = &mut scratch.stack;
     let cur = &mut scratch.cur;
@@ -1829,19 +1953,45 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                 run = i;
             }
             b'[' => {
-                escape_html(&src[run..i], cur);
-                flush!(i);
-                let node = list.push(Node::Tag("["));
-                #[cfg(feature = "ast")]
-                cspan!(node, i, i + 1);
-                stack.push(StackItem::Bracket {
-                    node,
-                    image: false,
-                    active: true,
-                    text_src: i + 1,
-                });
-                i += 1;
-                run = i;
+                // GFM footnote reference `[^label]` whose lowercased label has a
+                // matching definition; otherwise fall through to a link bracket.
+                let fnref = if fno {
+                    parse_footnote_ref(bytes, i).and_then(|(label, consumed)| {
+                        let id = label.to_lowercase();
+                        fn_ids.contains(&id).then_some((id, label, consumed))
+                    })
+                } else {
+                    None
+                };
+                if let Some((id, label, consumed)) = fnref {
+                    escape_html(&src[run..i], cur);
+                    if ast_mode {
+                        flush!(i);
+                        let si = sem.len() as u32;
+                        sem.push(Sem::FootnoteRef { identifier: id, label });
+                        let fid = list.push(Node::Sem(si));
+                        cspan!(fid, i, i + consumed);
+                        seg = cur.len();
+                    } else {
+                        footnote_ref_html(&id, cur, fn_order, fn_seen);
+                    }
+                    i += consumed;
+                    run = i;
+                } else {
+                    escape_html(&src[run..i], cur);
+                    flush!(i);
+                    let node = list.push(Node::Tag("["));
+                    #[cfg(feature = "ast")]
+                    cspan!(node, i, i + 1);
+                    stack.push(StackItem::Bracket {
+                        node,
+                        image: false,
+                        active: true,
+                        text_src: i + 1,
+                    });
+                    i += 1;
+                    run = i;
+                }
             }
             b'!' if bytes.get(i + 1) == Some(&b'[') => {
                 escape_html(&src[run..i], cur);
@@ -2193,7 +2343,7 @@ fn ast_image_alt(list: &List, op_node: usize, rb_node: usize, cur: &str, sem: &[
                 Sem::Code(v) => s.push_str(v),
                 Sem::Autolink { text, .. } => s.push_str(text),
                 Sem::Html(h) => s.push_str(h),
-                Sem::LinkOpen { .. } | Sem::LinkRef { .. } | Sem::Break => {}
+                Sem::LinkOpen { .. } | Sem::LinkRef { .. } | Sem::Break | Sem::FootnoteRef { .. } => {}
             },
             Node::LinkClose => {}
         }

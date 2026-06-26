@@ -5,7 +5,7 @@
 //! exact whitespace, including tight-vs-loose list items.
 
 use crate::block::{Kind, Tree};
-use crate::inline::{Scratch, render_inline};
+use crate::inline::{Scratch, encode_footnote_id, render_inline};
 use crate::options::Options;
 use crate::scan::{escape_block_mask, memchr1};
 #[cfg(feature = "gfm")]
@@ -29,7 +29,122 @@ pub(crate) fn render_with(tree: &Tree, out: &mut String, scratch: &mut Scratch) 
     if tree.opts.heading_ids {
         scratch.slugs.clear();
     }
+    // Per-document footnote state: seed the reference set (so `[^x]` resolves) and
+    // reset the numbering accumulated while rendering references.
+    if tree.opts.footnotes {
+        scratch.footnote_ids.clone_from(&tree.footnote_ids);
+        scratch.footnote_order.clear();
+        scratch.footnote_seen.clear();
+    }
     children(tree, tree.root, out, scratch);
+    // The footnotes <section> (referenced definitions, in reference order) follows
+    // the document body — matching mdast-util-to-hast's footer.
+    if tree.opts.footnotes && !scratch.footnote_order.is_empty() {
+        render_footnote_section(tree, out, scratch);
+    }
+}
+
+/// Render the GFM footnotes `<section>` exactly as remark-rehype does: an ordered
+/// list of the referenced definitions (in first-reference order), each with one
+/// backref per reference appended to its last paragraph (or as a bare anchor when
+/// the last block is not a paragraph).
+fn render_footnote_section(tree: &Tree, out: &mut String, scratch: &mut Scratch) {
+    // Map each referenced identifier to its first definition node (first wins).
+    let order: Vec<String> = scratch.footnote_order.clone();
+    cr(out);
+    out.push_str(
+        "<section data-footnotes class=\"footnotes\">\
+         <h2 class=\"sr-only\" id=\"footnote-label\">Footnotes</h2>\n<ol>\n",
+    );
+    for (i, id) in order.iter().enumerate() {
+        let num = i + 1;
+        let refcount = scratch.footnote_seen.get(id).copied().unwrap_or(1);
+        let enc = encode_footnote_id(id);
+        let Some(def) = first_footnote_def(tree, id) else {
+            continue;
+        };
+        out.push_str("<li id=\"user-content-fn-");
+        out.push_str(&enc);
+        out.push_str("\">\n");
+        render_footnote_def_body(tree, def, num, refcount, &enc, out, scratch);
+        out.push_str("</li>\n");
+    }
+    out.push_str("</ol>\n</section>");
+}
+
+/// The first `FootnoteDef` node whose identifier matches (definitions are matched
+/// first-wins, like link reference definitions).
+fn first_footnote_def(tree: &Tree, id: &str) -> Option<usize> {
+    (0..tree.nodes.len()).find(|&n| {
+        tree.nodes[n].kind == Kind::FootnoteDef && tree.fn_def(n).identifier == id
+    })
+}
+
+/// Append `↩` backref anchor(s) for footnote `num` (one per reference, `1..=count`).
+/// `nl` adds a trailing newline after each (used in the bare, non-paragraph case).
+fn footnote_backrefs(out: &mut String, enc: &str, num: usize, count: u32, nl: bool) {
+    for k in 1..=count {
+        out.push_str("<a href=\"#user-content-fnref-");
+        out.push_str(enc);
+        if k > 1 {
+            out.push('-');
+            out.push_str(&k.to_string());
+        }
+        out.push_str("\" data-footnote-backref=\"\" aria-label=\"Back to reference ");
+        out.push_str(&num.to_string());
+        if k > 1 {
+            out.push('-');
+            out.push_str(&k.to_string());
+        }
+        out.push_str("\" class=\"data-footnote-backref\">↩");
+        if k > 1 {
+            out.push_str("<sup>");
+            out.push_str(&k.to_string());
+            out.push_str("</sup>");
+        }
+        out.push_str("</a>");
+        if nl {
+            out.push('\n');
+        } else if k < count {
+            out.push(' ');
+        }
+    }
+}
+
+/// Render a footnote definition's blocks into the `<li>`, injecting backrefs into
+/// the last paragraph (or appending them as bare anchors after a non-paragraph
+/// last block).
+fn render_footnote_def_body(
+    tree: &Tree,
+    def: usize,
+    num: usize,
+    refcount: u32,
+    enc: &str,
+    out: &mut String,
+    scratch: &mut Scratch,
+) {
+    let mut c = tree.first_child(def);
+    while let Some(ci) = c {
+        let is_last = tree.next_sibling(ci).is_none();
+        if is_last && tree.nodes[ci].kind == Kind::Paragraph {
+            // Backrefs go inside the final paragraph, after a separating space.
+            cr(out);
+            out.push_str("<p>");
+            render_inline(tree.content(ci), out, &tree.refmap, scratch, tree.opts);
+            out.push(' ');
+            footnote_backrefs(out, enc, num, refcount, false);
+            out.push_str("</p>");
+            cr(out);
+        } else {
+            render_node(tree, ci, out, scratch);
+            if is_last {
+                // Last block is not a paragraph: backrefs follow as bare anchors.
+                cr(out);
+                footnote_backrefs(out, enc, num, refcount, true);
+            }
+        }
+        c = tree.next_sibling(ci);
+    }
 }
 
 /// PROTOTYPE built-in transform: derive a github-slugger-style id from a heading's
@@ -205,6 +320,9 @@ fn render_node(tree: &Tree, idx: usize, out: &mut String, scratch: &mut Scratch)
         Kind::Definition => {}
         // Frontmatter produces no HTML output (matching remark-frontmatter).
         Kind::Frontmatter => {}
+        // A footnote definition emits nothing where it sits; referenced ones are
+        // collected and rendered as the footnotes <section> after the document.
+        Kind::FootnoteDef => {}
         Kind::BlockQuote => {
             cr(out);
             out.push_str("<blockquote>");

@@ -35,6 +35,12 @@ pub struct Options {
     /// of the document (the remark-frontmatter grammar). Renders to nothing; with
     /// the `ast` feature it becomes a `yaml`/`toml` mdast node. Not GFM-gated.
     pub frontmatter: bool,
+    /// GFM footnotes: inline `[^label]` references and `[^label]: …` block
+    /// definitions (the remark-gfm grammar). References resolve only when a
+    /// matching definition exists. mdast: `footnoteReference`/`footnoteDefinition`;
+    /// HTML: the remark-rehype footnotes `<section>` with numbered backrefs. The
+    /// label set is collected in the block pass, so forward references work.
+    pub footnotes: bool,
 }
 
 impl Options {
@@ -69,6 +75,7 @@ impl Options {
             diagram: false,
             heading_ids: false,
             frontmatter: false,
+            footnotes: false,
         }
     }
 }

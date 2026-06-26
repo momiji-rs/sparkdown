@@ -141,6 +141,8 @@ function parseToMdastWire(md, flags = 0) {
       case 19: { const identifier = str(); const label = str(); const referenceType = REFTYPE[u8[p++]]; const alt = str(); return { type: 'imageReference', identifier, label, referenceType, alt, position }; }
       case 20: return { type: 'yaml', value: str(), position };
       case 21: return { type: 'toml', value: str(), position };
+      case 22: { const identifier = str(); const label = str(); return { type: 'footnoteDefinition', identifier, label, children: kids(), position }; }
+      case 23: { const identifier = str(); const label = str(); return { type: 'footnoteReference', identifier, label, position }; }
       default: throw new Error('bad wire tag ' + tag);
     }
   }

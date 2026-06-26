@@ -83,3 +83,42 @@ mod frontmatter {
         assert!(!j.contains(r#""type":"yaml""#), "{j}");
     }
 }
+
+#[cfg(feature = "ast")]
+mod footnotes {
+    use sparkdown::Options;
+    use sparkdown::ast::to_mdast_json_opts;
+
+    fn on() -> Options {
+        Options {
+            footnotes: true,
+            ..Options::default()
+        }
+    }
+
+    #[test]
+    fn reference_and_definition() {
+        let j = to_mdast_json_opts("A[^a]\n\n[^a]: note\n", on());
+        assert!(j.contains(r#""type":"footnoteReference","identifier":"a","label":"a""#), "{j}");
+        assert!(j.contains(r#""type":"footnoteDefinition","identifier":"a","label":"a""#), "{j}");
+    }
+
+    #[test]
+    fn identifier_is_lowercased() {
+        let j = to_mdast_json_opts("A[^Foo]\n\n[^Foo]: note\n", on());
+        assert!(j.contains(r#""type":"footnoteReference","identifier":"foo","label":"Foo""#), "{j}");
+    }
+
+    #[test]
+    fn reference_without_definition_is_literal() {
+        // No matching definition → no footnoteReference node.
+        let j = to_mdast_json_opts("see [^x] here\n", on());
+        assert!(!j.contains(r#""type":"footnoteReference""#), "{j}");
+    }
+
+    #[test]
+    fn off_by_default() {
+        let j = to_mdast_json_opts("A[^a]\n\n[^a]: note\n", Options::default());
+        assert!(!j.contains("footnote"), "{j}");
+    }
+}

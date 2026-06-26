@@ -94,6 +94,37 @@ fn frontmatter() {
 }
 
 #[test]
+fn footnotes() {
+    let on = Options {
+        footnotes: true,
+        ..Options::default()
+    };
+    let go = |s: &str| to_html_with(s, &on);
+    // A reference with a matching definition → numbered <sup> link plus the
+    // remark-rehype footnotes <section> with a backref.
+    assert_eq!(
+        go("A[^a].\n\n[^a]: note\n"),
+        "<p>A<sup><a href=\"#user-content-fn-a\" id=\"user-content-fnref-a\" \
+         data-footnote-ref aria-describedby=\"footnote-label\">1</a></sup>.</p>\n\
+         <section data-footnotes class=\"footnotes\">\
+         <h2 class=\"sr-only\" id=\"footnote-label\">Footnotes</h2>\n<ol>\n\
+         <li id=\"user-content-fn-a\">\n\
+         <p>note <a href=\"#user-content-fnref-a\" data-footnote-backref=\"\" \
+         aria-label=\"Back to reference 1\" class=\"data-footnote-backref\">↩</a></p>\n\
+         </li>\n</ol>\n</section>"
+    );
+    // A reference with no matching definition stays literal.
+    assert_eq!(go("see [^x] here\n"), "<p>see [^x] here</p>\n");
+    // Repeated references get -2, -3 fnref ids and one backref each (same number).
+    let multi = go("X[^a] Y[^a]\n\n[^a]: n\n");
+    assert!(multi.contains("id=\"user-content-fnref-a\""), "{multi}");
+    assert!(multi.contains("id=\"user-content-fnref-a-2\""), "{multi}");
+    assert!(multi.contains("↩<sup>2</sup>"), "{multi}");
+    // Off by default: `[^a]: note` is a link reference definition, `[^a]` a link.
+    assert!(!to_html("A[^a].\n\n[^a]: note\n").contains("data-footnotes"));
+}
+
+#[test]
 fn renderer_carries_options() {
     let mut r = Renderer::with_options(Options {
         hard_wraps: true,

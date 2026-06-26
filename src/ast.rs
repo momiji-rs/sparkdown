@@ -42,6 +42,8 @@ pub enum Mdast {
     Yaml(String),
     /// TOML frontmatter (`+++`); `value` is the text between the fences.
     Toml(String),
+    /// GFM footnote definition `[^label]: …` — a block container.
+    FootnoteDefinition { identifier: String, label: String, children: Vec<Mdast> },
     // --- inline ---
     Text(String),
     Emphasis(Vec<Mdast>),
@@ -53,6 +55,8 @@ pub enum Mdast {
     Image { url: String, title: Option<String>, alt: String },
     LinkReference { identifier: String, label: String, reftype: &'static str, children: Vec<Mdast> },
     ImageReference { identifier: String, label: String, reftype: &'static str, alt: String },
+    /// GFM footnote reference `[^label]` (inline leaf).
+    FootnoteReference { identifier: String, label: String },
     /// SPIKE: wraps a block node with its unist `position`. Kept as a wrapper
     /// (rather than a field on every variant) to minimize churn; the serializer
     /// folds it into the inner node's JSON object as `"position": …`.
@@ -171,9 +175,20 @@ pub fn to_mdast(src: &str) -> Mdast {
 /// Like [`to_mdast`] but with opt-in grammar extensions (e.g. frontmatter).
 pub fn to_mdast_opts(src: &str, opts: crate::Options) -> Mdast {
     let tree = crate::block::parse_with_opts(src, opts);
-    let mut scratch = Scratch::new();
+    let mut scratch = fn_scratch(&tree);
     let ctx = PosCtx::new(src);
     block(&tree, tree.root, &mut scratch, &ctx).0
+}
+
+/// A fresh [`Scratch`] seeded with the tree's footnote labels, so inline
+/// `[^label]` references resolve while building the mdast (forward refs work
+/// because the label set is collected in the block pass).
+fn fn_scratch(tree: &Tree) -> Scratch {
+    let mut scratch = Scratch::new();
+    if tree.opts.footnotes {
+        scratch.footnote_ids.clone_from(&tree.footnote_ids);
+    }
+    scratch
 }
 
 /// The mdast `value` of a frontmatter node: the raw text between the fences with
@@ -244,6 +259,16 @@ fn block(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> (Mdast
             let value = frontmatter_value(tree.content(idx)).to_owned();
             let inner = if node.level == 1 { Mdast::Toml(value) } else { Mdast::Yaml(value) };
             (inner, sb, se)
+        }
+        Kind::FootnoteDef => {
+            let d = tree.fn_def(idx);
+            let (identifier, label) = (d.identifier.clone(), d.label.clone());
+            let (kids, last) = block_children(tree, idx, scratch, ctx);
+            (
+                Mdast::FootnoteDefinition { identifier, label, children: kids },
+                sb,
+                last.unwrap_or(se),
+            )
         }
         Kind::Definition => {
             let d = tree.definition(idx);
@@ -392,6 +417,13 @@ fn build_inline(
                     Box::new(Mdast::ImageReference { identifier, label, reftype, alt }),
                 ));
             }
+            InlineTok::FootnoteRef { identifier, label } => {
+                let p = mkpos(start, end);
+                stack.last_mut().unwrap().1.push(Mdast::Positioned(
+                    p,
+                    Box::new(Mdast::FootnoteReference { identifier, label }),
+                ));
+            }
             InlineTok::Autolink { url, text } => {
                 // The link spans `<url>`; its text child spans the url itself.
                 let child = Mdast::Positioned(
@@ -501,7 +533,7 @@ pub fn to_mdast_wire_opts(src: &str, opts: crate::Options) -> Vec<u8> {
     // Emit wire bytes *directly* during the parse walk — no intermediate owned
     // `Mdast` tree (its construction was ~0.95 ms / the dominant boundary cost).
     let tree = crate::block::parse_with_opts(src, opts);
-    let mut scratch = Scratch::new();
+    let mut scratch = fn_scratch(&tree);
     let ctx = PosCtx::new(src);
     let mut out = Vec::<u8>::with_capacity(src.len() * 2 + 64);
     bwire(&tree, tree.root, &mut scratch, &ctx, &mut out);
@@ -676,6 +708,20 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
             w_str(value, out);
             se
         }
+        Kind::FootnoteDef => {
+            let d = tree.fn_def(idx);
+            out.push(22);
+            w_point(out, ctx.point(sb));
+            let eoff = reserve(out, 12);
+            w_str(&d.identifier, out);
+            w_str(&d.label, out);
+            let coff = reserve(out, 4);
+            let (n, last) = bchildren(tree, idx, scratch, ctx, out);
+            let end = last.unwrap_or(se);
+            patch_point(out, eoff, ctx.point(end));
+            w_u32_at(out, coff, n);
+            end
+        }
         Kind::Definition => {
             let d = tree.definition(idx);
             let eb = ctx.line_content_end(ctx.rtrim(sb, se));
@@ -846,6 +892,12 @@ impl InlineSink for WireSink<'_> {
         w_str(label, self.out);
         self.out.push(reftype_code(reftype));
         w_str(alt, self.out);
+        self.bump();
+    }
+    fn footnote_ref(&mut self, identifier: &str, label: &str, start: u32, end: u32) {
+        self.leaf(23, start, end);
+        w_str(identifier, self.out);
+        w_str(label, self.out);
         self.bump();
     }
     fn autolink(&mut self, url: &str, text: &str, start: u32, end: u32) {
@@ -1061,6 +1113,25 @@ fn write_json_pos(node: &Mdast, pos: Option<&Pos>, out: &mut String) {
             key("value", out);
             json_str(v, out);
         }
+        Mdast::FootnoteDefinition { identifier, label, children } => {
+            out.push_str("\"footnoteDefinition\",");
+            key("identifier", out);
+            json_str(identifier, out);
+            out.push(',');
+            key("label", out);
+            json_str(label, out);
+            out.push(',');
+            key("children", out);
+            json_children(children, out);
+        }
+        Mdast::FootnoteReference { identifier, label } => {
+            out.push_str("\"footnoteReference\",");
+            key("identifier", out);
+            json_str(identifier, out);
+            out.push(',');
+            key("label", out);
+            json_str(label, out);
+        }
         Mdast::Text(v) => {
             out.push_str("\"text\",");
             key("value", out);
@@ -1175,6 +1246,7 @@ pub fn node_count(node: &Mdast) -> usize {
         | List { children, .. }
         | ListItem { children, .. }
         | Link { children, .. }
+        | FootnoteDefinition { children, .. }
         | LinkReference { children, .. } => 1 + kids(children),
         ThematicBreak
         | Code { .. }
@@ -1186,6 +1258,7 @@ pub fn node_count(node: &Mdast) -> usize {
         | InlineCode(_)
         | Break
         | Image { .. }
+        | FootnoteReference { .. }
         | ImageReference { .. } => 1,
         Positioned(_, inner) => node_count(inner),
     }
