@@ -54,6 +54,7 @@ fn heading_ids() {
     );
 }
 
+#[cfg(feature = "frontmatter")]
 #[test]
 fn frontmatter() {
     let on = Options {
@@ -96,6 +97,7 @@ fn frontmatter() {
     );
 }
 
+#[cfg(feature = "footnotes")]
 #[test]
 fn footnotes() {
     let on = Options {
@@ -127,6 +129,7 @@ fn footnotes() {
     assert!(!to_html("A[^a].\n\n[^a]: note\n").contains("data-footnotes"));
 }
 
+#[cfg(feature = "external_links")]
 #[test]
 fn external_links() {
     let on = Options {

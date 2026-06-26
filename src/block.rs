@@ -34,6 +34,13 @@ pub enum Kind {
     /// GFM footnote definition `[^label]: …` (opt-in via [`Options::footnotes`]).
     /// A block container (fixed 4-space content indent, lazy paragraph
     /// continuation) carrying its label via `Node::fn_idx` → [`Tree::fn_defs`].
+    ///
+    /// The variant stays compiled even without the `footnotes` feature (only its
+    /// *producer* `start_footnote_def` and the heavy footnote code are cfg'd out,
+    /// so no such node is ever created): removing a variant shrinks the hot
+    /// `continue_block`/`can_contain` matches and perturbs their codegen (measured
+    /// +2% on the default path). Keeping the variant + its small arms keeps those
+    /// matches byte-identical to the proven-neutral baseline.
     FootnoteDef,
     /// Definition list container (`<dl>`), opt-in via [`Options::deflist`]. Holds
     /// an alternating sequence of [`Kind::DefTerm`] and [`Kind::DefDesc`] children.
@@ -48,6 +55,12 @@ pub enum Kind {
     DefDesc,
     /// Leaf directive `::name[label]{attrs}` (one line). Carries its payload via
     /// `Node::fn_idx` → [`Tree::directives`]; the `[label]` is inline content.
+    ///
+    /// The variant (and its `ContainerDirective` sibling) stays compiled even
+    /// without the `directives` feature (only their *producer* `start_directive`
+    /// and the heavy directive code are cfg'd out, so no such node is ever
+    /// created): removing a variant shrinks the hot `continue_block`/`can_contain`
+    /// matches and perturbs their codegen (measured +2% on the default path).
     LeafDirective,
     /// Container directive `:::name[label]{attrs}` … `:::` — a block container
     /// (its content parses as markdown). Colon-fenced like a code block
@@ -77,6 +90,7 @@ pub struct DefData {
 
 /// Payload for a GFM `footnoteDefinition` — the raw label and its lowercased
 /// identifier (the matching key, mirroring mdast's `label`/`identifier`).
+#[cfg(feature = "footnotes")]
 #[derive(Clone)]
 pub struct FnDef {
     pub label: String,
@@ -87,6 +101,7 @@ pub struct FnDef {
 /// `name`, ordered `attributes`, and the source byte range of its `[label]`
 /// content (if any). Indexed by `Node::fn_idx` (reused — a node is never both a
 /// footnote definition and a directive) into [`Tree::directives`].
+#[cfg(feature = "directives")]
 #[derive(Clone)]
 pub struct DirData {
     pub name: String,
@@ -220,12 +235,15 @@ pub struct Tree<'a> {
     /// Buffer for assembled text (block quotes, lists, code/HTML literals).
     buf: String,
     /// GFM footnote-definition payloads, indexed by `Node::fn_idx`.
+    #[cfg(feature = "footnotes")]
     pub fn_defs: Vec<FnDef>,
     /// GFM footnote labels (lowercased) that have ≥1 definition — the set a
     /// `[^label]` reference must hit to be a `footnoteReference`.
+    #[cfg(feature = "footnotes")]
     pub footnote_ids: std::collections::HashSet<String>,
     /// Block-directive payloads (`Kind::LeafDirective`/`ContainerDirective`),
     /// indexed by `Node::fn_idx`.
+    #[cfg(feature = "directives")]
     pub directives: Vec<DirData>,
     /// SPIKE (`ast` feature): payloads for `Kind::Definition` nodes; indexed by
     /// `Node::def`.
@@ -250,16 +268,19 @@ impl Tree<'_> {
 
     /// GFM footnote-definition payload (label + identifier) for a
     /// `Kind::FootnoteDef` node.
+    #[cfg(feature = "footnotes")]
     pub fn fn_def(&self, idx: usize) -> &FnDef {
         &self.fn_defs[self.nodes[idx].fn_idx as usize]
     }
 
     /// Block-directive payload for a `Kind::LeafDirective`/`ContainerDirective`.
+    #[cfg(feature = "directives")]
     pub fn directive(&self, idx: usize) -> &DirData {
         &self.directives[self.nodes[idx].fn_idx as usize]
     }
 
     /// A raw slice of the original source by byte range (e.g. a directive label).
+    #[cfg(feature = "directives")]
     pub fn source_range(&self, start: u32, end: u32) -> &str {
         &self.source[start as usize..end as usize]
     }
@@ -419,11 +440,14 @@ struct Parser<'a> {
     opts: Options,
     /// GFM footnote-definition payloads, in creation order; a node's
     /// `Node::fn_idx` indexes here.
+    #[cfg(feature = "footnotes")]
     fn_defs: Vec<FnDef>,
     /// GFM footnote labels (lowercased) seen as definitions — the reference set.
+    #[cfg(feature = "footnotes")]
     footnote_ids: std::collections::HashSet<String>,
     /// Block-directive payloads, in creation order; a node's `Node::fn_idx`
     /// indexes here.
+    #[cfg(feature = "directives")]
     directives: Vec<DirData>,
     /// SPIKE (`ast` feature): payloads for `Kind::Definition` nodes, in creation
     /// order; a node's `Node::def` indexes here.
@@ -473,8 +497,11 @@ impl<'a> Parser<'a> {
             prev_blank: false,
             partially_consumed_tab: false,
             opts,
+            #[cfg(feature = "footnotes")]
             fn_defs: Vec::new(),
+            #[cfg(feature = "footnotes")]
             footnote_ids: std::collections::HashSet::new(),
+            #[cfg(feature = "directives")]
             directives: Vec::new(),
             #[cfg(feature = "ast")]
             defs: Vec::new(),
@@ -926,19 +953,25 @@ impl<'a> Parser<'a> {
                 #[cfg(feature = "ast")]
                 self.compute_spread(idx);
             }
+            // Arm stays compiled (keeps the hot finalize match stable); without
+            // the `deflist` feature no `DefList` node is ever created, so the body
+            // is gated out and the arm folds into the `_ => {}` catch-all.
             Kind::DefList => {
                 // A trailing plain paragraph is a dangling term candidate (no
                 // description ever followed it); evict it to become the list's
                 // next sibling so it renders as an ordinary paragraph.
-                let lc = self.nodes[idx].last_child;
-                if lc != NO_NODE && self.nodes[lc as usize].kind == Kind::Paragraph {
-                    self.unlink(lc as usize);
-                    let after = self.nodes[idx].next_sibling;
-                    self.nodes[lc as usize].parent = parent;
-                    self.nodes[lc as usize].next_sibling = after;
-                    self.nodes[idx].next_sibling = lc;
-                    if self.nodes[parent].last_child == idx as u32 {
-                        self.nodes[parent].last_child = lc;
+                #[cfg(feature = "deflist")]
+                {
+                    let lc = self.nodes[idx].last_child;
+                    if lc != NO_NODE && self.nodes[lc as usize].kind == Kind::Paragraph {
+                        self.unlink(lc as usize);
+                        let after = self.nodes[idx].next_sibling;
+                        self.nodes[lc as usize].parent = parent;
+                        self.nodes[lc as usize].next_sibling = after;
+                        self.nodes[idx].next_sibling = lc;
+                        if self.nodes[parent].last_child == idx as u32 {
+                            self.nodes[parent].last_child = lc;
+                        }
                     }
                 }
             }
@@ -1050,6 +1083,7 @@ impl<'a> Parser<'a> {
     /// closing fence line), or `None` if the input does not open with a
     /// *complete* frontmatter block — in which case nothing is consumed and the
     /// fence text parses normally (an unmatched `---` becomes a thematic break).
+    #[cfg(feature = "frontmatter")]
     fn try_frontmatter(&mut self, bytes: &[u8]) -> Option<usize> {
         // The opening fence is the very first line, unindented, exactly three
         // `-`/`+` markers then only trailing spaces/tabs.
@@ -1091,6 +1125,7 @@ impl<'a> Parser<'a> {
 
     /// Create the frontmatter node as the document's (already empty) first child.
     /// It is born closed — block phase 1 never descends into it.
+    #[cfg(feature = "frontmatter")]
     fn push_frontmatter(&mut self, marker: u8, cstart: usize, cend: usize, src_end: usize) {
         let idx = self.nodes.len();
         let mut node = Node::new(Kind::Frontmatter, 0, 1);
@@ -1127,6 +1162,7 @@ impl<'a> Parser<'a> {
         // the very first byte. Consumed before the block loop so the rest parses
         // normally (and `---` only becomes a thematic break when there is no
         // matching close).
+        #[cfg(feature = "frontmatter")]
         if self.opts.frontmatter
             && let Some(resume) = self.try_frontmatter(bytes)
         {
@@ -1155,8 +1191,11 @@ impl<'a> Parser<'a> {
             opts: self.opts,
             source: src,
             buf: self.buf,
+            #[cfg(feature = "footnotes")]
             fn_defs: self.fn_defs,
+            #[cfg(feature = "footnotes")]
             footnote_ids: self.footnote_ids,
+            #[cfg(feature = "directives")]
             directives: self.directives,
             #[cfg(feature = "ast")]
             defs: self.defs,
@@ -1165,6 +1204,12 @@ impl<'a> Parser<'a> {
         }
     }
 
+    // Pinned: cfg-gating the woven extensions (see the `Kind`-variant notes
+    // above) shifts LLVM's auto-inlining of this single-caller per-line hot fn —
+    // measured +2% on the default path WITHOUT the pin, −1~−5% WITH it (best-of-N,
+    // instructions retired). The default-path benchmark on CI (CodSpeed, the
+    // `sparkdown` row of vs_pulldown) guards against a regression.
+    #[inline(always)]
     fn incorporate_line(&mut self, line: &'a [u8]) {
         let mut container = 0;
         self.oldtip = self.tip;
@@ -1221,12 +1266,15 @@ impl<'a> Parser<'a> {
                 fast_skip && !(self.opts.tables && matches!(first, Some(b'|') | Some(b':')));
             // A footnote definition starts with `[` (not in `maybe_special`); keep
             // the fast skip on for `[` lines unless footnotes are enabled.
+            #[cfg(feature = "footnotes")]
             let fast_skip = fast_skip && !(self.opts.footnotes && first == Some(b'['));
             // Definition-list markers and directives both start with `:` (not in
             // `maybe_special`); let `:` lines through to their matchers when
             // either extension is enabled.
-            let fast_skip =
-                fast_skip && !((self.opts.deflist || self.opts.directives) && first == Some(b':'));
+            let fast_skip = fast_skip
+                && !(((Options::DEFLIST && self.opts.deflist)
+                    || (Options::DIRECTIVES && self.opts.directives))
+                    && first == Some(b':'));
             if fast_skip {
                 self.advance_next_nonspace();
                 break;
@@ -1334,6 +1382,7 @@ impl<'a> Parser<'a> {
             // Footnote definition: a block container with a fixed 4-space content
             // indent (one tab stop), lazy paragraph continuation, and blank lines
             // tolerated once it has content (mirrors a list item with padding 4).
+            // Arm stays compiled (self-contained) so the match doesn't perturb.
             Kind::FootnoteDef => {
                 if self.blank {
                     if self.nodes[c].first_child == NO_NODE {
@@ -1414,7 +1463,11 @@ impl<'a> Parser<'a> {
             // A container directive runs until its closing colon fence (a line of
             // ≥ the opening colon count); otherwise its content flows in as
             // markdown with no prefix stripping.
+            // Arm stays compiled (keeps the hot continue match stable); without
+            // the `directives` feature no `ContainerDirective` node is ever
+            // created, so the body is gated out and the arm folds into `0`.
             Kind::ContainerDirective => {
+                #[cfg(feature = "directives")]
                 if !self.indented
                     && is_colon_close(self.line, self.next_nonspace, self.nodes[c].fence_len)
                 {
@@ -1495,9 +1548,27 @@ impl<'a> Parser<'a> {
             5 => self.start_thematic_break(),
             6 => self.start_list_item(container),
             7 => self.start_indented_code(),
+            // Footnote slot keeps main's index (8); its body is the only cfg'd
+            // part — a no-op `=> 0` without the feature, so the dispatch order is
+            // byte-identical to the proven-neutral baseline.
+            #[cfg(feature = "footnotes")]
             8 => self.start_footnote_def(container),
+            #[cfg(not(feature = "footnotes"))]
+            8 => 0,
+            // Deflist slot keeps main's index (9); its body is the only cfg'd
+            // part — a no-op `=> 0` without the feature, so the dispatch order is
+            // byte-identical to the proven-neutral baseline.
+            #[cfg(feature = "deflist")]
             9 => self.start_def_list(container),
+            #[cfg(not(feature = "deflist"))]
+            9 => 0,
+            // Directive slot keeps main's index (10); its body is the only cfg'd
+            // part — a no-op `=> 0` without the feature, so the dispatch order is
+            // byte-identical to the proven-neutral baseline.
+            #[cfg(feature = "directives")]
             10 => self.start_directive(),
+            #[cfg(not(feature = "directives"))]
+            10 => 0,
             #[cfg(feature = "gfm")]
             11 => self.start_table(container),
             _ => 0,
@@ -1735,6 +1806,7 @@ impl<'a> Parser<'a> {
     /// GFM footnote definition `[^label]: …`. A flow construct: it interrupts an
     /// open paragraph. Opens a `FootnoteDef` container; the remaining line content
     /// flows into it as a paragraph via the normal machinery.
+    #[cfg(feature = "footnotes")]
     fn start_footnote_def(&mut self, _container: usize) -> u8 {
         if !self.opts.footnotes || self.indented {
             return 0;
@@ -1783,6 +1855,7 @@ impl<'a> Parser<'a> {
     /// further markers add more descriptions (and intervening paragraphs add more
     /// terms) to the same list. A blank line before the marker makes the
     /// description *loose* (its body is wrapped in `<p>`).
+    #[cfg(feature = "deflist")]
     fn start_def_list(&mut self, container: usize) -> u8 {
         if !self.opts.deflist || self.indented || !self.is_def_marker() {
             return 0;
@@ -1836,6 +1909,7 @@ impl<'a> Parser<'a> {
 
     /// Splice a fresh `DefList` into `parent`'s child list where `para` sits, then
     /// move `para` (already retyped as a `DefTerm`) inside it. Returns the list.
+    #[cfg(feature = "deflist")]
     fn splice_def_list(&mut self, parent: usize, para: usize) -> usize {
         let dl = self.nodes.len();
         let mut node = Node::new(Kind::DefList, parent, self.nodes[para].start_line);
@@ -1870,6 +1944,7 @@ impl<'a> Parser<'a> {
     /// container `:::name…` … `:::`. The leading colon run selects the form (2 =
     /// leaf, ≥3 = container). The header (`name[label]{attrs}`) is parsed once and
     /// stashed in `directives`; the opening line must hold nothing but the header.
+    #[cfg(feature = "directives")]
     fn start_directive(&mut self) -> u8 {
         if !self.opts.directives || self.indented {
             return 0;
@@ -2059,6 +2134,10 @@ impl<'a> Parser<'a> {
     }
 }
 
+// Keep main's exact index map regardless of `footnotes` — the footnote slot
+// (8) stays counted; without the feature its `try_start` arm is a no-op `=> 0`.
+// (Renumbering the slots to drop the footnote index perturbs the hot block-start
+// dispatch — measured +3% on the default path — so we don't.)
 const NUM_STARTS: usize = if cfg!(feature = "gfm") { 12 } else { 11 };
 
 /// Could a line whose first non-space byte is `c` begin a block other than a
@@ -2085,6 +2164,7 @@ fn trim_cr(line: &[u8]) -> &[u8] {
 /// Returns `(label, bytes_through_colon)`. The label is non-empty, contains no
 /// unescaped brackets and no whitespace (backslash escapes are kept verbatim, as
 /// remark does), and must be immediately followed by `]:`.
+#[cfg(feature = "footnotes")]
 fn parse_footnote_label_def(line: &[u8]) -> Option<(String, usize)> {
     if line.len() < 4 || line[0] != b'[' || line[1] != b'^' {
         return None;
@@ -2109,6 +2189,7 @@ fn parse_footnote_label_def(line: &[u8]) -> Option<(String, usize)> {
 
 /// A frontmatter fence: exactly three `marker` bytes then only spaces/tabs
 /// (a trailing `\r` already trimmed). Four or more markers is not a fence.
+#[cfg(feature = "frontmatter")]
 fn is_fm_fence(line: &[u8], marker: u8) -> bool {
     line.len() >= 3
         && line[0] == marker
@@ -2119,7 +2200,9 @@ fn is_fm_fence(line: &[u8], marker: u8) -> bool {
 
 fn can_contain(parent: Kind, child: Kind) -> bool {
     match parent {
-        Kind::Document | Kind::BlockQuote | Kind::Item | Kind::FootnoteDef => child != Kind::Item,
+        Kind::Document | Kind::BlockQuote | Kind::Item => child != Kind::Item,
+        #[cfg(feature = "footnotes")]
+        Kind::FootnoteDef => child != Kind::Item,
         Kind::ContainerDirective => child != Kind::Item,
         Kind::List => child == Kind::Item,
         // A definition list holds term holders and descriptions; a plain
@@ -2310,6 +2393,7 @@ fn is_closing_fence(line: &[u8], from: usize, fence_char: u8, fence_len: usize) 
 
 /// A container-directive closing fence: a run of `≥ max(fence_len, 3)` colons
 /// followed only by whitespace.
+#[cfg(feature = "directives")]
 fn is_colon_close(line: &[u8], from: usize, fence_len: usize) -> bool {
     let rest = &line[from..];
     let run = rest.iter().take_while(|&&b| b == b':').count();

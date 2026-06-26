@@ -23,9 +23,10 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 # GFM extensions (opt-in, OFF by default): strikethrough, task lists, extended
-# autolinks, tag filter, and pipe tables. Off, none of this code is compiled —
-# the parser is byte-for-byte the pure-CommonMark fast path.
-gfm = []
+# autolinks, tag filter, pipe tables, and footnotes — the full GitHub Flavored
+# Markdown set. Off, none of this code is compiled — the parser is byte-for-byte
+# the pure-CommonMark fast path. (Umbrella: pulls in `footnotes`.)
+gfm = ["footnotes"]
 # Diagram extension (opt-in, OFF by default): a fenced code block tagged with a
 # client-side diagram language (currently `mermaid`) renders as a bare wrapper
 # element (`<pre class="mermaid">`) for a browser library to pick up, instead of
@@ -36,6 +37,33 @@ diagram = []
 # data table (src/ext/emoji_data.rs), so it is Cargo-gated to keep it out of the
 # default build.
 emoji = []
+# GFM footnotes extension (opt-in, OFF by default): inline `[^label]` references
+# and `[^label]: …` block definitions (the remark-gfm grammar). Off, none of this
+# code is compiled — the parser stays byte-for-byte the pure-CommonMark fast path.
+footnotes = []
+# Definition-lists extension (opt-in, OFF by default): a `Term` line followed by
+# `: definition` lines renders as `<dl>`/`<dt>`/`<dd>` (pandoc / remark-definition-
+# list grammar). Off, none of this heavy code is compiled — the parser stays
+# byte-for-byte the pure-CommonMark fast path.
+deflist = []
+# remark-directive extension (opt-in, OFF by default): inline `:name[label]{attrs}`,
+# leaf `::name…`, and container `:::name … :::` directives. Off, none of this heavy
+# code is compiled — the parser stays byte-for-byte the pure-CommonMark fast path.
+directives = []
+# Frontmatter extension (opt-in, OFF by default): a YAML (`---`) or TOML (`+++`)
+# fenced block at the very start of the document (the remark-frontmatter grammar).
+# Renders to nothing; with `ast` it becomes a `yaml`/`toml` mdast node. Off, none
+# of this code is compiled — the parser stays byte-for-byte the pure-CommonMark
+# fast path.
+frontmatter = []
+# External-links extension (opt-in, OFF by default): a post-render pass adds
+# `rel="nofollow"` to `http(s)://` links (the rehype-external-links default).
+# Render-only; off, the pass is not compiled.
+external_links = []
+# Umbrella features for the shipped bundles (see the README "Extension bundles"
+# matrix). `extras` = every non-GFM extension; `full` = GFM + extras = everything.
+extras = ["frontmatter", "emoji", "external_links", "diagram", "deflist", "directives"]
+full = ["gfm", "extras"]
 # Mirrors rostdown: opt-in scoped global bump allocator (src/arena.rs). An
 # embedder that enables it must install `sparkdown::ScopedAlloc` as its
 # `#[global_allocator]`. The local bump (src/bump.rs) is always on.

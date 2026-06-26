@@ -39,6 +39,7 @@ mod arena;
 pub mod ast;
 mod block;
 mod bump;
+#[cfg(feature = "directives")]
 mod directive;
 mod entities;
 mod ext;

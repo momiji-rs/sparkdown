@@ -59,32 +59,40 @@ pub enum Mdast {
     /// Raw HTML — block (here) or inline (from the inline stream).
     Html(String),
     /// YAML frontmatter (`---`); `value` is the text between the fences.
+    #[cfg(feature = "frontmatter")]
     Yaml(String),
     /// TOML frontmatter (`+++`); `value` is the text between the fences.
+    #[cfg(feature = "frontmatter")]
     Toml(String),
     /// GFM footnote definition `[^label]: …` — a block container.
+    #[cfg(feature = "footnotes")]
     FootnoteDefinition {
         identifier: String,
         label: String,
         children: Vec<Mdast>,
     },
     /// Definition list container (remark-definition-list `defList`).
+    #[cfg(feature = "deflist")]
     DefList(Vec<Mdast>),
     /// One term of a definition list (`defListTerm`); children are inline.
+    #[cfg(feature = "deflist")]
     DefListTerm(Vec<Mdast>),
     /// One description of a definition list (`defListDescription`). `spread` is
     /// true when loose; children are block content (a wrapping `paragraph`).
+    #[cfg(feature = "deflist")]
     DefListDescription {
         spread: bool,
         children: Vec<Mdast>,
     },
     /// remark-directive `containerDirective` (`:::name … :::`) — block children.
+    #[cfg(feature = "directives")]
     ContainerDirective {
         name: String,
         attributes: Vec<(String, String)>,
         children: Vec<Mdast>,
     },
     /// remark-directive `leafDirective` (`::name`) — inline children (the label).
+    #[cfg(feature = "directives")]
     LeafDirective {
         name: String,
         attributes: Vec<(String, String)>,
@@ -92,6 +100,7 @@ pub enum Mdast {
     },
     /// A container directive's `[label]`: serialized as a `paragraph` carrying
     /// `data: { directiveLabel: true }` (matching remark-directive).
+    #[cfg(feature = "directives")]
     DirectiveLabel(Vec<Mdast>),
     // --- inline ---
     Text(String),
@@ -123,11 +132,13 @@ pub enum Mdast {
         alt: String,
     },
     /// GFM footnote reference `[^label]` (inline leaf).
+    #[cfg(feature = "footnotes")]
     FootnoteReference {
         identifier: String,
         label: String,
     },
     /// remark-directive inline `textDirective` (`:name[label]{attrs}`).
+    #[cfg(feature = "directives")]
     TextDirective {
         name: String,
         attributes: Vec<(String, String)>,
@@ -267,8 +278,12 @@ pub fn to_mdast_opts(src: &str, opts: crate::Options) -> Mdast {
 /// A fresh [`Scratch`] seeded with the tree's footnote labels, so inline
 /// `[^label]` references resolve while building the mdast (forward refs work
 /// because the label set is collected in the block pass).
-fn fn_scratch(tree: &Tree) -> Scratch {
+fn fn_scratch(
+    #[cfg_attr(not(feature = "footnotes"), allow(unused_variables))] tree: &Tree,
+) -> Scratch {
+    #[cfg_attr(not(feature = "footnotes"), allow(unused_mut))]
     let mut scratch = Scratch::new();
+    #[cfg(feature = "footnotes")]
     if tree.opts.footnotes {
         scratch.footnote_ids.clone_from(&tree.footnote_ids);
     }
@@ -278,6 +293,7 @@ fn fn_scratch(tree: &Tree) -> Scratch {
 /// The mdast `value` of a frontmatter node: the raw text between the fences with
 /// exactly one trailing line ending dropped. Internal line endings are kept
 /// verbatim — remark-frontmatter does not normalize CRLF inside the value.
+#[cfg(feature = "frontmatter")]
 fn frontmatter_value(raw: &str) -> &str {
     let raw = raw.strip_suffix('\n').unwrap_or(raw);
     raw.strip_suffix('\r').unwrap_or(raw)
@@ -351,6 +367,11 @@ fn block(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> (Mdast
                 tree.html_ast_end(idx) as usize,
             )
         }
+        // The `Frontmatter` variant is always compiled (to keep the hot block
+        // matches stable), but a node only exists with the `frontmatter` feature.
+        #[cfg(not(feature = "frontmatter"))]
+        Kind::Frontmatter => unreachable!("Frontmatter node requires the `frontmatter` feature"),
+        #[cfg(feature = "frontmatter")]
         Kind::Frontmatter => {
             // `level` 1 = TOML (`+++`), 0 = YAML (`---`). The span is already the
             // exact mdast range: start at offset 0, end at the closing fence's
@@ -363,6 +384,11 @@ fn block(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> (Mdast
             };
             (inner, sb, se)
         }
+        // The `FootnoteDef` variant is always compiled (to keep the hot block
+        // matches stable), but a node only exists with the `footnotes` feature.
+        #[cfg(not(feature = "footnotes"))]
+        Kind::FootnoteDef => unreachable!("FootnoteDef node requires the `footnotes` feature"),
+        #[cfg(feature = "footnotes")]
         Kind::FootnoteDef => {
             let d = tree.fn_def(idx);
             let (identifier, label) = (d.identifier.clone(), d.label.clone());
@@ -417,6 +443,13 @@ fn block(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> (Mdast
                 last.unwrap_or(se),
             )
         }
+        // The deflist variants stay compiled (to keep the hot block match
+        // stable), but a node only exists with the `deflist` feature.
+        #[cfg(not(feature = "deflist"))]
+        Kind::DefList | Kind::DefTerm | Kind::DefDesc => {
+            unreachable!("DefList nodes require the `deflist` feature")
+        }
+        #[cfg(feature = "deflist")]
         Kind::DefList => {
             // Build the custom remark-definition-list shape: each term line is a
             // `defListTerm`, each `: …` line a `defListDescription` wrapping a
@@ -474,6 +507,7 @@ fn block(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> (Mdast
         }
         // Term/description nodes are built inline by their `DefList` parent; these
         // arms keep the match exhaustive and are not reached in practice.
+        #[cfg(feature = "deflist")]
         Kind::DefTerm => {
             let eb = ctx.rtrim_nl(se);
             (
@@ -482,6 +516,7 @@ fn block(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> (Mdast
                 eb,
             )
         }
+        #[cfg(feature = "deflist")]
         Kind::DefDesc => {
             let eb = ctx.rtrim_nl(se);
             let para = Mdast::Positioned(
@@ -497,6 +532,13 @@ fn block(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> (Mdast
                 eb,
             )
         }
+        // The directive variants stay compiled (to keep the hot block match
+        // stable), but a node only exists with the `directives` feature.
+        #[cfg(not(feature = "directives"))]
+        Kind::LeafDirective | Kind::ContainerDirective => {
+            unreachable!("directive nodes require the `directives` feature")
+        }
+        #[cfg(feature = "directives")]
         Kind::LeafDirective => {
             let d = tree.directive(idx);
             let eb = ctx.rtrim_nl(se);
@@ -511,6 +553,7 @@ fn block(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> (Mdast
                 eb,
             )
         }
+        #[cfg(feature = "directives")]
         Kind::ContainerDirective => {
             let d = tree.directive(idx);
             // A `[label]` on the opener becomes a leading `paragraph` carrying
@@ -553,6 +596,7 @@ fn block(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> (Mdast
 
 /// Build the inline children of a block directive's `[label]` (empty when absent).
 /// The label is a contiguous source range, so child token offsets map directly.
+#[cfg(feature = "directives")]
 fn directive_label_children(
     tree: &Tree,
     d: &crate::block::DirData,
@@ -659,10 +703,13 @@ enum Frame {
 /// source `base + o`); when `None` (buffered content) or a token span is unset,
 /// the block-granular `bpos` is used.
 fn build_inline(
-    content: &str,
+    // `content`/`tree`/`scratch` are consumed only by the `TextDirective` arm
+    // (it re-tokenizes a directive `[label]`), which is cfg'd out without the
+    // `directives` feature — so they are threaded but unread in that build.
+    #[cfg_attr(not(feature = "directives"), allow(unused_variables))] content: &str,
     toks: Vec<SpanTok>,
-    tree: &Tree,
-    scratch: &mut Scratch,
+    #[cfg_attr(not(feature = "directives"), allow(unused_variables))] tree: &Tree,
+    #[cfg_attr(not(feature = "directives"), allow(unused_variables))] scratch: &mut Scratch,
     ctx: &PosCtx,
     map: &dyn Fn(u32) -> usize,
     bpos: &Pos,
@@ -744,6 +791,7 @@ fn build_inline(
                     }),
                 ));
             }
+            #[cfg(feature = "footnotes")]
             InlineTok::FootnoteRef { identifier, label } => {
                 let p = mkpos(start, end);
                 stack.last_mut().unwrap().1.push(Mdast::Positioned(
@@ -751,6 +799,7 @@ fn build_inline(
                     Box::new(Mdast::FootnoteReference { identifier, label }),
                 ));
             }
+            #[cfg(feature = "directives")]
             InlineTok::TextDirective { name, attrs, label } => {
                 let p = mkpos(start, end);
                 let children = match label {
@@ -1091,6 +1140,11 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
             w_str(tree.html_value(idx), out);
             eb
         }
+        // The `Frontmatter` variant is always compiled (to keep the hot block
+        // matches stable), but a node only exists with the `frontmatter` feature.
+        #[cfg(not(feature = "frontmatter"))]
+        Kind::Frontmatter => unreachable!("Frontmatter node requires the `frontmatter` feature"),
+        #[cfg(feature = "frontmatter")]
         Kind::Frontmatter => {
             let value = frontmatter_value(tree.content(idx));
             out.push(if node.level == 1 { 21 } else { 20 }); // 20 = yaml, 21 = toml
@@ -1099,6 +1153,11 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
             w_str(value, out);
             se
         }
+        // The `FootnoteDef` variant is always compiled (to keep the hot block
+        // matches stable), but a node only exists with the `footnotes` feature.
+        #[cfg(not(feature = "footnotes"))]
+        Kind::FootnoteDef => unreachable!("FootnoteDef node requires the `footnotes` feature"),
+        #[cfg(feature = "footnotes")]
         Kind::FootnoteDef => {
             let d = tree.fn_def(idx);
             out.push(22);
@@ -1125,6 +1184,13 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
             w_opt(&d.title, out);
             eb
         }
+        // The deflist variants stay compiled (to keep the hot block match
+        // stable), but a node only exists with the `deflist` feature.
+        #[cfg(not(feature = "deflist"))]
+        Kind::DefList | Kind::DefTerm | Kind::DefDesc => {
+            unreachable!("DefList nodes require the `deflist` feature")
+        }
+        #[cfg(feature = "deflist")]
         Kind::DefList => {
             // tag 24 = defList; children are built from the term/description
             // nodes the same way as `block()` (terms split per line).
@@ -1197,6 +1263,13 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
             w_u32_at(out, coff, n);
             last
         }
+        // The directive variants stay compiled (to keep the hot block match
+        // stable), but a node only exists with the `directives` feature.
+        #[cfg(not(feature = "directives"))]
+        Kind::LeafDirective | Kind::ContainerDirective => {
+            unreachable!("directive nodes require the `directives` feature")
+        }
+        #[cfg(feature = "directives")]
         Kind::LeafDirective => {
             let d = tree.directive(idx);
             let eb = ctx.rtrim_nl(se);
@@ -1215,6 +1288,7 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
             w_u32_at(out, coff, n);
             eb
         }
+        #[cfg(feature = "directives")]
         Kind::ContainerDirective => {
             let d = tree.directive(idx);
             out.push(29); // containerDirective
@@ -1247,6 +1321,7 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
             last
         }
         // Built inline by their `DefList` parent; unreachable but kept exhaustive.
+        #[cfg(feature = "deflist")]
         Kind::DefTerm => {
             let eb = ctx.rtrim_nl(se);
             out.push(25);
@@ -1257,6 +1332,7 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
             w_u32_at(out, coff, n);
             eb
         }
+        #[cfg(feature = "deflist")]
         Kind::DefDesc => {
             let eb = ctx.rtrim_nl(se);
             out.push(26);
@@ -1333,6 +1409,7 @@ fn inline_wire(
 /// Emit the inline content of a raw source range `body` (starting at source byte
 /// `src_start`) to wire — used for a block directive's `[label]`. Returns the
 /// label's source byte end and its child count.
+#[cfg(feature = "directives")]
 fn inline_wire_src(
     tree: &Tree,
     src_start: u32,
@@ -1359,6 +1436,7 @@ fn inline_wire_src(
 
 /// Write an ordered attribute object to wire: `u32` count, then `(key, value)`
 /// string pairs.
+#[cfg(feature = "directives")]
 fn w_attrs(attrs: &[(String, String)], out: &mut Vec<u8>) {
     w_u32(attrs.len() as u32, out);
     for (k, v) in attrs {
@@ -1514,12 +1592,14 @@ impl InlineSink for WireSink<'_> {
         w_str(alt, self.out);
         self.bump();
     }
+    #[cfg(feature = "footnotes")]
     fn footnote_ref(&mut self, identifier: &str, label: &str, start: u32, end: u32) {
         self.leaf(23, start, end);
         w_str(identifier, self.out);
         w_str(label, self.out);
         self.bump();
     }
+    #[cfg(feature = "directives")]
     fn text_directive(
         &mut self,
         name: &str,
@@ -1670,6 +1750,7 @@ fn json_opt(v: &Option<String>, out: &mut String) {
 }
 
 /// Write a directive `attributes` object `{"k":"v",…}` in insertion order.
+#[cfg(feature = "directives")]
 fn json_attrs(attrs: &[(String, String)], out: &mut String) {
     out.push('{');
     for (i, (k, v)) in attrs.iter().enumerate() {
@@ -1777,16 +1858,19 @@ fn write_json_pos(node: &Mdast, pos: Option<&Pos>, out: &mut String) {
             key("value", out);
             json_str(v, out);
         }
+        #[cfg(feature = "frontmatter")]
         Mdast::Yaml(v) => {
             out.push_str("\"yaml\",");
             key("value", out);
             json_str(v, out);
         }
+        #[cfg(feature = "frontmatter")]
         Mdast::Toml(v) => {
             out.push_str("\"toml\",");
             key("value", out);
             json_str(v, out);
         }
+        #[cfg(feature = "footnotes")]
         Mdast::FootnoteDefinition {
             identifier,
             label,
@@ -1802,16 +1886,19 @@ fn write_json_pos(node: &Mdast, pos: Option<&Pos>, out: &mut String) {
             key("children", out);
             json_children(children, out);
         }
+        #[cfg(feature = "deflist")]
         Mdast::DefList(c) => {
             out.push_str("\"defList\",");
             key("children", out);
             json_children(c, out);
         }
+        #[cfg(feature = "deflist")]
         Mdast::DefListTerm(c) => {
             out.push_str("\"defListTerm\",");
             key("children", out);
             json_children(c, out);
         }
+        #[cfg(feature = "deflist")]
         Mdast::DefListDescription { spread, children } => {
             out.push_str("\"defListDescription\",");
             key("spread", out);
@@ -1819,6 +1906,7 @@ fn write_json_pos(node: &Mdast, pos: Option<&Pos>, out: &mut String) {
             key("children", out);
             json_children(children, out);
         }
+        #[cfg(feature = "directives")]
         Mdast::ContainerDirective {
             name,
             attributes,
@@ -1834,6 +1922,7 @@ fn write_json_pos(node: &Mdast, pos: Option<&Pos>, out: &mut String) {
             key("children", out);
             json_children(children, out);
         }
+        #[cfg(feature = "directives")]
         Mdast::LeafDirective {
             name,
             attributes,
@@ -1849,6 +1938,7 @@ fn write_json_pos(node: &Mdast, pos: Option<&Pos>, out: &mut String) {
             key("children", out);
             json_children(children, out);
         }
+        #[cfg(feature = "directives")]
         Mdast::TextDirective {
             name,
             attributes,
@@ -1864,6 +1954,7 @@ fn write_json_pos(node: &Mdast, pos: Option<&Pos>, out: &mut String) {
             key("children", out);
             json_children(children, out);
         }
+        #[cfg(feature = "directives")]
         Mdast::DirectiveLabel(children) => {
             out.push_str("\"paragraph\",");
             key("data", out);
@@ -1871,6 +1962,7 @@ fn write_json_pos(node: &Mdast, pos: Option<&Pos>, out: &mut String) {
             key("children", out);
             json_children(children, out);
         }
+        #[cfg(feature = "footnotes")]
         Mdast::FootnoteReference { identifier, label } => {
             out.push_str("\"footnoteReference\",");
             key("identifier", out);
@@ -2007,29 +2099,36 @@ pub fn node_count(node: &Mdast) -> usize {
     use Mdast::*;
     let kids = |c: &[Mdast]| c.iter().map(node_count).sum::<usize>();
     match node {
-        Root(c) | Paragraph(c) | Blockquote(c) | Emphasis(c) | Strong(c) | Delete(c)
-        | DefList(c) | DefListTerm(c) | DirectiveLabel(c) => 1 + kids(c),
+        Root(c) | Paragraph(c) | Blockquote(c) | Emphasis(c) | Strong(c) | Delete(c) => 1 + kids(c),
+        #[cfg(feature = "directives")]
+        DirectiveLabel(c) => 1 + kids(c),
+        #[cfg(feature = "deflist")]
+        DefList(c) | DefListTerm(c) => 1 + kids(c),
+        #[cfg(feature = "deflist")]
+        DefListDescription { children, .. } => 1 + kids(children),
+        #[cfg(feature = "footnotes")]
+        FootnoteDefinition { children, .. } => 1 + kids(children),
+        #[cfg(feature = "directives")]
+        ContainerDirective { children, .. }
+        | LeafDirective { children, .. }
+        | TextDirective { children, .. } => 1 + kids(children),
         Heading { children, .. }
         | List { children, .. }
         | ListItem { children, .. }
         | Link { children, .. }
-        | FootnoteDefinition { children, .. }
-        | DefListDescription { children, .. }
-        | ContainerDirective { children, .. }
-        | LeafDirective { children, .. }
-        | TextDirective { children, .. }
         | LinkReference { children, .. } => 1 + kids(children),
+        #[cfg(feature = "footnotes")]
+        FootnoteReference { .. } => 1,
+        #[cfg(feature = "frontmatter")]
+        Yaml(_) | Toml(_) => 1,
         ThematicBreak
         | Code { .. }
         | Definition { .. }
         | Html(_)
-        | Yaml(_)
-        | Toml(_)
         | Text(_)
         | InlineCode(_)
         | Break
         | Image { .. }
-        | FootnoteReference { .. }
         | ImageReference { .. } => 1,
         Positioned(_, inner) => node_count(inner),
     }

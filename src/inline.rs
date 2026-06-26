@@ -649,10 +649,18 @@ enum Sem {
         reftype: &'static str,
         alt: String,
     },
+    // NOTE: unlike the block `Kind` variants (kept compiled — removing them
+    // perturbs the hot block matches, see block.rs), the inline extension variants
+    // below ARE cfg-removed. Measured: removing them does NOT perturb the
+    // monomorphized `render_inline_impl` (inline/colon-heavy corpora 0% on the
+    // default path) and it keeps the build leaner — so each path uses the policy
+    // that is measured-optimal for it, not a single uniform one.
     /// GFM `[^label]` → mdast `footnoteReference` (a leaf).
+    #[cfg(feature = "footnotes")]
     FootnoteRef { identifier: String, label: String },
     /// remark-directive inline `:name[label]{attrs}` → mdast `textDirective`. The
     /// `label` is a content byte range (re-tokenized into children at build time).
+    #[cfg(feature = "directives")]
     TextDirective {
         name: String,
         attrs: Vec<(String, String)>,
@@ -714,9 +722,11 @@ pub enum InlineTok {
         alt: String,
     },
     /// mdast `footnoteReference` (leaf).
+    #[cfg(feature = "footnotes")]
     FootnoteRef { identifier: String, label: String },
     /// mdast `textDirective`. `label` is a content byte range whose inline content
     /// becomes the directive's children (re-tokenized by the AST builder).
+    #[cfg(feature = "directives")]
     TextDirective {
         name: String,
         attrs: Vec<(String, String)>,
@@ -843,10 +853,12 @@ fn list_to_tokens(list: &List, cur: &str, sem: &[Sem], out: &mut Vec<SpanTok>) {
                     reftype,
                     alt: alt.clone(),
                 },
+                #[cfg(feature = "footnotes")]
                 Sem::FootnoteRef { identifier, label } => InlineTok::FootnoteRef {
                     identifier: identifier.clone(),
                     label: label.clone(),
                 },
+                #[cfg(feature = "directives")]
                 Sem::TextDirective { name, attrs, label } => InlineTok::TextDirective {
                     name: name.clone(),
                     attrs: attrs.clone(),
@@ -899,9 +911,11 @@ pub trait InlineSink {
         start: u32,
         end: u32,
     );
+    #[cfg(feature = "footnotes")]
     fn footnote_ref(&mut self, identifier: &str, label: &str, start: u32, end: u32);
     /// A remark-directive `textDirective`. `label` is a content byte range whose
     /// inline content forms the children (the wire emitter resolves it best-effort).
+    #[cfg(feature = "directives")]
     fn text_directive(
         &mut self,
         name: &str,
@@ -1002,9 +1016,11 @@ fn emit_inline<S: InlineSink>(list: &List, cur: &str, sem: &[Sem], sink: &mut S)
                         reftype,
                         alt,
                     } => sink.imageref(identifier, label, reftype, alt, s, e),
+                    #[cfg(feature = "footnotes")]
                     Sem::FootnoteRef { identifier, label } => {
                         sink.footnote_ref(identifier, label, s, e)
                     }
+                    #[cfg(feature = "directives")]
                     Sem::TextDirective { name, attrs, label } => {
                         sink.text_directive(name, attrs, *label, s, e)
                     }
@@ -1229,13 +1245,16 @@ pub struct Scratch {
     /// (populated per-document by the renderer/mdast builder before walking, like
     /// `slugs`; survives `reset()`). A `[^label]` is a `footnoteReference` only if
     /// its lowercased label is in here — otherwise it stays literal text.
+    #[cfg(feature = "footnotes")]
     pub(crate) footnote_ids: std::collections::HashSet<String>,
     /// GFM footnotes (HTML path): identifiers in first-reference order — a ref's
     /// number is its index here + 1. Document-level (cleared per document, like
     /// `slugs`); the footnotes `<section>` is emitted in this order.
+    #[cfg(feature = "footnotes")]
     pub(crate) footnote_order: Vec<String>,
     /// GFM footnotes (HTML path): per-identifier count of references emitted so
     /// far, for the `fnref-id-2`, `-3`, … suffixes and the backref count.
+    #[cfg(feature = "footnotes")]
     pub(crate) footnote_seen: std::collections::HashMap<String, u32>,
     #[cfg(feature = "ast")]
     toks: Option<Vec<SpanTok>>,
@@ -1256,8 +1275,11 @@ impl Scratch {
             norm: String::with_capacity(48),
             sem: Vec::new(),
             slugs: std::collections::HashMap::new(),
+            #[cfg(feature = "footnotes")]
             footnote_ids: std::collections::HashSet::new(),
+            #[cfg(feature = "footnotes")]
             footnote_order: Vec::new(),
+            #[cfg(feature = "footnotes")]
             footnote_seen: std::collections::HashMap::new(),
             #[cfg(feature = "ast")]
             toks: None,
@@ -1278,6 +1300,7 @@ impl Scratch {
 /// Parse a GFM footnote reference `[^label]` at `bytes[i]` (`[`). Returns
 /// `(label, bytes_consumed)`. Same label rules as a definition opener: non-empty,
 /// no whitespace, no unescaped brackets (backslash escapes kept); ends at `]`.
+#[cfg(feature = "footnotes")]
 fn parse_footnote_ref(bytes: &[u8], i: usize) -> Option<(String, usize)> {
     if bytes.get(i + 1) != Some(&b'^') {
         return None;
@@ -1303,6 +1326,7 @@ fn parse_footnote_ref(bytes: &[u8], i: usize) -> Option<(String, usize)> {
 /// `encodeURIComponent(identifier)` — the exact transform `mdast-util-to-hast`
 /// applies to a footnote identifier before building `fn-…`/`fnref-…` ids and
 /// hrefs (keeps `A-Za-z0-9-_.!~*'()`, percent-encodes the rest as UTF-8).
+#[cfg(feature = "footnotes")]
 pub(crate) fn encode_footnote_id(id: &str) -> String {
     let mut out = String::with_capacity(id.len());
     for &b in id.as_bytes() {
@@ -1340,6 +1364,7 @@ pub(crate) fn encode_footnote_id(id: &str) -> String {
 /// Emit the remark-rehype `<sup>` markup for a footnote reference: the
 /// document-order number (assigned on first sight) and the `-2`/`-3`… `fnref`
 /// suffix per repeat occurrence. Mirrors `mdast-util-to-hast`'s reference handler.
+#[cfg(feature = "footnotes")]
 fn footnote_ref_html(
     id: &str,
     cur: &mut String,
@@ -1737,9 +1762,9 @@ pub fn render_inline(
     // eliminated and the default build streams pure CommonMark.
     let tf = Options::GFM && opts.tagfilter;
     let al = Options::GFM && opts.autolink;
-    let fno = opts.footnotes;
+    let fno = Options::FOOTNOTES && opts.footnotes;
     let emo = Options::EMOJI && opts.emoji;
-    let dir = opts.directives;
+    let dir = Options::DIRECTIVES && opts.directives;
     match (opts.hard_wraps, Options::GFM && opts.strikethrough) {
         (false, false) => render_inline_impl::<false, false>(
             src, out, refmap, scratch, tf, al, fno, emo, dir, opts,
@@ -1816,10 +1841,14 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
     scratch: &mut Scratch,
     tf: bool,
     al: bool,
-    fno: bool,
+    // Without the `footnotes` feature its only consumer (the `[^…]` detection in
+    // the `b'['` arm) is cfg'd out, so the bool is threaded but unread.
+    #[cfg_attr(not(feature = "footnotes"), allow(unused_variables))] fno: bool,
     emo: bool,
     dir: bool,
-    opts: Options,
+    // Without the `directives` feature its only consumer (the inline text-directive
+    // sub-render in the `b':'` arm) is cfg'd out, so it may be threaded but unread.
+    #[cfg_attr(not(feature = "directives"), allow(unused_variables))] opts: Options,
 ) {
     let bytes = src.as_bytes();
     // SPIKE: AST mode captures semantic nodes instead of HTML. `ast_mode` is a
@@ -1856,8 +1885,11 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
     // GFM footnotes: the definition set (read-only) and document-order numbering
     // state (HTML path). Distinct fields from the borrows below, so they coexist;
     // untouched by `reset()` (document-level, like `slugs`).
+    #[cfg(feature = "footnotes")]
     let fn_ids = &scratch.footnote_ids;
+    #[cfg(feature = "footnotes")]
     let fn_order = &mut scratch.footnote_order;
+    #[cfg(feature = "footnotes")]
     let fn_seen = &mut scratch.footnote_seen;
     let list = &mut scratch.list;
     let stack = &mut scratch.stack;
@@ -2081,6 +2113,9 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
             b'[' => {
                 // GFM footnote reference `[^label]` whose lowercased label has a
                 // matching definition; otherwise fall through to a link bracket.
+                // Without the `footnotes` feature this whole detection is cfg'd
+                // out and every `[` falls straight through to the link bracket.
+                #[cfg(feature = "footnotes")]
                 let fnref = if fno {
                     parse_footnote_ref(bytes, i).and_then(|(label, consumed)| {
                         let id = label.to_lowercase();
@@ -2089,7 +2124,8 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                 } else {
                     None
                 };
-                if let Some((id, label, consumed)) = fnref {
+                #[cfg(feature = "footnotes")]
+                let handled = if let Some((id, label, consumed)) = fnref {
                     escape_html(&src[run..i], cur);
                     if ast_mode {
                         flush!(i);
@@ -2106,7 +2142,13 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                     }
                     i += consumed;
                     run = i;
+                    true
                 } else {
+                    false
+                };
+                #[cfg(not(feature = "footnotes"))]
+                let handled = false;
+                if !handled {
                     escape_html(&src[run..i], cur);
                     flush!(i);
                     let node = list.push(Node::Tag("["));
@@ -2229,50 +2271,63 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                     cur.push_str(emoji);
                     i = e;
                     run = i;
-                } else if dir
-                    && !(i > 0 && bytes[i - 1] == b':')
-                    && bytes.get(i + 1) != Some(&b':')
-                    && let Some(h) = crate::directive::parse_header(&bytes[i + 1..])
-                    // A trailing `:` means this is a `:shortcode:`-shaped token, not
-                    // a text directive (matches micromark-extension-directive).
-                    && bytes.get(i + 1 + h.consumed) != Some(&b':')
-                {
-                    let ac = i + 1;
-                    let after = ac + h.consumed;
-                    let name = src[ac + h.name_start..ac + h.name_end].to_owned();
-                    let label = h.label.map(|(ls, le)| (ac + ls, ac + le));
-                    escape_html(&src[run..i], cur);
-                    if ast_mode {
-                        flush!(i);
-                        let si = sem.len() as u32;
-                        sem.push(Sem::TextDirective {
-                            name,
-                            attrs: h.attrs,
-                            label: label.map(|(s, e)| (s as u32, e as u32)),
-                        });
-                        let did = list.push(Node::Sem(si));
-                        cspan!(did, i, after);
-                        seg = cur.len();
-                    } else {
-                        // HTML convention: <name attrs>label</name>; the label is
-                        // inline content (sub-rendered with a scratch of its own).
-                        crate::render::directive_open_tag(&name, &h.attrs, cur);
-                        if let Some((ls, le)) = label {
-                            // The label is inline content; sub-render it with a
-                            // scratch of its own (the live one is mid-parse).
-                            let mut tmp = Scratch::new();
-                            let mut html = String::new();
-                            render_inline(&src[ls..le], &mut html, refmap, &mut tmp, opts);
-                            cur.push_str(&html);
-                        }
-                        cur.push_str("</");
-                        cur.push_str(&name);
-                        cur.push('>');
-                    }
-                    i = after;
-                    run = i;
                 } else {
-                    i += 1;
+                    // remark-directive inline `:name[label]{attrs}`. Without the
+                    // `directives` feature `dir` const-folds to `false` and this
+                    // whole detection is cfg'd out, so every other `:` advances by
+                    // one byte (the pure-CommonMark fast path).
+                    #[cfg(feature = "directives")]
+                    let handled = if dir
+                        && !(i > 0 && bytes[i - 1] == b':')
+                        && bytes.get(i + 1) != Some(&b':')
+                        && let Some(h) = crate::directive::parse_header(&bytes[i + 1..])
+                        // A trailing `:` means this is a `:shortcode:`-shaped token,
+                        // not a text directive (matches micromark-extension-directive).
+                        && bytes.get(i + 1 + h.consumed) != Some(&b':')
+                    {
+                        let ac = i + 1;
+                        let after = ac + h.consumed;
+                        let name = src[ac + h.name_start..ac + h.name_end].to_owned();
+                        let label = h.label.map(|(ls, le)| (ac + ls, ac + le));
+                        escape_html(&src[run..i], cur);
+                        if ast_mode {
+                            flush!(i);
+                            let si = sem.len() as u32;
+                            sem.push(Sem::TextDirective {
+                                name,
+                                attrs: h.attrs,
+                                label: label.map(|(s, e)| (s as u32, e as u32)),
+                            });
+                            let did = list.push(Node::Sem(si));
+                            cspan!(did, i, after);
+                            seg = cur.len();
+                        } else {
+                            // HTML convention: <name attrs>label</name>; the label is
+                            // inline content (sub-rendered with a scratch of its own).
+                            crate::render::directive_open_tag(&name, &h.attrs, cur);
+                            if let Some((ls, le)) = label {
+                                // The label is inline content; sub-render it with a
+                                // scratch of its own (the live one is mid-parse).
+                                let mut tmp = Scratch::new();
+                                let mut html = String::new();
+                                render_inline(&src[ls..le], &mut html, refmap, &mut tmp, opts);
+                                cur.push_str(&html);
+                            }
+                            cur.push_str("</");
+                            cur.push_str(&name);
+                            cur.push('>');
+                        }
+                        i = after;
+                        run = i;
+                        true
+                    } else {
+                        false
+                    };
+                    #[cfg(not(feature = "directives"))]
+                    let handled = false;
+                    if !handled {
+                        i += 1;
+                    }
                 }
             }
             // Skip plain text to the next significant byte in one SIMD pass —
@@ -2529,11 +2584,11 @@ fn ast_image_alt(list: &List, op_node: usize, rb_node: usize, cur: &str, sem: &[
                 Sem::Code(v) => s.push_str(v),
                 Sem::Autolink { text, .. } => s.push_str(text),
                 Sem::Html(h) => s.push_str(h),
-                Sem::LinkOpen { .. }
-                | Sem::LinkRef { .. }
-                | Sem::Break
-                | Sem::FootnoteRef { .. }
-                | Sem::TextDirective { .. } => {}
+                #[cfg(feature = "footnotes")]
+                Sem::FootnoteRef { .. } => {}
+                #[cfg(feature = "directives")]
+                Sem::TextDirective { .. } => {}
+                Sem::LinkOpen { .. } | Sem::LinkRef { .. } | Sem::Break => {}
             },
             Node::LinkClose => {}
         }

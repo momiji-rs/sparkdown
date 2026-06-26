@@ -93,7 +93,7 @@ mod diagram {
     }
 }
 
-#[cfg(feature = "ast")]
+#[cfg(all(feature = "ast", feature = "frontmatter"))]
 mod frontmatter {
     use sparkdown::Options;
     use sparkdown::ast::to_mdast_json_opts;
@@ -140,6 +140,7 @@ mod frontmatter {
     }
 }
 
+#[cfg(feature = "deflist")]
 mod definition_lists {
     use sparkdown::{Options, to_html_with};
 
@@ -223,7 +224,7 @@ mod definition_lists {
     }
 }
 
-#[cfg(feature = "ast")]
+#[cfg(all(feature = "ast", feature = "deflist"))]
 mod definition_lists_mdast {
     use sparkdown::Options;
     use sparkdown::ast::to_mdast_json_opts;
@@ -263,6 +264,7 @@ mod definition_lists_mdast {
     }
 }
 
+#[cfg(feature = "directives")]
 mod directives {
     use sparkdown::{Options, to_html_with};
 
@@ -325,7 +327,7 @@ mod directives {
     }
 }
 
-#[cfg(feature = "ast")]
+#[cfg(all(feature = "ast", feature = "directives"))]
 mod directives_mdast {
     use sparkdown::Options;
     use sparkdown::ast::to_mdast_json_opts;
@@ -374,7 +376,7 @@ mod directives_mdast {
     }
 }
 
-#[cfg(feature = "ast")]
+#[cfg(all(feature = "ast", feature = "footnotes"))]
 mod footnotes {
     use sparkdown::Options;
     use sparkdown::ast::to_mdast_json_opts;

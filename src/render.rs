@@ -5,7 +5,9 @@
 //! exact whitespace, including tight-vs-loose list items.
 
 use crate::block::{Kind, Tree};
-use crate::inline::{Scratch, encode_footnote_id, render_inline};
+#[cfg(feature = "footnotes")]
+use crate::inline::encode_footnote_id;
+use crate::inline::{Scratch, render_inline};
 use crate::options::Options;
 use crate::scan::{escape_block_mask, memchr1};
 #[cfg(feature = "gfm")]
@@ -31,6 +33,7 @@ pub(crate) fn render_with(tree: &Tree, out: &mut String, scratch: &mut Scratch) 
     }
     // Per-document footnote state: seed the reference set (so `[^x]` resolves) and
     // reset the numbering accumulated while rendering references.
+    #[cfg(feature = "footnotes")]
     if tree.opts.footnotes {
         scratch.footnote_ids.clone_from(&tree.footnote_ids);
         scratch.footnote_order.clear();
@@ -39,10 +42,12 @@ pub(crate) fn render_with(tree: &Tree, out: &mut String, scratch: &mut Scratch) 
     children(tree, tree.root, out, scratch);
     // The footnotes <section> (referenced definitions, in reference order) follows
     // the document body — matching mdast-util-to-hast's footer.
+    #[cfg(feature = "footnotes")]
     if tree.opts.footnotes && !scratch.footnote_order.is_empty() {
         render_footnote_section(tree, out, scratch);
     }
     // External-link transform: a single post-render pass over the finished HTML.
+    #[cfg(feature = "external_links")]
     if tree.opts.external_links {
         decorate_external_links(out);
     }
@@ -55,6 +60,7 @@ pub(crate) fn render_with(tree: &Tree, out: &mut String, scratch: &mut Scratch) 
 /// rehype transform also decorates). `rel` is inserted before the tag's `>`, after
 /// any `href`/`title` (matching hast property order); the scan is quote-aware so a
 /// `>` inside an attribute value is not mistaken for the tag end.
+#[cfg(feature = "external_links")]
 fn decorate_external_links(out: &mut String) {
     const PAT: &str = "<a href=\"";
     if !out.contains(PAT) {
@@ -96,6 +102,7 @@ fn decorate_external_links(out: &mut String) {
 /// list of the referenced definitions (in first-reference order), each with one
 /// backref per reference appended to its last paragraph (or as a bare anchor when
 /// the last block is not a paragraph).
+#[cfg(feature = "footnotes")]
 fn render_footnote_section(tree: &Tree, out: &mut String, scratch: &mut Scratch) {
     // Map each referenced identifier to its first definition node (first wins).
     let order: Vec<String> = scratch.footnote_order.clone();
@@ -120,6 +127,7 @@ fn render_footnote_section(tree: &Tree, out: &mut String, scratch: &mut Scratch)
     out.push_str("</ol>\n</section>");
 }
 
+#[cfg(feature = "footnotes")]
 /// The first `FootnoteDef` node whose identifier matches (definitions are matched
 /// first-wins, like link reference definitions).
 fn first_footnote_def(tree: &Tree, id: &str) -> Option<usize> {
@@ -129,6 +137,7 @@ fn first_footnote_def(tree: &Tree, id: &str) -> Option<usize> {
 
 /// Append `↩` backref anchor(s) for footnote `num` (one per reference, `1..=count`).
 /// `nl` adds a trailing newline after each (used in the bare, non-paragraph case).
+#[cfg(feature = "footnotes")]
 fn footnote_backrefs(out: &mut String, enc: &str, num: usize, count: u32, nl: bool) {
     for k in 1..=count {
         out.push_str("<a href=\"#user-content-fnref-");
@@ -158,6 +167,7 @@ fn footnote_backrefs(out: &mut String, enc: &str, num: usize, count: u32, nl: bo
     }
 }
 
+#[cfg(feature = "footnotes")]
 /// Render a footnote definition's blocks into the `<li>`, injecting backrefs into
 /// the last paragraph (or appending them as bare anchors after a non-paragraph
 /// last block).
@@ -268,6 +278,7 @@ fn cr(out: &mut String) {
 /// convention: the name is the element, attributes become HTML attributes). The
 /// name is emitted verbatim; attribute values are HTML-escaped. Shared with the
 /// inline text-directive renderer.
+#[cfg(feature = "directives")]
 pub(crate) fn directive_open_tag(name: &str, attrs: &[(String, String)], out: &mut String) {
     out.push('<');
     out.push_str(name);
@@ -392,16 +403,24 @@ fn render_node(tree: &Tree, idx: usize, out: &mut String, scratch: &mut Scratch)
         Kind::Frontmatter => {}
         // A footnote definition emits nothing where it sits; referenced ones are
         // collected and rendered as the footnotes <section> after the document.
+        // Arm stays compiled (keeps the hot match stable; no node exists without
+        // the feature anyway).
         Kind::FootnoteDef => {}
+        // Deflist arms stay compiled (keep the hot render match stable); without
+        // the `deflist` feature no such node exists, so the bodies are gated out.
         Kind::DefList => {
-            cr(out);
-            out.push_str("<dl>\n");
-            children(tree, idx, out, scratch);
-            out.push_str("</dl>");
-            cr(out);
+            #[cfg(feature = "deflist")]
+            {
+                cr(out);
+                out.push_str("<dl>\n");
+                children(tree, idx, out, scratch);
+                out.push_str("</dl>");
+                cr(out);
+            }
         }
         Kind::DefTerm => {
             // Each source line of the term holder renders as its own <dt>.
+            #[cfg(feature = "deflist")]
             for line in tree.content(idx).split('\n') {
                 let line = line.trim_matches([' ', '\t', '\r']);
                 if line.is_empty() {
@@ -412,49 +431,60 @@ fn render_node(tree: &Tree, idx: usize, out: &mut String, scratch: &mut Scratch)
                 out.push_str("</dt>\n");
             }
         }
+        // Directive arms stay compiled (keep the hot render match stable); without
+        // the `directives` feature no such node exists, so the bodies are gated out.
         Kind::LeafDirective => {
             // Convention: the directive name is the element; the `[label]` is its
             // inline content. (HTML is not the gate-able output; mdast is.)
-            let d = tree.directive(idx);
-            cr(out);
-            directive_open_tag(&d.name, &d.attrs, out);
-            if let Some((s, e)) = d.label {
-                render_inline(
-                    tree.source_range(s, e),
-                    out,
-                    &tree.refmap,
-                    scratch,
-                    tree.opts,
-                );
+            #[cfg(feature = "directives")]
+            {
+                let d = tree.directive(idx);
+                cr(out);
+                directive_open_tag(&d.name, &d.attrs, out);
+                if let Some((s, e)) = d.label {
+                    render_inline(
+                        tree.source_range(s, e),
+                        out,
+                        &tree.refmap,
+                        scratch,
+                        tree.opts,
+                    );
+                }
+                out.push_str("</");
+                out.push_str(&d.name);
+                out.push('>');
+                cr(out);
             }
-            out.push_str("</");
-            out.push_str(&d.name);
-            out.push('>');
-            cr(out);
         }
         Kind::ContainerDirective => {
-            let d = tree.directive(idx);
-            cr(out);
-            directive_open_tag(&d.name, &d.attrs, out);
-            cr(out);
-            children(tree, idx, out, scratch);
-            cr(out);
-            out.push_str("</");
-            out.push_str(&d.name);
-            out.push('>');
-            cr(out);
+            #[cfg(feature = "directives")]
+            {
+                let d = tree.directive(idx);
+                cr(out);
+                directive_open_tag(&d.name, &d.attrs, out);
+                cr(out);
+                children(tree, idx, out, scratch);
+                cr(out);
+                out.push_str("</");
+                out.push_str(&d.name);
+                out.push('>');
+                cr(out);
+            }
         }
         Kind::DefDesc => {
-            let body = tree.content(idx).trim_matches([' ', '\t', '\n', '\r']);
-            if node.level == 1 {
-                // Loose: a blank line preceded the marker, so wrap the body in <p>.
-                out.push_str("<dd>\n<p>");
-                render_inline(body, out, &tree.refmap, scratch, tree.opts);
-                out.push_str("</p>\n</dd>\n");
-            } else {
-                out.push_str("<dd>");
-                render_inline(body, out, &tree.refmap, scratch, tree.opts);
-                out.push_str("\n</dd>\n");
+            #[cfg(feature = "deflist")]
+            {
+                let body = tree.content(idx).trim_matches([' ', '\t', '\n', '\r']);
+                if node.level == 1 {
+                    // Loose: a blank line preceded the marker, so wrap the body in <p>.
+                    out.push_str("<dd>\n<p>");
+                    render_inline(body, out, &tree.refmap, scratch, tree.opts);
+                    out.push_str("</p>\n</dd>\n");
+                } else {
+                    out.push_str("<dd>");
+                    render_inline(body, out, &tree.refmap, scratch, tree.opts);
+                    out.push_str("\n</dd>\n");
+                }
             }
         }
         Kind::BlockQuote => {

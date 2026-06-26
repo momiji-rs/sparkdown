@@ -90,6 +90,40 @@ impl Options {
     #[cfg(not(feature = "emoji"))]
     pub(crate) const EMOJI: bool = false;
 
+    /// `true` iff the `footnotes` Cargo feature is compiled in. Used as
+    /// `Options::FOOTNOTES && opts.footnotes` so that, without the feature, every
+    /// footnote check folds to `false` and its code is eliminated — the default
+    /// build is byte-for-byte the pure-CommonMark fast path.
+    #[cfg(feature = "footnotes")]
+    pub(crate) const FOOTNOTES: bool = true;
+    #[cfg(not(feature = "footnotes"))]
+    pub(crate) const FOOTNOTES: bool = false;
+
+    /// `true` iff the `deflist` Cargo feature is compiled in. Used as
+    /// `Options::DEFLIST && opts.deflist` so that, without the feature, every
+    /// definition-list check folds to `false` and its code is eliminated — the
+    /// default build is byte-for-byte the pure-CommonMark fast path.
+    #[cfg(feature = "deflist")]
+    pub(crate) const DEFLIST: bool = true;
+    #[cfg(not(feature = "deflist"))]
+    pub(crate) const DEFLIST: bool = false;
+
+    /// `true` iff the `directives` Cargo feature is compiled in. Used as
+    /// `Options::DIRECTIVES && opts.directives` so that, without the feature, every
+    /// directive check folds to `false` and its code is eliminated — the default
+    /// build is byte-for-byte the pure-CommonMark fast path.
+    #[cfg(feature = "directives")]
+    pub(crate) const DIRECTIVES: bool = true;
+    #[cfg(not(feature = "directives"))]
+    pub(crate) const DIRECTIVES: bool = false;
+
+    // `frontmatter` and `external_links` need no such const: their only runtime
+    // check lives inside their own `#[cfg(feature = …)]` block (a document
+    // pre-pass / a post-render pass), so there is no always-compiled site for the
+    // const to fold. A `FEATURE` const exists only for extensions whose check sits
+    // on the always-compiled hot path (the four above + GFM/EMOJI), where
+    // `Options::FEATURE && opts.flag` folds the disabled check to nothing.
+
     /// GitHub Flavored Markdown: every GFM extension enabled. (Effective only
     /// when the crate is built with the `gfm` feature.)
     pub const fn gfm() -> Self {
