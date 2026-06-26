@@ -166,11 +166,11 @@ Within any bundle, `toHtml(md, { footnotes: false, tables: true, … })` switche
 extensions **per call** — no rebuild, the flags fold to no-ops for whatever the
 bundle didn't compile.
 
-> **Status:** every extension is now feature-gated and **measured moat-neutral** —
+> **Status:** every extension is feature-gated and **measured moat-neutral** —
 > the lean `pure` build drops ~43 KB of extension code versus an all-in build, and
-> the default-path instruction count is unchanged (a few are *faster*). The crate's
-> `gfm` and `full` umbrella features ship today (`features = ["full"]`); on npm,
-> `@momiji-rs/sparkdown` and `…/gfm` are published and `…/full` is being wired.
+> the default-path instruction count is unchanged (a few are *faster*). All three
+> bundles ship: the crate's `gfm`/`full` umbrella features and the npm `.` / `/gfm`
+> / `/full` subpaths.
 
 ## WebAssembly
 

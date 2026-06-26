@@ -44,6 +44,30 @@ for (const post of posts) post.html = toHtmlSync(post.markdown); // sync, hot lo
 
 `toHtml` is also the default export. TypeScript types are bundled.
 
+## Extensions — the `/gfm` and `/full` subpaths
+
+The package root is pure CommonMark (smallest wasm). Two subpaths add extensions
+— same engine, a larger wasm, and a `toHtml(md, options)` that toggles each one
+per call:
+
+```js
+import { toHtml } from "@momiji-rs/sparkdown/gfm";  // + GitHub Flavored Markdown
+await toHtml("~~done~~ and www.example.com");
+await toHtml(md, { tables: false }); // toggle a flag
+
+import { toHtml } from "@momiji-rs/sparkdown/full"; // + every extension
+await toHtml(":::note\n`:tada:` ~~x~~\n:::");       // directives, emoji, … on by default
+```
+
+| subpath | adds | wasm |
+| --- | --- | --- |
+| `@momiji-rs/sparkdown` | — (CommonMark) | ~182 KB |
+| `@momiji-rs/sparkdown/gfm` | strikethrough, tasklists, autolinks, tag filter, tables, footnotes | ~239 KB |
+| `@momiji-rs/sparkdown/full` | + frontmatter, emoji, definition lists, directives, diagrams, external-link `rel`, heading ids | ~319 KB |
+
+A bundler ships only the subpath you import. All three expose the same
+`toHtml` / `toHtmlSync` / `initSync` / `ready` / `init` surface.
+
 ## How it's built
 
 The package wraps a `wasm32-unknown-unknown` build of the

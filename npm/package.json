@@ -1,7 +1,7 @@
 {
   "name": "@momiji-rs/sparkdown",
   "version": "0.0.4",
-  "description": "Fast, standards-first CommonMark → HTML (100% CommonMark 0.31.2), as WASI-free WebAssembly — zero dependencies, runs in Node/browsers/bundlers/Deno/edge. Optional GitHub Flavored Markdown via the `@momiji-rs/sparkdown/gfm` subpath.",
+  "description": "Fast, standards-first CommonMark → HTML (100% CommonMark 0.31.2), as WASI-free WebAssembly — zero dependencies, runs in Node/browsers/bundlers/Deno/edge. GitHub Flavored Markdown via the `/gfm` subpath; every extension via `/full`.",
   "type": "module",
   "main": "./sparkdown.mjs",
   "module": "./sparkdown.mjs",
@@ -14,9 +14,13 @@
     "./gfm": {
       "types": "./gfm.d.ts",
       "default": "./gfm.mjs"
+    },
+    "./full": {
+      "types": "./full.d.ts",
+      "default": "./full.mjs"
     }
   },
-  "files": ["sparkdown.mjs", "wasm-inline.mjs", "index.d.ts", "gfm.mjs", "gfm-wasm-inline.mjs", "gfm.d.ts", "README.md"],
+  "files": ["sparkdown.mjs", "wasm-inline.mjs", "index.d.ts", "gfm.mjs", "gfm-wasm-inline.mjs", "gfm.d.ts", "full.mjs", "full-wasm-inline.mjs", "full.d.ts", "README.md"],
   "sideEffects": false,
   "scripts": {
     "build": "node build.mjs",
