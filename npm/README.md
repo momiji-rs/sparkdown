@@ -1,11 +1,15 @@
 # @momiji-rs/sparkdown
 
-Fast, standards-first **CommonMark → HTML**, compiled to **WASI-free WebAssembly**.
+Fast, standards-first **CommonMark → HTML** — and the fastest drop-in
+**`remark-parse`** — compiled to **WASI-free WebAssembly**.
 
 - ✅ **100% CommonMark 0.31.2** — all 652 official examples pass *through the wasm*.
 - 🚀 **~0.9 ms** to render the 200 KB CommonMark spec — ~5× faster than
   markdown-it/marked, and faster than rushdown's *native* build; the native
   crate does it in ~0.59 ms.
+- 🌳 **Fastest `remark-parse`.** The [`/mdast`](#mdast--the-fastest-remark-parse)
+  subpath emits a unist/mdast tree that **deep-equals `mdast-util-from-markdown`**
+  on all 652 examples — ~80× faster, drop-in for unified / remark / rehype.
 - 🪶 **Zero dependencies, self-contained.** The wasm is base64-inlined, so it
   works in Node, browsers, bundlers, Deno, Bun, and edge runtimes (Cloudflare
   Workers, Fastly, Vercel) with no `fetch`, `fs`, WASI, or asset configuration.
@@ -64,9 +68,45 @@ await toHtml(":::note\n`:tada:` ~~x~~\n:::");       // directives, emoji, … on
 | `@momiji-rs/sparkdown` | — (CommonMark) | ~182 KB |
 | `@momiji-rs/sparkdown/gfm` | strikethrough, tasklists, autolinks, tag filter, tables, footnotes | ~239 KB |
 | `@momiji-rs/sparkdown/full` | + frontmatter, emoji, definition lists, directives, diagrams, external-link `rel`, heading ids | ~319 KB |
+| `@momiji-rs/sparkdown/mdast` | markdown → mdast tree + a unified `remark-parse` plugin (see below) | ~440 KB |
 
-A bundler ships only the subpath you import. All three expose the same
-`toHtml` / `toHtmlSync` / `initSync` / `ready` / `init` surface.
+A bundler ships only the subpath you import. The `.` / `/gfm` / `/full` entries
+share the same `toHtml` / `toHtmlSync` / `initSync` / `ready` / `init` surface;
+`/mdast` adds `toMdast` and a unified parser plugin.
+
+## mdast — the fastest `remark-parse`
+
+`@momiji-rs/sparkdown/mdast` emits a full **mdast (unist)** tree — the exact shape
+`remark-parse` produces — as a drop-in, **~80× faster** parser for the unified /
+remark / rehype ecosystem:
+
+```js
+import { unified } from "unified";
+import sparkdownParse from "@momiji-rs/sparkdown/mdast"; // drop-in remark-parse
+import remarkRehype from "remark-rehype";
+import rehypeStringify from "rehype-stringify";
+
+await sparkdownParse.ready; // browsers only; Node/Bun/Deno/edge need no await
+const html = String(unified()
+  .use(sparkdownParse)
+  .use(remarkRehype)
+  .use(rehypeStringify)
+  .processSync(markdown));
+```
+
+Or call it directly — `toMdast(md, options)` → tree, `toHtml(md, options)` → HTML
+(an in-wasm `mdast → html` render, byte-identical to `mdast-util-to-hast` +
+`hast-util-to-html`). The tree is **plain unist objects** (not opaque handles), so
+every remark plugin works unmodified; it **deep-equals `mdast-util-from-markdown`
+on all 652** CommonMark examples *including* `position`. Pass `{ position: false }`
+for ~2× faster parsing when your plugins don't read source positions.
+
+| export | signature |
+| --- | --- |
+| `sparkdownParse` (default) | unified parser plugin — `unified().use(sparkdownParse)` |
+| `toMdast` / `toMdastSync` | `(markdown, options?) => mdast tree` |
+| `toHtml` / `toHtmlSync` | `(markdown, options?) => string` (in-wasm mdast→html) |
+| `initSync` / `init` / `ready` | instantiation (as in the other entries) |
 
 ## How it's built
 

@@ -22,6 +22,11 @@ with a default build tuned to be the fastest CommonMark parser we know of and
 the default build doesn't even compile. The speed is a means — a clean, embeddable
 engine — not a scoreboard.
 
+It ships three ways: a **native crate**, a **WASI-free WebAssembly** module (Node /
+browsers / Deno / edge, zero-config), and — via an opt-in
+[mdast](#mdast--the-unified-ecosystem) tree — the **fastest drop-in `remark-parse`**
+for the unified / remark / rehype ecosystem.
+
 ## Status — ✅ 100% CommonMark 0.31.2
 
 Passes all **652/652** examples of the official conformance suite.
@@ -155,11 +160,12 @@ feature set; a Rust dependent can also pick any subset directly
 | definition lists                                            | `deflist`        |        |       |   ✅   |
 | directives (`:::`)                                          | `directives`     |        |       |   ✅   |
 
-| bundle   | crate features | npm package                    | contents                |
-| -------- | -------------- | ------------------------------ | ----------------------- |
-| **pure** | *(none)*       | `@momiji-rs/sparkdown`         | CommonMark only, smallest |
-| **gfm**  | `gfm`          | `@momiji-rs/sparkdown/gfm`     | + GitHub Flavored Markdown |
-| **full** | `full`         | `@momiji-rs/sparkdown/full`    | + every extension       |
+| bundle    | crate features | npm package                    | contents                |
+| --------- | -------------- | ------------------------------ | ----------------------- |
+| **pure**  | *(none)*       | `@momiji-rs/sparkdown`         | CommonMark only, smallest |
+| **gfm**   | `gfm`          | `@momiji-rs/sparkdown/gfm`     | + GitHub Flavored Markdown |
+| **full**  | `full`         | `@momiji-rs/sparkdown/full`    | + every extension       |
+| **mdast** | `ast,full`     | `@momiji-rs/sparkdown/mdast`   | markdown → [mdast](#mdast--the-unified-ecosystem) tree + a unified `remark-parse` plugin |
 
 `gfm = ["footnotes"]` and `full = ["gfm", "extras"]` are umbrella features.
 Within any bundle, `toHtml(md, { footnotes: false, tables: true, … })` switches
@@ -178,13 +184,14 @@ A **WASI-free** WebAssembly build runs in Node, browsers, bundlers, Deno, Bun,
 and edge runtimes with no `fetch`/`fs`/WASI setup. It ships two ways:
 
 - **npm** — [`@momiji-rs/sparkdown`](https://www.npmjs.com/package/@momiji-rs/sparkdown):
-  pure CommonMark from the package root, GFM from the `@momiji-rs/sparkdown/gfm`
-  subpath (one package, two entries; a bundler only ships the variant you
+  pure CommonMark from the package root, plus the `/gfm`, `/full`, and `/mdast`
+  subpaths (one package, four entries; a bundler only ships the variant you
   import). Zero dependencies, self-contained (the wasm is base64-inlined). Also on
   jsDelivr/unpkg for free.
-- **GitHub Releases** — the raw `sparkdown.wasm` / `sparkdown-gfm.wasm` modules
-  (with SHA-256 sums) are attached to each tagged release, for non-JS hosts
-  (wasmtime, wazero, Workers, Python, …) that want the bare module.
+- **GitHub Releases** — the raw `sparkdown.wasm` / `sparkdown-gfm.wasm` /
+  `sparkdown-full.wasm` / `sparkdown-mdast.wasm` modules (with SHA-256 sums) are
+  attached to each tagged release, for non-JS hosts (wasmtime, wazero, Workers,
+  Python, …) that want the bare module.
 
 Against the popular JS markdown libraries, in Node on the same 198 KB document,
 sparkdown's **wasm** still wins comfortably:
@@ -234,55 +241,60 @@ RUSTFLAGS="-C target-feature=+simd128,+bulk-memory" \
   cargo build --release --features wasm --target wasm32-unknown-unknown
 ```
 
-## mdast & the unified ecosystem (experimental)
+## mdast & the unified ecosystem
 
-Behind the opt-in `ast` Cargo feature, sparkdown can emit a full **[mdast](https://github.com/syntax-tree/mdast)**
-syntax tree — the exact shape `remark-parse` produces — so it drops into the
-unified / remark / rehype ecosystem as a parser:
+Beyond HTML, sparkdown emits a full **[mdast](https://github.com/syntax-tree/mdast)**
+syntax tree — the exact shape `remark-parse` produces — so it's a **drop-in,
+~80× faster `remark-parse`** for the unified / remark / rehype ecosystem, shipped
+as the **`@momiji-rs/sparkdown/mdast`** subpath:
 
 ```js
-const html = String(await unified()
-  .use(sparkdown)        // parse markdown → mdast IN WASM
-  .use(remarkToc)        // ↓ any existing remark/rehype plugin, unmodified
-  .use(remarkRehype)
+import { unified } from "unified";
+import sparkdownParse from "@momiji-rs/sparkdown/mdast"; // drop-in remark-parse
+import remarkRehype from "remark-rehype";
+import rehypeStringify from "rehype-stringify";
+
+const html = String(unified()
+  .use(sparkdownParse)        // parse markdown → mdast IN WASM
+  .use(remarkRehype)          // ↓ any existing remark/rehype plugin, unmodified
   .use(rehypeStringify)
-  .process(markdown))
+  .processSync(markdown));
 ```
 
+Or call it directly — `toMdast(md, options)` → tree, and `toHtml(md, options)` → HTML
+through an in-wasm `mdast → html` render (byte-identical to `mdast-util-to-hast` +
+`hast-util-to-html`), so the unified pipeline's front *and* back can run in wasm.
+
 It emits **plain unist objects**, not opaque handles, so every existing remark
-plugin works without rewriting. Verified against the reference: sparkdown's tree
-**deep-equals `mdast-util-from-markdown` on all 652** CommonMark examples —
-*including* `position` (line/column/offset) — and a unified pipeline with real
-plugins (remark-toc, remark-emoji, rehype-slug, remark-lint) produces HTML
-**identical to the same pipeline on `remark-parse` for all 652** (compared after
-normalizing the single trailing-newline difference between cmark and rehype).
+plugin works unmodified. Verified against the reference: sparkdown's tree
+**deep-equals `mdast-util-from-markdown` on all 652** CommonMark examples
+*including* `position` (line/column/offset), and a real unified pipeline produces
+HTML **identical to `remark-parse` on all 652**.
 
-The tree crosses the wasm→JS boundary as a compact **binary wire format** read
-straight out of linear memory into plain objects — no JSON serialize, no
-`JSON.parse`. On a fully-materialized mdast tree (the whole tree walked, so no
-lazy backend is skipping work) it's the fastest markdown→mdast path we've
-measured — ahead of [Sätteri](https://github.com/bruits/satteri) (the native
-Rust+JS competitor) and an order of magnitude past pure-JS remark:
+The tree crosses the wasm→JS boundary as a compact **string-pooled binary wire
+format**, read straight out of linear memory into plain objects — no JSON, no
+`JSON.parse`. The result: sparkdown **fully materializes** the entire plain-object
+tree faster than [Sätteri](https://github.com/bruits/satteri) returns a *lazy*
+handle that builds nothing, and ~80× past pure-JS remark:
 
-| engine                              |     time | relative |
-| ----------------------------------- | -------: | -------: |
-| **sparkdown — mdast (wire)**        | **~2.8 ms** |  1.00×  |
-| Sätteri (Rust core, napi native)    |  ~4.0 ms |   ~1.4×  |
-| sparkdown — mdast (JSON boundary)   |  ~7.5 ms |   ~2.7×  |
-| remark (`mdast-util-from-markdown`) | ~73 ms |    ~26×  |
+| engine | time | relative |
+| ------ | ---: | -------: |
+| **sparkdown — `toMdast({ position: false })`**     | **~0.9 ms** | 1.00× |
+| Sätteri (Rust core, napi native — lazy handle)     | ~1.4 ms | ~1.5× |
+| sparkdown — `toMdast()` (incl. `position`)         | ~1.9 ms | ~2.1× |
+| remark (`mdast-util-from-markdown`)                | ~73 ms  | ~80× |
 
 <sub>CommonMark spec (198 KB), best-of-15, fully materialized, Apple Mac Studio,
 measured in Node. Ratios are the portable part; absolute times are
-machine-specific. Sätteri's native binding varies run-to-run (~3.9–4.3 ms); the
-lead is ~1.4–1.5×. Sätteri keeps the tree in a Rust arena behind a handle (fast
+machine-specific. Sätteri keeps the tree in a Rust arena behind a handle (fast
 when you *never* read it); sparkdown materializes plain objects every time, yet
-still wins once the tree is actually traversed — and stays drop-in for any remark
-plugin and any wasm host.</sub>
+still wins once the tree is traversed — and stays drop-in for any remark plugin
+and any wasm host. The default keeps unist `position` for a faithful
+`remark-parse`; pass `{ position: false }` to skip it for ~2× faster parsing when
+plugins don't need source positions.</sub>
 
-This path is **experimental** — behind the `ast` feature and not yet exposed in
-the npm package. The harness under `harness/` builds it and runs the
-compatibility gates and benchmarks (`cargo build --release --features wasm,ast
---target wasm32-unknown-unknown`, then `npm run gate` / `npm run e2e`).
+Under the hood it's the opt-in `ast` Cargo feature (`to_mdast` / `to_mdast_wire`).
+The harness under `harness/` runs the compatibility gates and benchmarks.
 
 ## What was reused from rostdown (and what wasn't)
 

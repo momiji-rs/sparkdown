@@ -1,7 +1,7 @@
 [package]
 name = "sparkdown"
 description = "Fast, zero-dependency CommonMark 0.31.2 parser (100% conformant, byte-identical to cmark) with opt-in GFM + extensions (footnotes, emoji, definition lists, directives, frontmatter, …) and an mdast/unist output — all behind moat-neutral Cargo features."
-version = "0.0.5"
+version = "0.0.6"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
