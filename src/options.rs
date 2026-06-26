@@ -117,23 +117,12 @@ impl Options {
     #[cfg(not(feature = "directives"))]
     pub(crate) const DIRECTIVES: bool = false;
 
-    /// `true` iff the `frontmatter` Cargo feature is compiled in. Used as
-    /// `Options::FRONTMATTER && opts.frontmatter` so that, without the feature, the
-    /// frontmatter check folds to `false` and its code is eliminated — the default
-    /// build is byte-for-byte the pure-CommonMark fast path.
-    #[cfg(feature = "frontmatter")]
-    pub(crate) const FRONTMATTER: bool = true;
-    #[cfg(not(feature = "frontmatter"))]
-    pub(crate) const FRONTMATTER: bool = false;
-
-    /// `true` iff the `external_links` Cargo feature is compiled in. Used as
-    /// `Options::EXTERNAL_LINKS && opts.external_links` so that, without the
-    /// feature, the post-render `rel` pass folds away — the default build is
-    /// byte-for-byte the pure-CommonMark fast path.
-    #[cfg(feature = "external_links")]
-    pub(crate) const EXTERNAL_LINKS: bool = true;
-    #[cfg(not(feature = "external_links"))]
-    pub(crate) const EXTERNAL_LINKS: bool = false;
+    // `frontmatter` and `external_links` need no such const: their only runtime
+    // check lives inside their own `#[cfg(feature = …)]` block (a document
+    // pre-pass / a post-render pass), so there is no always-compiled site for the
+    // const to fold. A `FEATURE` const exists only for extensions whose check sits
+    // on the always-compiled hot path (the four above + GFM/EMOJI), where
+    // `Options::FEATURE && opts.flag` folds the disabled check to nothing.
 
     /// GitHub Flavored Markdown: every GFM extension enabled. (Effective only
     /// when the crate is built with the `gfm` feature.)

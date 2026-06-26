@@ -34,7 +34,7 @@ pub(crate) fn render_with(tree: &Tree, out: &mut String, scratch: &mut Scratch) 
     // Per-document footnote state: seed the reference set (so `[^x]` resolves) and
     // reset the numbering accumulated while rendering references.
     #[cfg(feature = "footnotes")]
-    if Options::FOOTNOTES && tree.opts.footnotes {
+    if tree.opts.footnotes {
         scratch.footnote_ids.clone_from(&tree.footnote_ids);
         scratch.footnote_order.clear();
         scratch.footnote_seen.clear();
@@ -43,12 +43,12 @@ pub(crate) fn render_with(tree: &Tree, out: &mut String, scratch: &mut Scratch) 
     // The footnotes <section> (referenced definitions, in reference order) follows
     // the document body — matching mdast-util-to-hast's footer.
     #[cfg(feature = "footnotes")]
-    if Options::FOOTNOTES && tree.opts.footnotes && !scratch.footnote_order.is_empty() {
+    if tree.opts.footnotes && !scratch.footnote_order.is_empty() {
         render_footnote_section(tree, out, scratch);
     }
     // External-link transform: a single post-render pass over the finished HTML.
     #[cfg(feature = "external_links")]
-    if Options::EXTERNAL_LINKS && tree.opts.external_links {
+    if tree.opts.external_links {
         decorate_external_links(out);
     }
 }

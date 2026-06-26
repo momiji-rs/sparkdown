@@ -1163,8 +1163,7 @@ impl<'a> Parser<'a> {
         // normally (and `---` only becomes a thematic break when there is no
         // matching close).
         #[cfg(feature = "frontmatter")]
-        if Options::FRONTMATTER
-            && self.opts.frontmatter
+        if self.opts.frontmatter
             && let Some(resume) = self.try_frontmatter(bytes)
         {
             start = resume;
