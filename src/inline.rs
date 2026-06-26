@@ -74,6 +74,60 @@ fn push_str_escaped(out: &mut String, s: &str) {
     }
 }
 
+// SPIKE (`ast`): text-span emitters for the wire/AST path. In `raw` mode the
+// inline tokenizer writes the *un-escaped* text into the span buffer `cur`, so
+// the wire reader (`emit_inline`/`list_to_tokens`/`ast_image_alt`) can borrow it
+// directly with no HTML un-escape round-trip. In HTML mode (`raw == false`)
+// these are byte-for-byte the original escaping helpers, so HTML output is
+// unchanged. Each is the exact inverse of the former HTML un-escape, so the raw
+// bytes written equal what that un-escape used to recover.
+
+/// Text run: HTML-escape (`raw == false`) or write verbatim (`raw == true`).
+#[inline]
+fn emit_text(raw: bool, s: &str, out: &mut String) {
+    if raw {
+        out.push_str(s);
+    } else {
+        escape_html(s, out);
+    }
+}
+
+/// Backslash-escaped ASCII byte: escape the text specials, or push it verbatim.
+#[inline]
+fn emit_escaped_byte(raw: bool, out: &mut String, b: u8) {
+    if raw {
+        out.push(b as char);
+    } else {
+        push_escaped_byte(out, b);
+    }
+}
+
+/// Resolved code point: escape the text specials, or push it verbatim (keeping
+/// the same U+FFFD remapping for U+0000/surrogates/out-of-range).
+#[inline]
+fn emit_char_escaped(raw: bool, out: &mut String, cp: u32) {
+    if raw {
+        let ch = if cp == 0 {
+            '\u{FFFD}'
+        } else {
+            char::from_u32(cp).unwrap_or('\u{FFFD}')
+        };
+        out.push(ch);
+    } else {
+        push_char_escaped(out, cp);
+    }
+}
+
+/// Resolved entity expansion text: escape the text specials, or push verbatim.
+#[inline]
+fn emit_str_escaped(raw: bool, out: &mut String, s: &str) {
+    if raw {
+        out.push_str(s);
+    } else {
+        push_str_escaped(out, s);
+    }
+}
+
 /// Try to parse an entity or numeric character reference at `bytes[i]` (`&`).
 /// Returns `(resolved value, bytes consumed including the `&` and `;`)`.
 fn parse_entity(bytes: &[u8], i: usize) -> Option<(Resolved, usize)> {
@@ -744,43 +798,6 @@ pub struct SpanTok {
     pub end: u32,
 }
 
-/// SPIKE: reverse [`escape_html`] (`&amp;`/`&lt;`/`&gt;`/`&quot;` only) to recover
-/// an mdast `text` value from a rendered span. escape_html escapes exactly these
-/// four, after entity/backslash resolution — so this is exact, not heuristic.
-/// Returns a borrow when the span needs no unescaping (the overwhelming common
-/// case), so the sink path can stream it to the wire with zero allocation.
-/// Unconditional (dead without `ast`) so AST branches compile in every build.
-#[allow(dead_code)]
-fn unescape_html_text(s: &str) -> Cow<'_, str> {
-    if !s.contains('&') {
-        return Cow::Borrowed(s);
-    }
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(amp) = rest.find('&') {
-        out.push_str(&rest[..amp]);
-        let tail = &rest[amp..];
-        if let Some(after) = tail.strip_prefix("&amp;") {
-            out.push('&');
-            rest = after;
-        } else if let Some(after) = tail.strip_prefix("&lt;") {
-            out.push('<');
-            rest = after;
-        } else if let Some(after) = tail.strip_prefix("&gt;") {
-            out.push('>');
-            rest = after;
-        } else if let Some(after) = tail.strip_prefix("&quot;") {
-            out.push('"');
-            rest = after;
-        } else {
-            out.push('&');
-            rest = &tail[1..];
-        }
-    }
-    out.push_str(rest);
-    Cow::Owned(out)
-}
-
 /// SPIKE: convert the resolved slot list into the semantic [`InlineTok`] stream.
 /// Spans now hold *only* plain escaped text (every lossy construct is a
 /// [`Node::Sem`]/[`Node::LinkClose`]), so reconstruction is exact.
@@ -798,9 +815,11 @@ fn list_to_tokens(list: &List, cur: &str, sem: &[Sem], out: &mut Vec<SpanTok>) {
         };
         match &list.slots[idx].node {
             Node::Span { start, end } => {
-                let t = unescape_html_text(&cur[*start..*end]);
+                // `cur` already holds raw (un-escaped) span text in wire mode, so
+                // borrow it directly — no HTML un-escape round-trip.
+                let t = &cur[*start..*end];
                 if !t.is_empty() {
-                    push(InlineTok::Text(t.into_owned()));
+                    push(InlineTok::Text(t.to_owned()));
                 }
             }
             Node::Tag(t) => push(match *t {
@@ -960,7 +979,8 @@ fn emit_inline<S: InlineSink>(list: &List, cur: &str, sem: &[Sem], sink: &mut S)
     while let Some(idx) = node {
         let (s, e) = list.slots[idx].cspan;
         match &list.slots[idx].node {
-            Node::Span { start, end } => add_text!(unescape_html_text(&cur[*start..*end]), s, e),
+            // `cur` already holds raw span text in wire mode — borrow it directly.
+            Node::Span { start, end } => add_text!(Cow::Borrowed(&cur[*start..*end]), s, e),
             Node::Tag(t) => match *t {
                 "<em>" => {
                     flush!();
@@ -1862,6 +1882,12 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
     let resolve = scratch.resolve;
     #[cfg(not(feature = "ast"))]
     let ast_mode = false;
+    // SPIKE (`ast`): wire/AST mode writes *raw* (un-escaped) text into the span
+    // buffer `cur`, so the wire reader borrows it with no un-escape round-trip.
+    // Identical to `ast_mode` (resolve || toks), captured as a plain `bool` here —
+    // before `cur` is borrowed below — so the emit helpers need no `scratch`
+    // re-borrow. Const-folds to `false` (HTML, byte-identical) without `ast`.
+    let raw = ast_mode;
     // Fast path: no emphasis/link (or `~` when ST) delimiters → stream directly.
     // Skipped in AST mode: the streaming path emits HTML for code spans /
     // autolinks / raw HTML, which we must instead capture as semantic nodes.
@@ -1947,7 +1973,7 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
     while i < bytes.len() {
         match bytes[i] {
             b'\\' => {
-                escape_html(&src[run..i], cur);
+                emit_text(raw, &src[run..i], cur);
                 if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
                     if ast_mode {
                         flush!(i);
@@ -1967,7 +1993,7 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                         i = skip_spaces(bytes, i + 2);
                     }
                 } else if i + 1 < bytes.len() && is_ascii_punct(bytes[i + 1]) {
-                    push_escaped_byte(cur, bytes[i + 1]);
+                    emit_escaped_byte(raw, cur, bytes[i + 1]);
                     i += 2;
                 } else {
                     cur.push('\\');
@@ -1976,7 +2002,7 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                 run = i;
             }
             b'`' => {
-                escape_html(&src[run..i], cur);
+                emit_text(raw, &src[run..i], cur);
                 if ast_mode {
                     if let Some((val, new_i)) = code_span_value(src, bytes, i) {
                         flush!(i);
@@ -2001,21 +2027,26 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                 run = i;
             }
             b'&' => {
-                escape_html(&src[run..i], cur);
+                emit_text(raw, &src[run..i], cur);
                 if let Some((val, consumed)) = parse_entity(bytes, i) {
                     match val {
-                        Resolved::Cp(cp) => push_char_escaped(cur, cp),
-                        Resolved::Text(s) => push_str_escaped(cur, s),
+                        Resolved::Cp(cp) => emit_char_escaped(raw, cur, cp),
+                        Resolved::Text(s) => emit_str_escaped(raw, cur, s),
                     }
                     i += consumed;
                 } else {
-                    cur.push_str("&amp;");
+                    // A bare `&` (no entity): raw text or its `&amp;` escape.
+                    if raw {
+                        cur.push('&');
+                    } else {
+                        cur.push_str("&amp;");
+                    }
                     i += 1;
                 }
                 run = i;
             }
             b'<' => {
-                escape_html(&src[run..i], cur);
+                emit_text(raw, &src[run..i], cur);
                 if let Some((consumed, html)) = try_autolink(src, bytes, i) {
                     if ast_mode {
                         // Recover url/text: href is percent-encoded (lossy), but
@@ -2055,14 +2086,19 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                     }
                     i = end;
                 } else {
-                    cur.push_str("&lt;");
+                    // A bare `<` (no autolink/raw HTML): raw text or its `&lt;`.
+                    if raw {
+                        cur.push('<');
+                    } else {
+                        cur.push_str("&lt;");
+                    }
                     i += 1;
                 }
                 run = i;
             }
             b'*' | b'_' => {
                 let ch = bytes[i];
-                escape_html(&src[run..i], cur);
+                emit_text(raw, &src[run..i], cur);
                 flush!(i);
                 let count = bytes[i..].iter().take_while(|&&b| b == ch).count();
                 let before = src[..i].chars().next_back();
@@ -2084,7 +2120,7 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
             // GFM strikethrough: a `~` run of 1 or 2 is a delimiter (→ <del>);
             // 3+ tildes are literal. Only reachable when ST is on.
             b'~' if ST => {
-                escape_html(&src[run..i], cur);
+                emit_text(raw, &src[run..i], cur);
                 flush!(i);
                 let count = bytes[i..].iter().take_while(|&&b| b == b'~').count();
                 if count <= 2 {
@@ -2126,7 +2162,7 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                 };
                 #[cfg(feature = "footnotes")]
                 let handled = if let Some((id, label, consumed)) = fnref {
-                    escape_html(&src[run..i], cur);
+                    emit_text(raw, &src[run..i], cur);
                     if ast_mode {
                         flush!(i);
                         let si = sem.len() as u32;
@@ -2149,7 +2185,7 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                 #[cfg(not(feature = "footnotes"))]
                 let handled = false;
                 if !handled {
-                    escape_html(&src[run..i], cur);
+                    emit_text(raw, &src[run..i], cur);
                     flush!(i);
                     let node = list.push(Node::Tag("["));
                     #[cfg(feature = "ast")]
@@ -2165,7 +2201,7 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                 }
             }
             b'!' if bytes.get(i + 1) == Some(&b'[') => {
-                escape_html(&src[run..i], cur);
+                emit_text(raw, &src[run..i], cur);
                 flush!(i);
                 let node = list.push(Node::Tag("!["));
                 #[cfg(feature = "ast")]
@@ -2180,7 +2216,7 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                 run = i;
             }
             b']' => {
-                escape_html(&src[run..i], cur);
+                emit_text(raw, &src[run..i], cur);
                 flush!(i);
                 let rb = list.push(Node::Tag("]"));
                 #[cfg(feature = "ast")]
@@ -2204,7 +2240,7 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                 let line = &src[run..i];
                 let trimmed = line.trim_end_matches(' ');
                 let hard = line.len() - trimmed.len() >= 2;
-                escape_html(trimmed, cur);
+                emit_text(raw, trimmed, cur);
                 if (hard || HW) && ast_mode {
                     // The text node ends before the trailing spaces; the break
                     // spans them through the line ending.
@@ -2239,7 +2275,7 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
             // including any `_`/`*` in the path — before they become delimiters.
             b'@' if al => {
                 if let Some((s, e)) = gfm_scan_email(bytes, i) {
-                    escape_html(&src[run..s], cur);
+                    emit_text(raw, &src[run..s], cur);
                     emit_email(src, s, e, cur);
                     i = e;
                     run = i;
@@ -2249,7 +2285,7 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
             }
             b'w' | b'W' if al && al_boundary(bytes, i) => {
                 if let Some(end) = gfm_scan_url(bytes, i) {
-                    escape_html(&src[run..i], cur);
+                    emit_text(raw, &src[run..i], cur);
                     emit_url(src, i, end, cur);
                     i = end;
                     run = i;
@@ -2259,7 +2295,7 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
             }
             b':' if al || emo || dir => {
                 if al && let Some((s, e)) = gfm_scan_url_at_colon(bytes, i) {
-                    escape_html(&src[run..s], cur);
+                    emit_text(raw, &src[run..s], cur);
                     emit_url(src, s, e, cur);
                     i = e;
                     run = i;
@@ -2267,7 +2303,7 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                     // Emoji is plain text in both HTML and AST mode: flush the
                     // pending text and append the emoji to the current segment
                     // (no node boundary), so it folds into the surrounding text.
-                    escape_html(&src[run..i], cur);
+                    emit_text(raw, &src[run..i], cur);
                     cur.push_str(emoji);
                     i = e;
                     run = i;
@@ -2289,7 +2325,7 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                         let after = ac + h.consumed;
                         let name = src[ac + h.name_start..ac + h.name_end].to_owned();
                         let label = h.label.map(|(ls, le)| (ac + ls, ac + le));
-                        escape_html(&src[run..i], cur);
+                        emit_text(raw, &src[run..i], cur);
                         if ast_mode {
                             flush!(i);
                             let si = sem.len() as u32;
@@ -2362,7 +2398,7 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
     // to form a hard break). The last text node ends before them (mdast trims
     // trailing spaces from the final text node's value *and* position).
     let block_text_end = run + src[run..].trim_end_matches(' ').len();
-    escape_html(&src[run..block_text_end], cur);
+    emit_text(raw, &src[run..block_text_end], cur);
     flush!(block_text_end);
 
     process_emphasis(list, stack, 0);
@@ -2569,7 +2605,8 @@ fn ast_image_alt(list: &List, op_node: usize, rb_node: usize, cur: &str, sem: &[
             break;
         }
         match &list.slots[idx].node {
-            Node::Span { start, end } => s.push_str(&unescape_html_text(&cur[*start..*end])),
+            // `cur` already holds raw span text in wire mode — borrow it directly.
+            Node::Span { start, end } => s.push_str(&cur[*start..*end]),
             Node::Tag(t) => match *t {
                 "<em>" | "</em>" | "<strong>" | "</strong>" | "<del>" | "</del>" => {}
                 lit => s.push_str(lit),
