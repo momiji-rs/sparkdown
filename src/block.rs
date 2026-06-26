@@ -1204,6 +1204,11 @@ impl<'a> Parser<'a> {
         }
     }
 
+    // Pinned: cfg-gating the woven extensions (see the `Kind`-variant notes
+    // above) shifts LLVM's auto-inlining of this single-caller per-line hot fn —
+    // measured +2% on the default path WITHOUT the pin, −1~−5% WITH it (best-of-N,
+    // instructions retired). The default-path benchmark on CI (CodSpeed, the
+    // `sparkdown` row of vs_pulldown) guards against a regression.
     #[inline(always)]
     fn incorporate_line(&mut self, line: &'a [u8]) {
         let mut container = 0;

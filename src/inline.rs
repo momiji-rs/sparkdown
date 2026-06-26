@@ -649,6 +649,12 @@ enum Sem {
         reftype: &'static str,
         alt: String,
     },
+    // NOTE: unlike the block `Kind` variants (kept compiled — removing them
+    // perturbs the hot block matches, see block.rs), the inline extension variants
+    // below ARE cfg-removed. Measured: removing them does NOT perturb the
+    // monomorphized `render_inline_impl` (inline/colon-heavy corpora 0% on the
+    // default path) and it keeps the build leaner — so each path uses the policy
+    // that is measured-optimal for it, not a single uniform one.
     /// GFM `[^label]` → mdast `footnoteReference` (a leaf).
     #[cfg(feature = "footnotes")]
     FootnoteRef { identifier: String, label: String },
