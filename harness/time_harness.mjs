@@ -23,10 +23,22 @@ function wasmOnly() {
   return total;
 }
 
+// direct to_html: parse + render (no wire serialization, no JS tree) — the parse floor
+function htmlOnly() {
+  const inPtr = ex.sparkdown_alloc(inputBytes.length);
+  new Uint8Array(ex.memory.buffer).set(inputBytes, inPtr);
+  const ptr = ex.sparkdown_to_html(inPtr, inputBytes.length);
+  const total = new DataView(ex.memory.buffer).getUint32(ptr, true);
+  ex.sparkdown_free(ptr, 4 + total);
+  ex.sparkdown_free(inPtr, inputBytes.length);
+  return total;
+}
+
 const fn =
   which === 'satteri' ? () => markdownToMdast(md, satFeat)
   : which === 'pos' ? () => toMdastSync(md)
   : which === 'wasmonly' ? wasmOnly
+  : which === 'html' ? htmlOnly
   : () => toMdastSync(md, { position: false }); // 'nopos'
 
 let sink = 0;

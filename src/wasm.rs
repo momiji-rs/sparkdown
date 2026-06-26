@@ -213,6 +213,29 @@ pub unsafe extern "C" fn sparkdown_to_mdast_wire_nopos_opts(
     box_html(&crate::ast::to_mdast_wire_nopos_opts(&md, opts))
 }
 
+/// Like [`sparkdown_to_mdast_wire_nopos_opts`] but emits the **string-pooled**
+/// no-position wire (see [`crate::ast::to_mdast_wire_fast_opts`]): the structure
+/// holds only `u32` UTF-16 string lengths and all UTF-8 string bytes are packed
+/// into one contiguous pool, so a JS reader decodes the pool with a single
+/// `TextDecoder.decode` and slices substrings. Layout is
+/// `[u32 poolStart][structure][pool]`. Same `flags` bitmask as
+/// [`sparkdown_to_mdast_wire_opts`].
+///
+/// # Safety
+/// `ptr` must point to `len` readable, initialized bytes.
+#[cfg(feature = "ast")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sparkdown_to_mdast_wire_fast_opts(
+    ptr: *const u8,
+    len: usize,
+    flags: u32,
+) -> *mut u8 {
+    let input = unsafe { core::slice::from_raw_parts(ptr, len) };
+    let md = String::from_utf8_lossy(input);
+    let opts = opts_from_flags(flags);
+    box_html(&crate::ast::to_mdast_wire_fast_opts(&md, opts))
+}
+
 /// Like [`sparkdown_to_html`] but applies extension options from a bitmask: bit
 /// 0 strikethrough, 1 task lists, 2 autolinks, 3 tag filter, 4 tables, 5 hard
 /// wraps, 6 diagram, 7 heading ids (built-in slug transform), 8 frontmatter

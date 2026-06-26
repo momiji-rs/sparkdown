@@ -92,15 +92,21 @@ function toFlags(options) {
   );
 }
 
-// Read the compact binary wire (src/ast.rs `to_mdast_wire`) straight out of wasm
-// linear memory into a remark-shaped plain-object tree — no JSON, no full-buffer
-// decode. ASCII strings take a `fromCharCode` fast path; UTF-8 falls to TextDecoder.
+// Read the compact binary wire straight out of wasm linear memory into a
+// remark-shaped plain-object tree — no JSON, no full-buffer decode.
+//
+// The no-position path uses the string-POOLED wire (`..._fast_opts`): every
+// string's bytes are one contiguous block at the end, decoded with a SINGLE
+// TextDecoder call, and each node's strings are O(1) substrings of it, located by
+// a running UTF-16 offset (the pool is emitted in the same preorder the reader
+// walks). Measured ~6× faster string handling than thousands of per-string decode
+// calls. The position path keeps the inline format (position dominates its cost).
 function readWire(ex, markdown, flags, withPos) {
   const buf = encoder.encode(markdown);
   const inPtr = ex.sparkdown_alloc(buf.length);
   new Uint8Array(ex.memory.buffer).set(buf, inPtr);
   const ptr = !withPos
-    ? ex.sparkdown_to_mdast_wire_nopos_opts(inPtr, buf.length, flags)
+    ? ex.sparkdown_to_mdast_wire_fast_opts(inPtr, buf.length, flags)
     : flags
       ? ex.sparkdown_to_mdast_wire_opts(inPtr, buf.length, flags)
       : ex.sparkdown_to_mdast_wire(inPtr, buf.length);
@@ -110,24 +116,33 @@ function readWire(ex, markdown, flags, withPos) {
   const total = dv.getUint32(ptr, true);
   const base = ptr + 4;
   const u8 = new Uint8Array(mem, base, total);
-  let p = 0;
+
+  // pooled wire = [u32 poolStart][structure][pool]; structure starts at byte 4 and
+  // encodes each string as just [u32 u16Len]. Decode the whole pool once, up front.
+  const pooled = !withPos;
+  const pool = pooled ? decoder.decode(u8.subarray(dv.getUint32(base, true), total)) : "";
+  let p = pooled ? 4 : 0;
+  let off = 0; // running UTF-16 offset into `pool`
 
   const u32 = () => {
     const v = dv.getUint32(base + p, true);
     p += 4;
     return v;
   };
-  const str = () => {
-    const hdr = u32();
-    const n = hdr & 0x7fffffff; // high bit (Rust's is-ASCII hint) is unused — see below
-    const end = p + n;
-    // Measured: V8's native TextDecoder beats `String.fromCharCode.apply(subarray)`
-    // (the argument-spread dominates) for this mix of mostly-short strings. Skip the
-    // call entirely for empty strings (common: blank opt()s, empty code).
-    const s = n === 0 ? "" : decoder.decode(u8.subarray(p, end));
-    p = end;
-    return s;
-  };
+  const str = pooled
+    ? () => {
+        const len = u32();
+        const s = pool.slice(off, off + len);
+        off += len;
+        return s;
+      }
+    : () => {
+        const n = u32() & 0x7fffffff; // high bit (Rust's is-ASCII hint) is unused
+        const end = p + n;
+        const s = n === 0 ? "" : decoder.decode(u8.subarray(p, end));
+        p = end;
+        return s;
+      };
   const opt = () => {
     if (dv.getUint32(base + p, true) === 0xffffffff) {
       p += 4;

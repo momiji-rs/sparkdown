@@ -167,6 +167,12 @@ struct PosCtx {
     src_len: usize,
     src: Vec<u8>,
     enabled: bool, // when false, `wrap` returns bare nodes and no position work is done
+    /// When `Some`, the wire serializer runs in *string-pooled* mode: every string
+    /// is written into the structure as just its `u32` UTF-16 length (an `Option`
+    /// string uses `0xFFFFFFFF` for `None`) and its UTF-8 bytes are appended to this
+    /// shared pool in preorder-DFS emit order. The `to_mdast_wire_fast_opts` path
+    /// then ships `[u32 poolStart][structure][pool]`. `None` = the inline format.
+    pool: Option<std::cell::RefCell<Vec<u8>>>,
 }
 
 impl PosCtx {
@@ -190,6 +196,7 @@ impl PosCtx {
             src_len: src.len(),
             src: src.as_bytes().to_vec(),
             enabled: true,
+            pool: None,
         }
     }
 
@@ -203,6 +210,22 @@ impl PosCtx {
             src_len: 0,
             src: Vec::new(),
             enabled: false,
+            pool: None,
+        }
+    }
+
+    /// A no-position context whose wire serializer runs in *string-pooled* mode:
+    /// strings are written into the structure as a bare `u32` UTF-16 length and
+    /// their UTF-8 bytes are accumulated into the shared `pool` in DFS emit order.
+    /// Used by `to_mdast_wire_fast_opts`.
+    fn pooled() -> Self {
+        PosCtx {
+            line_off: Vec::new(),
+            u16: Vec::new(),
+            src_len: 0,
+            src: Vec::new(),
+            enabled: false,
+            pool: Some(std::cell::RefCell::new(Vec::new())),
         }
     }
 
@@ -1707,11 +1730,69 @@ pub fn to_mdast_wire_nopos_opts(src: &str, opts: crate::Options) -> Vec<u8> {
     out
 }
 
+/// The fastest md→mdast boundary format: a no-position wire whose strings are
+/// *string-pooled* into one contiguous block so a JS reader decodes the whole
+/// pool with a single `TextDecoder.decode` (then slices substrings) instead of
+/// thousands of per-string decodes.
+///
+/// Returned layout: `[u32 poolStart][structure bytes][pool bytes]`, where
+/// `poolStart = 4 + structure_len` is the byte offset (from the start of the
+/// returned Vec) at which the pool begins.
+///
+/// The `structure` is the SAME no-position node encoding as
+/// `to_mdast_wire_nopos_opts` (tag byte, child counts, heading depth, list
+/// flags+start, listItem/defListDescription spread bool, reftype byte, directive
+/// attrs — no position) EXCEPT each string is replaced by just `[u32 u16Len]`
+/// (its UTF-16 code-unit length) and each `Option<String>` by `[u32 u16Len]` for
+/// `Some` or `[u32 0xFFFFFFFF]` for `None`. The string bytes live only in the pool.
+///
+/// The `pool` is every string's UTF-8 bytes concatenated in the exact
+/// preorder-DFS order the strings are emitted into the structure. A reader walking
+/// the structure in order, tracking a running UTF-16 offset, recovers each string
+/// as `pool[runningOff .. runningOff + u16Len]` (offsets and lengths in UTF-16
+/// units, which is what JS `String.prototype.slice` uses).
+pub fn to_mdast_wire_fast_opts(src: &str, opts: crate::Options) -> Vec<u8> {
+    let tree = crate::block::parse_with_opts(src, opts);
+    let mut scratch = fn_scratch(&tree);
+    let ctx = PosCtx::pooled();
+    let mut structure = Vec::<u8>::with_capacity(src.len() + 64);
+    bwire(&tree, tree.root, &mut scratch, &ctx, &mut structure);
+    let pool = ctx
+        .pool
+        .expect("pooled ctx always carries a pool")
+        .into_inner();
+    let pool_start = 4 + structure.len();
+    let mut out = Vec::<u8>::with_capacity(pool_start + pool.len());
+    w_u32(pool_start as u32, &mut out);
+    out.extend_from_slice(&structure);
+    out.extend_from_slice(&pool);
+    out
+}
+
 #[inline]
 fn w_u32(v: u32, out: &mut Vec<u8>) {
     out.extend_from_slice(&v.to_le_bytes());
 }
-fn w_str(s: &str, out: &mut Vec<u8>) {
+/// A string's UTF-16 code-unit length: `s.len()` is exact for ASCII (each byte is
+/// one UTF-16 unit), else count the encoded units.
+#[inline]
+fn u16_len(s: &str) -> u32 {
+    if s.is_ascii() {
+        s.len() as u32
+    } else {
+        s.encode_utf16().count() as u32
+    }
+}
+/// Write a string to wire. In the inline format this is `[u32 hdr][utf8 bytes]`
+/// where `hdr` carries the byte length plus an ASCII high-bit flag. In the pooled
+/// format (`ctx.pool` is `Some`) the structure gets only `[u32 u16Len]` and the
+/// UTF-8 bytes are appended to the shared pool in DFS emit order.
+fn w_str(s: &str, ctx: &PosCtx, out: &mut Vec<u8>) {
+    if let Some(pool) = &ctx.pool {
+        w_u32(u16_len(s), out);
+        pool.borrow_mut().extend_from_slice(s.as_bytes());
+        return;
+    }
     // Encode the ASCII-ness in the length's high bit so the JS reader can pick
     // the fast `String.fromCharCode` path without re-scanning the bytes itself
     // (Rust's `is_ascii` is a cheap vectorized scan). Lengths are « 2^31.
@@ -1719,15 +1800,15 @@ fn w_str(s: &str, out: &mut Vec<u8>) {
     w_u32(hdr, out);
     out.extend_from_slice(s.as_bytes());
 }
-fn w_opt(o: &Option<String>, out: &mut Vec<u8>) {
+fn w_opt(o: &Option<String>, ctx: &PosCtx, out: &mut Vec<u8>) {
     match o {
-        Some(s) => w_str(s, out),
+        Some(s) => w_str(s, ctx, out),
         None => w_u32(u32::MAX, out),
     }
 }
-fn w_opt_str(o: Option<&str>, out: &mut Vec<u8>) {
+fn w_opt_str(o: Option<&str>, ctx: &PosCtx, out: &mut Vec<u8>) {
     match o {
-        Some(s) => w_str(s, out),
+        Some(s) => w_str(s, ctx, out),
         None => w_u32(u32::MAX, out),
     }
 }
@@ -1901,9 +1982,9 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
             out.push(7);
             w_pos(ctx, out, sb);
             w_pos(ctx, out, eb);
-            w_opt(&lang, out);
-            w_opt(&meta, out);
-            w_str(&value, out);
+            w_opt(&lang, ctx, out);
+            w_opt(&meta, ctx, out);
+            w_str(&value, ctx, out);
             eb
         }
         Kind::HtmlBlock => {
@@ -1911,7 +1992,7 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
             out.push(8);
             w_pos(ctx, out, sb);
             w_pos(ctx, out, eb);
-            w_str(tree.html_value(idx), out);
+            w_str(tree.html_value(idx), ctx, out);
             eb
         }
         // The `Frontmatter` variant is always compiled (to keep the hot block
@@ -1924,7 +2005,7 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
             out.push(if node.level == 1 { 21 } else { 20 }); // 20 = yaml, 21 = toml
             w_pos(ctx, out, sb);
             w_pos(ctx, out, se);
-            w_str(value, out);
+            w_str(value, ctx, out);
             se
         }
         // The `FootnoteDef` variant is always compiled (to keep the hot block
@@ -1937,8 +2018,8 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
             out.push(22);
             w_pos(ctx, out, sb);
             let eoff = reserve_pos(ctx, out);
-            w_str(&d.identifier, out);
-            w_str(&d.label, out);
+            w_str(&d.identifier, ctx, out);
+            w_str(&d.label, ctx, out);
             let coff = reserve(out, 4);
             let (n, last) = bchildren(tree, idx, scratch, ctx, out);
             let end = last.unwrap_or(se);
@@ -1952,10 +2033,10 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
             out.push(17);
             w_pos(ctx, out, sb);
             w_pos(ctx, out, eb);
-            w_str(&d.identifier, out);
-            w_str(&d.label, out);
-            w_str(&d.url, out);
-            w_opt(&d.title, out);
+            w_str(&d.identifier, ctx, out);
+            w_str(&d.label, ctx, out);
+            w_str(&d.url, ctx, out);
+            w_opt(&d.title, ctx, out);
             eb
         }
         // The deflist variants stay compiled (to keep the hot block match
@@ -2050,8 +2131,8 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
             out.push(28); // leafDirective
             w_pos(ctx, out, sb);
             w_pos(ctx, out, eb);
-            w_str(&d.name, out);
-            w_attrs(&d.attrs, out);
+            w_str(&d.name, ctx, out);
+            w_attrs(&d.attrs, ctx, out);
             let coff = reserve(out, 4);
             let n = match d.label {
                 Some((ls, le)) => {
@@ -2068,8 +2149,8 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
             out.push(29); // containerDirective
             w_pos(ctx, out, sb);
             let eoff = reserve_pos(ctx, out);
-            w_str(&d.name, out);
-            w_attrs(&d.attrs, out);
+            w_str(&d.name, ctx, out);
+            w_attrs(&d.attrs, ctx, out);
             let coff = reserve(out, 4);
             let mut n = 0u32;
             let mut last = se;
@@ -2122,7 +2203,7 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
             out.push(8);
             w_pos(ctx, out, sb);
             w_pos(ctx, out, eb);
-            w_str(tree.content(idx), out);
+            w_str(tree.content(idx), ctx, out);
             eb
         }
     }
@@ -2211,11 +2292,11 @@ fn inline_wire_src(
 /// Write an ordered attribute object to wire: `u32` count, then `(key, value)`
 /// string pairs.
 #[cfg(feature = "directives")]
-fn w_attrs(attrs: &[(String, String)], out: &mut Vec<u8>) {
+fn w_attrs(attrs: &[(String, String)], ctx: &PosCtx, out: &mut Vec<u8>) {
     w_u32(attrs.len() as u32, out);
     for (k, v) in attrs {
-        w_str(k, out);
-        w_str(v, out);
+        w_str(k, ctx, out);
+        w_str(v, ctx, out);
     }
 }
 
@@ -2346,17 +2427,17 @@ impl WireSink<'_> {
 impl InlineSink for WireSink<'_> {
     fn text(&mut self, value: &str, start: u32, end: u32) {
         self.leaf(9, start, end);
-        w_str(value, self.out);
+        w_str(value, self.ctx, self.out);
         self.bump();
     }
     fn code(&mut self, value: &str, start: u32, end: u32) {
         self.leaf(13, start, end);
-        w_str(value, self.out);
+        w_str(value, self.ctx, self.out);
         self.bump();
     }
     fn html(&mut self, value: &str, start: u32, end: u32) {
         self.leaf(8, start, end);
-        w_str(value, self.out);
+        w_str(value, self.ctx, self.out);
         self.bump();
     }
     fn brk(&mut self, start: u32, end: u32) {
@@ -2365,9 +2446,9 @@ impl InlineSink for WireSink<'_> {
     }
     fn image(&mut self, url: &str, title: Option<&str>, alt: &str, start: u32, end: u32) {
         self.leaf(16, start, end);
-        w_str(url, self.out);
-        w_opt_str(title, self.out);
-        w_str(alt, self.out);
+        w_str(url, self.ctx, self.out);
+        w_opt_str(title, self.ctx, self.out);
+        w_str(alt, self.ctx, self.out);
         self.bump();
     }
     fn imageref(
@@ -2380,17 +2461,17 @@ impl InlineSink for WireSink<'_> {
         end: u32,
     ) {
         self.leaf(19, start, end);
-        w_str(identifier, self.out);
-        w_str(label, self.out);
+        w_str(identifier, self.ctx, self.out);
+        w_str(label, self.ctx, self.out);
         self.out.push(reftype_code(reftype));
-        w_str(alt, self.out);
+        w_str(alt, self.ctx, self.out);
         self.bump();
     }
     #[cfg(feature = "footnotes")]
     fn footnote_ref(&mut self, identifier: &str, label: &str, start: u32, end: u32) {
         self.leaf(23, start, end);
-        w_str(identifier, self.out);
-        w_str(label, self.out);
+        w_str(identifier, self.ctx, self.out);
+        w_str(label, self.ctx, self.out);
         self.bump();
     }
     #[cfg(feature = "directives")]
@@ -2406,14 +2487,14 @@ impl InlineSink for WireSink<'_> {
         // `[label]`, so its inline children are emitted empty here (the JSON mdast
         // path — what the directive gate checks — carries the full children).
         self.leaf(27, start, end);
-        w_str(name, self.out);
-        w_attrs(attrs, self.out);
+        w_str(name, self.ctx, self.out);
+        w_attrs(attrs, self.ctx, self.out);
         w_u32(0, self.out); // children: empty (best-effort on the wire path)
         self.bump();
     }
     fn autolink(&mut self, url: &str, text: &str, start: u32, end: u32) {
         self.leaf(15, start, end);
-        w_str(url, self.out);
+        w_str(url, self.ctx, self.out);
         w_u32(u32::MAX, self.out); // title: None
         w_u32(1, self.out); // one text child
         self.out.push(9);
@@ -2422,7 +2503,7 @@ impl InlineSink for WireSink<'_> {
             w_point(self.out, cp.start);
             w_point(self.out, cp.end);
         }
-        w_str(text, self.out);
+        w_str(text, self.ctx, self.out);
         self.bump();
     }
     fn open(&mut self, kind: &'static str, start: u32, end: u32) {
@@ -2449,8 +2530,8 @@ impl InlineSink for WireSink<'_> {
         self.out.push(15);
         self.w_start(start);
         let eoff = self.reserve_end();
-        w_str(url, self.out);
-        w_opt_str(title, self.out);
+        w_str(url, self.ctx, self.out);
+        w_opt_str(title, self.ctx, self.out);
         let coff = reserve(self.out, 4);
         self.stack.push(InlineFrame {
             eoff,
@@ -2472,8 +2553,8 @@ impl InlineSink for WireSink<'_> {
         self.out.push(18);
         self.w_start(start);
         let eoff = self.reserve_end();
-        w_str(identifier, self.out);
-        w_str(label, self.out);
+        w_str(identifier, self.ctx, self.out);
+        w_str(label, self.ctx, self.out);
         self.out.push(reftype_code(reftype));
         let coff = reserve(self.out, 4);
         self.stack.push(InlineFrame {
@@ -3172,6 +3253,288 @@ mod wire_nopos_tests {
             let a = to_mdast_wire(src);
             let b = to_mdast_wire(src);
             assert_eq!(a, b, "pos wire not deterministic for {src:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod wire_pooled_tests {
+    //! Verify the string-pooled wire (`to_mdast_wire_fast_opts`) reproduces exactly
+    //! the same strings, in the same DFS order, as the inline no-position wire
+    //! (`to_mdast_wire_nopos_opts`). Two schema walkers — identical structurally —
+    //! decode both wires into the ordered list of strings: the inline walker reads
+    //! `[u32 hdr][bytes]`; the pooled walker reads `[u32 u16Len]` and slices the
+    //! pool at a running UTF-16 offset. If the two string lists are byte-equal, the
+    //! pool (sliced by UTF-16 offset) reproduces the inline strings exactly.
+
+    use super::*;
+
+    /// A walker over the no-position structure. `read_str`/`read_opt` push the
+    /// decoded string bytes onto `out`. The tag dispatch mirrors the canonical
+    /// `wire_nopos_tests::Reader` schema exactly (no position bytes on either wire).
+    struct StrWalker<'a, F, G> {
+        b: &'a [u8],
+        p: usize,
+        out: Vec<Vec<u8>>,
+        read_str: F,
+        read_opt: G,
+    }
+
+    impl<F, G> StrWalker<'_, F, G>
+    where
+        F: FnMut(&[u8], &mut usize) -> Vec<u8>,
+        G: FnMut(&[u8], &mut usize) -> Option<Vec<u8>>,
+    {
+        fn u8(&mut self) -> u8 {
+            let v = self.b[self.p];
+            self.p += 1;
+            v
+        }
+        fn u32(&mut self) -> u32 {
+            let v = u32::from_le_bytes(self.b[self.p..self.p + 4].try_into().unwrap());
+            self.p += 4;
+            v
+        }
+        fn wstr(&mut self) {
+            let s = (self.read_str)(self.b, &mut self.p);
+            self.out.push(s);
+        }
+        fn wopt(&mut self) {
+            if let Some(s) = (self.read_opt)(self.b, &mut self.p) {
+                self.out.push(s);
+            }
+        }
+        fn wattrs(&mut self) {
+            let n = self.u32();
+            for _ in 0..n {
+                self.wstr();
+                self.wstr();
+            }
+        }
+        fn kids(&mut self) {
+            let n = self.u32();
+            for _ in 0..n {
+                self.node();
+            }
+        }
+        fn node(&mut self) {
+            let tag = self.u8();
+            match tag {
+                0 | 1 | 3 => self.kids(),
+                2 => {
+                    self.u8();
+                    self.kids();
+                }
+                4 => {
+                    self.u8();
+                    self.u32();
+                    self.kids();
+                }
+                5 => {
+                    self.u8();
+                    self.kids();
+                }
+                6 | 14 => {}
+                7 => {
+                    self.wopt();
+                    self.wopt();
+                    self.wstr();
+                }
+                8 | 9 | 13 => self.wstr(),
+                10..=12 => self.kids(),
+                15 => {
+                    self.wstr();
+                    self.wopt();
+                    self.kids();
+                }
+                16 => {
+                    self.wstr();
+                    self.wopt();
+                    self.wstr();
+                }
+                17 => {
+                    self.wstr();
+                    self.wstr();
+                    self.wstr();
+                    self.wopt();
+                }
+                18 => {
+                    self.wstr();
+                    self.wstr();
+                    self.u8();
+                    self.kids();
+                }
+                19 => {
+                    self.wstr();
+                    self.wstr();
+                    self.u8();
+                    self.wstr();
+                }
+                20 | 21 => self.wstr(),
+                22 => {
+                    self.wstr();
+                    self.wstr();
+                    self.kids();
+                }
+                23 => {
+                    self.wstr();
+                    self.wstr();
+                }
+                24 => self.kids(),
+                25 => self.kids(),
+                26 => {
+                    self.u8();
+                    self.kids();
+                }
+                27..=29 => {
+                    self.wstr();
+                    self.wattrs();
+                    self.kids();
+                }
+                30 => self.kids(),
+                other => panic!("unknown wire tag {other} at byte {}", self.p - 1),
+            }
+        }
+    }
+
+    /// Strings (in DFS order) from the inline no-position wire: `[u32 hdr][bytes]`,
+    /// where `hdr`'s low 31 bits are the byte length and `None` is `0xFFFFFFFF`.
+    fn inline_strings(wire: &[u8]) -> Vec<Vec<u8>> {
+        let read_str = |b: &[u8], p: &mut usize| -> Vec<u8> {
+            let hdr = u32::from_le_bytes(b[*p..*p + 4].try_into().unwrap());
+            *p += 4;
+            let n = (hdr & 0x7fff_ffff) as usize;
+            let s = b[*p..*p + n].to_vec();
+            *p += n;
+            s
+        };
+        let read_opt = |b: &[u8], p: &mut usize| -> Option<Vec<u8>> {
+            let hdr = u32::from_le_bytes(b[*p..*p + 4].try_into().unwrap());
+            if hdr == u32::MAX {
+                *p += 4;
+                None
+            } else {
+                let n = (hdr & 0x7fff_ffff) as usize;
+                *p += 4;
+                let s = b[*p..*p + n].to_vec();
+                *p += n;
+                Some(s)
+            }
+        };
+        let mut w = StrWalker {
+            b: wire,
+            p: 0,
+            out: Vec::new(),
+            read_str,
+            read_opt,
+        };
+        w.node();
+        assert_eq!(w.p, wire.len(), "inline decoder did not consume whole wire");
+        w.out
+    }
+
+    /// Strings (in DFS order) from the pooled wire `[u32 poolStart][structure][pool]`:
+    /// the structure holds `[u32 u16Len]` per string (`0xFFFFFFFF` for `None`); a
+    /// running UTF-16 offset slices the pool. Mirrors the JS reader.
+    fn pooled_strings(wire: &[u8]) -> Vec<Vec<u8>> {
+        let pool_start = u32::from_le_bytes(wire[0..4].try_into().unwrap()) as usize;
+        let structure = &wire[4..pool_start];
+        // Decode the pool ONCE (like JS `TextDecoder.decode`) into UTF-16 units, so
+        // a `[u16off, u16off + u16Len)` slice recovers the exact source string —
+        // matching the JS reader's `pool.slice(off, off + len)`.
+        let pool_str = std::str::from_utf8(&wire[pool_start..]).expect("pool is valid utf-8");
+        let pool16: Vec<u16> = pool_str.encode_utf16().collect();
+        let off = std::cell::Cell::new(0usize);
+        let slice_pool = |u16_len: usize| -> Vec<u8> {
+            let start = off.get();
+            let end = start + u16_len;
+            off.set(end);
+            String::from_utf16(&pool16[start..end])
+                .expect("pool slice is a valid utf-16 run")
+                .into_bytes()
+        };
+        let read_str = |b: &[u8], p: &mut usize| -> Vec<u8> {
+            let len = u32::from_le_bytes(b[*p..*p + 4].try_into().unwrap()) as usize;
+            *p += 4;
+            slice_pool(len)
+        };
+        let read_opt = |b: &[u8], p: &mut usize| -> Option<Vec<u8>> {
+            let hdr = u32::from_le_bytes(b[*p..*p + 4].try_into().unwrap());
+            *p += 4;
+            if hdr == u32::MAX {
+                None
+            } else {
+                Some(slice_pool(hdr as usize))
+            }
+        };
+        let mut w = StrWalker {
+            b: structure,
+            p: 0,
+            out: Vec::new(),
+            read_str,
+            read_opt,
+        };
+        w.node();
+        assert_eq!(
+            w.p,
+            structure.len(),
+            "pooled decoder did not consume whole structure"
+        );
+        // Every pool byte must be consumed by the running offset.
+        assert_eq!(off.get(), pool16.len(), "pool not fully consumed");
+        w.out
+    }
+
+    const SAMPLES: &[&str] = &[
+        "",
+        "hello world\n",
+        "# Heading *em* and **strong** and `code`\n",
+        "> a quote\n> over lines\n",
+        "- one\n- two\n  - nested\n\n1. a\n2. b\n",
+        "```rust\nfn main() {}\n```\n",
+        "    indented code\n    line two\n",
+        "para with [a link](https://x.com \"t\") and ![img](u.png \"a\")\n",
+        "ref [link][id] and [id]: https://x.com \"title\"\n\n[id]: https://x.com\n",
+        "an <https://auto.link> autolink\n",
+        "<div>raw html</div>\n",
+        "***\n\nmore\n",
+        "line one\\\nline two with hard break\n",
+        "unicode café — résumé 日本語 text\n",
+        "föö 🎉 café and **bold 🚀** plus `code ✓`\n",
+        "a `multi\nword` and ~~del~~ mix [shortcut] ![imgref][]\n",
+        "empty link [](#) and image ![]()\n",
+    ];
+
+    #[test]
+    fn pooled_strings_equal_inline_strings() {
+        for &src in SAMPLES {
+            let opts = crate::Options::default();
+            let inline = to_mdast_wire_nopos_opts(src, opts);
+            let pooled = to_mdast_wire_fast_opts(src, opts);
+
+            // Layout sanity: poolStart points just past the structure.
+            let pool_start = u32::from_le_bytes(pooled[0..4].try_into().unwrap()) as usize;
+            assert!(
+                pool_start <= pooled.len() && pool_start >= 4,
+                "poolStart out of range for {src:?}: {pool_start} / {}",
+                pooled.len()
+            );
+
+            let a = inline_strings(&inline);
+            let b = pooled_strings(&pooled);
+            assert_eq!(
+                a, b,
+                "pooled strings (sliced by UTF-16 offset) differ from inline for {src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pooled_wire_is_deterministic() {
+        for &src in SAMPLES {
+            let a = to_mdast_wire_fast_opts(src, crate::Options::default());
+            let b = to_mdast_wire_fast_opts(src, crate::Options::default());
+            assert_eq!(a, b, "pooled wire not deterministic for {src:?}");
         }
     }
 }
