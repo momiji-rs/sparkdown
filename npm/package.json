@@ -18,9 +18,13 @@
     "./full": {
       "types": "./full.d.ts",
       "default": "./full.mjs"
+    },
+    "./mdast": {
+      "types": "./mdast.d.ts",
+      "default": "./mdast.mjs"
     }
   },
-  "files": ["sparkdown.mjs", "wasm-inline.mjs", "index.d.ts", "gfm.mjs", "gfm-wasm-inline.mjs", "gfm.d.ts", "full.mjs", "full-wasm-inline.mjs", "full.d.ts", "README.md"],
+  "files": ["sparkdown.mjs", "wasm-inline.mjs", "index.d.ts", "gfm.mjs", "gfm-wasm-inline.mjs", "gfm.d.ts", "full.mjs", "full-wasm-inline.mjs", "full.d.ts", "mdast.mjs", "mdast-wasm-inline.mjs", "mdast.d.ts", "README.md"],
   "sideEffects": false,
   "scripts": {
     "build": "node build.mjs",

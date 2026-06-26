@@ -2,6 +2,7 @@
 wasm-inline.mjs
 gfm-wasm-inline.mjs
 full-wasm-inline.mjs
+mdast-wasm-inline.mjs
 sparkdown.opt.wasm
 node_modules/
 *.tgz

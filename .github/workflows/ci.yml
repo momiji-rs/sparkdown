@@ -114,7 +114,7 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: "24"
-      - name: Build + inline all three wasm variants (the `.`, `./gfm`, `./full` entries)
+      - name: Build + inline all four wasm variants (the `.`, `./gfm`, `./full`, `./mdast` entries)
         run: |
           RF="-D warnings -C target-feature=+simd128,+bulk-memory"
           W=../target/wasm32-unknown-unknown/release/sparkdown.wasm
@@ -124,6 +124,8 @@ jobs:
           (cd npm && node build.mjs "$W" gfm-wasm-inline.mjs)
           RUSTFLAGS="$RF" cargo build --target wasm32-unknown-unknown --release --features wasm,full
           (cd npm && node build.mjs "$W" full-wasm-inline.mjs)
-      - name: Conformance + GFM gate through the wasm (all three entries, 652/652)
+          RUSTFLAGS="$RF" cargo build --target wasm32-unknown-unknown --release --features wasm,ast,full
+          (cd npm && node build.mjs "$W" mdast-wasm-inline.mjs)
+      - name: Conformance + GFM + mdast gate through the wasm (all four entries, 652/652)
         run: npm test
         working-directory: npm

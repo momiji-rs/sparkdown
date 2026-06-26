@@ -49,7 +49,7 @@ jobs:
           targets: wasm32-unknown-unknown
       - name: Install binaryen (wasm-opt)
         run: sudo apt-get update && sudo apt-get install -y binaryen
-      - name: Build + optimize the three wasm modules
+      - name: Build + optimize the four wasm modules
         run: |
           RF="-C target-feature=+simd128,+bulk-memory"
           O="-O3 --enable-simd --enable-bulk-memory --strip-debug --strip-producers"
@@ -59,13 +59,16 @@ jobs:
           wasm-opt $O target/wasm32-unknown-unknown/release/sparkdown.wasm -o sparkdown-gfm.wasm
           RUSTFLAGS="$RF" cargo build --target wasm32-unknown-unknown --release --features wasm,full
           wasm-opt $O target/wasm32-unknown-unknown/release/sparkdown.wasm -o sparkdown-full.wasm
-          sha256sum sparkdown.wasm sparkdown-gfm.wasm sparkdown-full.wasm > SHA256SUMS.txt
+          RUSTFLAGS="$RF" cargo build --target wasm32-unknown-unknown --release --features wasm,ast,full
+          wasm-opt $O target/wasm32-unknown-unknown/release/sparkdown.wasm -o sparkdown-mdast.wasm
+          sha256sum sparkdown.wasm sparkdown-gfm.wasm sparkdown-full.wasm sparkdown-mdast.wasm > SHA256SUMS.txt
       - uses: softprops/action-gh-release@v2
         with:
           files: |
             sparkdown.wasm
             sparkdown-gfm.wasm
             sparkdown-full.wasm
+            sparkdown-mdast.wasm
             SHA256SUMS.txt
 
   # One package, two subpath entries (`.` CommonMark + `./gfm`): build both wasm
@@ -84,7 +87,7 @@ jobs:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
           package-manager-cache: false # never cache in release builds
-      - name: Build + inline the three wasm variants (. / gfm / full)
+      - name: Build + inline the four wasm variants (. / gfm / full / mdast)
         run: |
           RF="-C target-feature=+simd128,+bulk-memory"
           W=../target/wasm32-unknown-unknown/release/sparkdown.wasm
@@ -94,6 +97,8 @@ jobs:
           (cd npm && node build.mjs "$W" gfm-wasm-inline.mjs)
           RUSTFLAGS="$RF" cargo build --target wasm32-unknown-unknown --release --features wasm,full
           (cd npm && node build.mjs "$W" full-wasm-inline.mjs)
+          RUSTFLAGS="$RF" cargo build --target wasm32-unknown-unknown --release --features wasm,ast,full
+          (cd npm && node build.mjs "$W" mdast-wasm-inline.mjs)
       - run: npm test # all three entries: CommonMark 652/652 + GFM/full checks
         working-directory: npm
       - run: npm publish --provenance --access public
