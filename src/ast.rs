@@ -311,7 +311,7 @@ impl PosCtx {
 /// Render an mdast tree to HTML entirely in Rust, **byte-identical** to the
 /// unified JS pipeline `mdast-util-to-hast` + `hast-util-to-html` (rehype's
 /// `toHast(tree)` → `toHtml(...)`), with the default options (no
-/// `allowDangerousHtml`). See [`emit`] for the per-node mapping.
+/// `allowDangerousHtml`). See `emit_md` for the per-node mapping.
 ///
 /// Note: the caller appends the trailing `\n` that rehype-stringify adds.
 pub fn render_mdast(node: &Mdast) -> String {
@@ -354,14 +354,26 @@ fn collect_definitions<'a>(
 ) {
     use Mdast::*;
     match unwrap_pos(node) {
-        Definition { identifier, url, title, .. } => {
+        Definition {
+            identifier,
+            url,
+            title,
+            ..
+        } => {
             defs.entry(identifier.as_str())
                 .or_insert((url.as_str(), title.as_deref()));
         }
-        Root(c) | Paragraph(c) | Blockquote(c) | Heading { children: c, .. }
-        | List { children: c, .. } | ListItem { children: c, .. }
-        | Emphasis(c) | Strong(c) | Delete(c)
-        | Link { children: c, .. } | LinkReference { children: c, .. } => {
+        Root(c)
+        | Paragraph(c)
+        | Blockquote(c)
+        | Heading { children: c, .. }
+        | List { children: c, .. }
+        | ListItem { children: c, .. }
+        | Emphasis(c)
+        | Strong(c)
+        | Delete(c)
+        | Link { children: c, .. }
+        | LinkReference { children: c, .. } => {
             for ch in c {
                 collect_definitions(ch, defs);
             }
@@ -603,7 +615,9 @@ fn list_is_loose(spread: bool, children: &[Mdast]) -> bool {
     if spread {
         return true;
     }
-    children.iter().any(|c| matches!(unwrap_pos(c), Mdast::ListItem { spread, .. } if *spread))
+    children
+        .iter()
+        .any(|c| matches!(unwrap_pos(c), Mdast::ListItem { spread, .. } if *spread))
 }
 
 fn emit(node: &Mdast, out: &mut String, defs: &DefMap) {
@@ -629,7 +643,12 @@ fn emit(node: &Mdast, out: &mut String, defs: &DefMap) {
             emit_wrapped(c, true, out, defs);
             out.push_str("</blockquote>");
         }
-        List { ordered, start, spread, children } => {
+        List {
+            ordered,
+            start,
+            spread,
+            children,
+        } => {
             if *ordered {
                 match start {
                     Some(n) if *n != 1 => {
@@ -661,7 +680,10 @@ fn emit(node: &Mdast, out: &mut String, defs: &DefMap) {
             out.push_str("<pre><code");
             if let Some(l) = lang {
                 // CM/GH keep only the first whitespace-delimited token.
-                let first = l.split([' ', '\t', '\n', '\r', '\x0c']).next().unwrap_or("");
+                let first = l
+                    .split([' ', '\t', '\n', '\r', '\x0c'])
+                    .next()
+                    .unwrap_or("");
                 if !first.is_empty() {
                     out.push_str(" class=\"language-");
                     esc_attr(first, out);
@@ -701,7 +723,11 @@ fn emit(node: &Mdast, out: &mut String, defs: &DefMap) {
             out.push_str("</code>");
         }
         Break => out.push_str("<br>\n"),
-        Link { url, title, children } => {
+        Link {
+            url,
+            title,
+            children,
+        } => {
             out.push_str("<a href=\"");
             emit_uri_attr(url, out);
             out.push('"');
@@ -727,25 +753,33 @@ fn emit(node: &Mdast, out: &mut String, defs: &DefMap) {
             }
             out.push('>');
         }
-        LinkReference { identifier, label, reftype, children } => {
-            match defs.get(identifier.as_str()) {
-                Some(&(url, title)) => {
-                    out.push_str("<a href=\"");
-                    emit_uri_attr(url, out);
+        LinkReference {
+            identifier,
+            label,
+            reftype,
+            children,
+        } => match defs.get(identifier.as_str()) {
+            Some(&(url, title)) => {
+                out.push_str("<a href=\"");
+                emit_uri_attr(url, out);
+                out.push('"');
+                if let Some(t) = title {
+                    out.push_str(" title=\"");
+                    esc_attr(t, out);
                     out.push('"');
-                    if let Some(t) = title {
-                        out.push_str(" title=\"");
-                        esc_attr(t, out);
-                        out.push('"');
-                    }
-                    out.push('>');
-                    emit_inline(children, out, defs);
-                    out.push_str("</a>");
                 }
-                None => revert_link(children, label, identifier, reftype, out, defs),
+                out.push('>');
+                emit_inline(children, out, defs);
+                out.push_str("</a>");
             }
-        }
-        ImageReference { identifier, label, reftype, alt } => {
+            None => revert_link(children, label, identifier, reftype, out, defs),
+        },
+        ImageReference {
+            identifier,
+            label,
+            reftype,
+            alt,
+        } => {
             match defs.get(identifier.as_str()) {
                 Some(&(url, title)) => {
                     out.push_str("<img src=\"");
@@ -843,10 +877,10 @@ fn emit_list_item_inner(children: &[Mdast], loose: bool, out: &mut String, defs:
             emit(child, out, defs);
         }
     }
-    if let Some(&tail) = results.last() {
-        if loose || !is_paragraph(tail) {
-            out.push('\n');
-        }
+    if let Some(&tail) = results.last()
+        && (loose || !is_paragraph(tail))
+    {
+        out.push('\n');
     }
     out.push_str("</li>");
 }
@@ -927,7 +961,7 @@ pub fn to_mdast_opts(src: &str, opts: crate::Options) -> Mdast {
 
 /// Like [`to_mdast_opts`] but builds the tree WITHOUT unist `position` — for the
 /// HTML-render path, which never reads it. Skips the UTF-16 prefix-table build and
-/// the source copy in [`PosCtx`], and emits bare nodes instead of wrapping every
+/// the source copy in `PosCtx`, and emits bare nodes instead of wrapping every
 /// one in `Mdast::Positioned`. The resulting tree renders byte-identically; only
 /// the `position` metadata (unused by the renderer) is absent.
 pub fn to_mdast_opts_nopos(src: &str, opts: crate::Options) -> Mdast {
@@ -1189,7 +1223,11 @@ fn block(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> (Mdast
         #[cfg(feature = "deflist")]
         Kind::DefDesc => {
             let eb = ctx.rtrim_nl(se);
-            let para = ctx.wrap(sb, eb, Mdast::Paragraph(inline(tree, idx, scratch, ctx, sb, eb)));
+            let para = ctx.wrap(
+                sb,
+                eb,
+                Mdast::Paragraph(inline(tree, idx, scratch, ctx, sb, eb)),
+            );
             (
                 Mdast::DefListDescription {
                     spread: node.level == 1,
@@ -1446,11 +1484,11 @@ fn build_inline(
                     .push(wrapm(start, end, Mdast::Break));
             }
             InlineTok::Image { url, title, alt } => {
-                stack
-                    .last_mut()
-                    .unwrap()
-                    .1
-                    .push(wrapm(start, end, Mdast::Image { url, title, alt }));
+                stack.last_mut().unwrap().1.push(wrapm(
+                    start,
+                    end,
+                    Mdast::Image { url, title, alt },
+                ));
             }
             InlineTok::ImageRef {
                 identifier,
