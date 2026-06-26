@@ -47,7 +47,8 @@ pub(crate) fn render_with(tree: &Tree, out: &mut String, scratch: &mut Scratch) 
         render_footnote_section(tree, out, scratch);
     }
     // External-link transform: a single post-render pass over the finished HTML.
-    if tree.opts.external_links {
+    #[cfg(feature = "external_links")]
+    if Options::EXTERNAL_LINKS && tree.opts.external_links {
         decorate_external_links(out);
     }
 }
@@ -59,6 +60,7 @@ pub(crate) fn render_with(tree: &Tree, out: &mut String, scratch: &mut Scratch) 
 /// rehype transform also decorates). `rel` is inserted before the tag's `>`, after
 /// any `href`/`title` (matching hast property order); the scan is quote-aware so a
 /// `>` inside an attribute value is not mistaken for the tag end.
+#[cfg(feature = "external_links")]
 fn decorate_external_links(out: &mut String) {
     const PAT: &str = "<a href=\"";
     if !out.contains(PAT) {

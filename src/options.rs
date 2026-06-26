@@ -126,6 +126,15 @@ impl Options {
     #[cfg(not(feature = "frontmatter"))]
     pub(crate) const FRONTMATTER: bool = false;
 
+    /// `true` iff the `external_links` Cargo feature is compiled in. Used as
+    /// `Options::EXTERNAL_LINKS && opts.external_links` so that, without the
+    /// feature, the post-render `rel` pass folds away — the default build is
+    /// byte-for-byte the pure-CommonMark fast path.
+    #[cfg(feature = "external_links")]
+    pub(crate) const EXTERNAL_LINKS: bool = true;
+    #[cfg(not(feature = "external_links"))]
+    pub(crate) const EXTERNAL_LINKS: bool = false;
+
     /// GitHub Flavored Markdown: every GFM extension enabled. (Effective only
     /// when the crate is built with the `gfm` feature.)
     pub const fn gfm() -> Self {

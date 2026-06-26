@@ -56,6 +56,10 @@ directives = []
 # of this code is compiled — the parser stays byte-for-byte the pure-CommonMark
 # fast path.
 frontmatter = []
+# External-links extension (opt-in, OFF by default): a post-render pass adds
+# `rel="nofollow"` to `http(s)://` links (the rehype-external-links default).
+# Render-only; off, the pass is not compiled.
+external_links = []
 # Mirrors rostdown: opt-in scoped global bump allocator (src/arena.rs). An
 # embedder that enables it must install `sparkdown::ScopedAlloc` as its
 # `#[global_allocator]`. The local bump (src/bump.rs) is always on.
