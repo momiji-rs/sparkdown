@@ -1,2 +1,9 @@
 /target
 Cargo.lock
+
+# profiling artifacts
+harness/sparkdown-named.wasm
+harness/sparkdown-raw.wasm
+harness/isolate-*.log
+harness/prof*.txt
+harness/prof_loop_raw.mjs

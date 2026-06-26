@@ -84,6 +84,19 @@ fn box_html(bytes: &[u8]) -> *mut u8 {
     ret
 }
 
+/// Decode `input` as UTF-8 for parsing. `str::from_utf8`'s validation uses the
+/// word-at-a-time ASCII fast path — measurably cheaper than `String::from_utf8_lossy`'s
+/// `Utf8Chunks` iterator (~12% of parse time on the profile). Invalid UTF-8 (rare — the
+/// JS glue always sends `TextEncoder` output) falls back to lossy U+FFFD replacement so
+/// the boundary stays total.
+#[inline]
+fn input_str(input: &[u8]) -> std::borrow::Cow<'_, str> {
+    match core::str::from_utf8(input) {
+        Ok(s) => std::borrow::Cow::Borrowed(s),
+        Err(_) => String::from_utf8_lossy(input),
+    }
+}
+
 /// Render `len` UTF-8 bytes at `ptr` to HTML. Returns a pointer to a buffer
 /// `[u32 little-endian length][HTML bytes]`; free it with
 /// [`sparkdown_free`]`(ret, 4 + length)`.
@@ -93,7 +106,7 @@ fn box_html(bytes: &[u8]) -> *mut u8 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sparkdown_to_html(ptr: *const u8, len: usize) -> *mut u8 {
     let input = unsafe { core::slice::from_raw_parts(ptr, len) };
-    let md = String::from_utf8_lossy(input);
+    let md = input_str(input);
     RENDERER.with(|cell| box_html(cell.borrow_mut().render(&md).as_bytes()))
 }
 
@@ -108,7 +121,7 @@ pub unsafe extern "C" fn sparkdown_to_html(ptr: *const u8, len: usize) -> *mut u
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sparkdown_to_mdast_json(ptr: *const u8, len: usize) -> *mut u8 {
     let input = unsafe { core::slice::from_raw_parts(ptr, len) };
-    let md = String::from_utf8_lossy(input);
+    let md = input_str(input);
     box_html(crate::ast::to_mdast_json(&md).as_bytes())
 }
 
@@ -128,7 +141,7 @@ pub unsafe extern "C" fn sparkdown_to_html_via_mdast_opts(
     flags: u32,
 ) -> *mut u8 {
     let input = unsafe { core::slice::from_raw_parts(ptr, len) };
-    let md = String::from_utf8_lossy(input);
+    let md = input_str(input);
     let tree = crate::ast::to_mdast_opts_nopos(&md, opts_from_flags(flags));
     let mut out = String::with_capacity(md.len() + md.len() / 8 + 64);
     crate::ast::render_mdast_into(&tree, &mut out);
@@ -146,7 +159,7 @@ pub unsafe extern "C" fn sparkdown_to_html_via_mdast_opts(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sparkdown_to_mdast_wire(ptr: *const u8, len: usize) -> *mut u8 {
     let input = unsafe { core::slice::from_raw_parts(ptr, len) };
-    let md = String::from_utf8_lossy(input);
+    let md = input_str(input);
     box_html(&crate::ast::to_mdast_wire(&md))
 }
 
@@ -166,7 +179,7 @@ pub unsafe extern "C" fn sparkdown_to_mdast_json_opts(
     flags: u32,
 ) -> *mut u8 {
     let input = unsafe { core::slice::from_raw_parts(ptr, len) };
-    let md = String::from_utf8_lossy(input);
+    let md = input_str(input);
     let opts = opts_from_flags(flags);
     box_html(crate::ast::to_mdast_json_opts(&md, opts).as_bytes())
 }
@@ -185,7 +198,7 @@ pub unsafe extern "C" fn sparkdown_to_mdast_wire_opts(
     flags: u32,
 ) -> *mut u8 {
     let input = unsafe { core::slice::from_raw_parts(ptr, len) };
-    let md = String::from_utf8_lossy(input);
+    let md = input_str(input);
     let opts = opts_from_flags(flags);
     box_html(&crate::ast::to_mdast_wire_opts(&md, opts))
 }
@@ -208,7 +221,7 @@ pub unsafe extern "C" fn sparkdown_to_mdast_wire_nopos_opts(
     flags: u32,
 ) -> *mut u8 {
     let input = unsafe { core::slice::from_raw_parts(ptr, len) };
-    let md = String::from_utf8_lossy(input);
+    let md = input_str(input);
     let opts = opts_from_flags(flags);
     box_html(&crate::ast::to_mdast_wire_nopos_opts(&md, opts))
 }
@@ -231,7 +244,7 @@ pub unsafe extern "C" fn sparkdown_to_mdast_wire_fast_opts(
     flags: u32,
 ) -> *mut u8 {
     let input = unsafe { core::slice::from_raw_parts(ptr, len) };
-    let md = String::from_utf8_lossy(input);
+    let md = input_str(input);
     let opts = opts_from_flags(flags);
     box_html(&crate::ast::to_mdast_wire_fast_opts(&md, opts))
 }
@@ -250,7 +263,7 @@ pub unsafe extern "C" fn sparkdown_to_mdast_wire_fast_opts(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sparkdown_to_html_opts(ptr: *const u8, len: usize, flags: u32) -> *mut u8 {
     let input = unsafe { core::slice::from_raw_parts(ptr, len) };
-    let md = String::from_utf8_lossy(input);
+    let md = input_str(input);
     let opts = opts_from_flags(flags);
     RENDERER.with(|cell| {
         let mut r = cell.borrow_mut();
