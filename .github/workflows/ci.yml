@@ -33,6 +33,8 @@ jobs:
         run: cargo test --features arena --verbose
       - name: Test (gfm feature) — GFM extensions + 652 conformance
         run: cargo test --features gfm --verbose
+      - name: Test (full + ast) — every extension + mdast + 652 conformance
+        run: cargo test --features full,ast --verbose
 
   fmt:
     name: rustfmt
