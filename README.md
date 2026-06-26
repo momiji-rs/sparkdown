@@ -166,10 +166,11 @@ Within any bundle, `toHtml(md, { footnotes: false, tables: true, … })` switche
 extensions **per call** — no rebuild, the flags fold to no-ops for whatever the
 bundle didn't compile.
 
-> **Status:** `gfm`, `footnotes`, `emoji`, and `diagram` are feature-gated today.
-> `frontmatter` / `external_links` / `deflist` / `directives` are being gated with
-> the same (measured moat-neutral) technique; the `full` bundle and the leanest
-> `pure` build land as that completes.
+> **Status:** every extension is now feature-gated and **measured moat-neutral** —
+> the lean `pure` build drops ~43 KB of extension code versus an all-in build, and
+> the default-path instruction count is unchanged (a few are *faster*). The crate's
+> `gfm` and `full` umbrella features ship today (`features = ["full"]`); on npm,
+> `@momiji-rs/sparkdown` and `…/gfm` are published and `…/full` is being wired.
 
 ## WebAssembly
 

@@ -60,6 +60,10 @@ frontmatter = []
 # `rel="nofollow"` to `http(s)://` links (the rehype-external-links default).
 # Render-only; off, the pass is not compiled.
 external_links = []
+# Umbrella features for the shipped bundles (see the README "Extension bundles"
+# matrix). `extras` = every non-GFM extension; `full` = GFM + extras = everything.
+extras = ["frontmatter", "emoji", "external_links", "diagram", "deflist", "directives"]
+full = ["gfm", "extras"]
 # Mirrors rostdown: opt-in scoped global bump allocator (src/arena.rs). An
 # embedder that enables it must install `sparkdown::ScopedAlloc` as its
 # `#[global_allocator]`. The local bump (src/bump.rs) is always on.
