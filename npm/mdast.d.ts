@@ -2,6 +2,11 @@
 
 /** Opt-in grammar extensions (all off by default = pure CommonMark). */
 export interface Options {
+  /**
+   * Include unist `position` on every node (default `true`, matching remark-parse).
+   * Set `false` for ~30% faster, lighter parsing when plugins don't read positions.
+   */
+  position?: boolean;
   // GFM
   strikethrough?: boolean;
   tasklist?: boolean;

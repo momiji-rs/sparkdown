@@ -37,6 +37,13 @@ for (const e of data) {
 }
 console.log(`toMdast == mdast-util-from-markdown : ${g1}/${data.length} ignoring position, ${g2}/${data.length} including position`);
 
+// { position: false } — the no-position wire must equal the canonical tree minus position
+let np = 0;
+for (const e of data) {
+  if (eq(toMdastSync(e.markdown, { position: false }), fromMarkdown(e.markdown), true)) np++;
+}
+console.log(`toMdast({position:false}) == mdast-util-from-markdown (ignoring position) : ${np}/${data.length}`);
+
 // (2) drop-in in a real unified pipeline: same HTML as remark-parse
 const sparkProc = unified().use(sparkdownParse).use(remarkRehype).use(rehypeStringify);
 const remarkProc = unified().use(remarkParse).use(remarkRehype).use(rehypeStringify);
@@ -65,7 +72,8 @@ const bench = (fn) => {
   return b;
 };
 const rows = [
-  ['sparkdown toMdast (wasm wire, materialized)', () => toMdastSync(md)],
+  ['sparkdown toMdast (materialized, with position)', () => toMdastSync(md)],
+  ['sparkdown toMdast (materialized, no position)', () => toMdastSync(md, { position: false })],
   ['remark-parse (mdast-util-from-markdown)', () => fromMarkdown(md)],
   ['satteri markdownToMdast (lazy handle)', () => markdownToMdast(md, satFeat)],
 ];

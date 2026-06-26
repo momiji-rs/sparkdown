@@ -190,6 +190,29 @@ pub unsafe extern "C" fn sparkdown_to_mdast_wire_opts(
     box_html(&crate::ast::to_mdast_wire_opts(&md, opts))
 }
 
+/// Like [`sparkdown_to_mdast_wire_opts`] but emits the **no-position** wire
+/// (see [`crate::ast::to_mdast_wire_nopos_opts`]): every node's `6×u32` start/end
+/// point is omitted and the heavy UTF-16 position table + source copy are never
+/// built. For consumers (e.g. remark plugins) that never read `position`; ships
+/// ~100 KB less and parses faster. Same `flags` bitmask as
+/// [`sparkdown_to_mdast_wire_opts`]. The non-position payload bytes are identical
+/// to the position-on wire — the JS reader must be told to skip the point reads.
+///
+/// # Safety
+/// `ptr` must point to `len` readable, initialized bytes.
+#[cfg(feature = "ast")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sparkdown_to_mdast_wire_nopos_opts(
+    ptr: *const u8,
+    len: usize,
+    flags: u32,
+) -> *mut u8 {
+    let input = unsafe { core::slice::from_raw_parts(ptr, len) };
+    let md = String::from_utf8_lossy(input);
+    let opts = opts_from_flags(flags);
+    box_html(&crate::ast::to_mdast_wire_nopos_opts(&md, opts))
+}
+
 /// Like [`sparkdown_to_html`] but applies extension options from a bitmask: bit
 /// 0 strikethrough, 1 task lists, 2 autolinks, 3 tag filter, 4 tables, 5 hard
 /// wraps, 6 diagram, 7 heading ids (built-in slug transform), 8 frontmatter

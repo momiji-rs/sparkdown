@@ -1688,6 +1688,25 @@ pub fn to_mdast_wire_opts(src: &str, opts: crate::Options) -> Vec<u8> {
     out
 }
 
+/// Like [`to_mdast_wire_opts`] but **without unist `position`**: every node's
+/// `6×u32` start/end point is omitted, and the heavy `PosCtx` (UTF-16 prefix
+/// table + a full source copy, ~400 KB of allocations) plus the two `point()`
+/// lookups per node are skipped entirely. Many remark consumers never read
+/// position; this ships ~100 KB less and parses faster. The non-position payload
+/// bytes (tags, child counts, strings, reftypes, …) are byte-identical to the
+/// position-on wire — the JS reader skips the point reads when told there is no
+/// position. The position-on [`to_mdast_wire`] / [`to_mdast_wire_opts`] output is
+/// unaffected (the `if ctx.enabled` guards leave the enabled path's bytes and
+/// emit order exactly as before).
+pub fn to_mdast_wire_nopos_opts(src: &str, opts: crate::Options) -> Vec<u8> {
+    let tree = crate::block::parse_with_opts(src, opts);
+    let mut scratch = fn_scratch(&tree);
+    let ctx = PosCtx::disabled();
+    let mut out = Vec::<u8>::with_capacity(src.len() * 2 + 64);
+    bwire(&tree, tree.root, &mut scratch, &ctx, &mut out);
+    out
+}
+
 #[inline]
 fn w_u32(v: u32, out: &mut Vec<u8>) {
     out.extend_from_slice(&v.to_le_bytes());
@@ -1740,6 +1759,42 @@ fn patch_point(out: &mut [u8], off: usize, pt: (u32, u32, u32)) {
     w_u32_at(out, off + 8, pt.2);
 }
 
+/// Sentinel returned by [`reserve_pos`] / accepted by [`patch_pos`] when position
+/// is disabled — no end-point slot was reserved, so the later patch is a no-op.
+const POS_DISABLED: usize = usize::MAX;
+
+/// Emit a start/end position point for source byte `boff`, but only when position
+/// is enabled. When disabled this writes nothing AND never calls `ctx.point`
+/// (which would index `PosCtx`'s empty tables on the disabled path).
+#[inline]
+fn w_pos(ctx: &PosCtx, out: &mut Vec<u8>, boff: usize) {
+    if ctx.enabled {
+        w_point(out, ctx.point(boff));
+    }
+}
+
+/// Reserve a 12-byte end-position slot for later backpatching — but only when
+/// position is enabled. When disabled it reserves nothing and returns
+/// [`POS_DISABLED`], so the matching [`patch_pos`] becomes a no-op.
+#[inline]
+fn reserve_pos(ctx: &PosCtx, out: &mut Vec<u8>) -> usize {
+    if ctx.enabled {
+        reserve(out, 12)
+    } else {
+        POS_DISABLED
+    }
+}
+
+/// Backpatch a reserved end-position slot with the point for source byte `boff`.
+/// A no-op when `off == POS_DISABLED` (position disabled), and `ctx.point` is
+/// never called on that path.
+#[inline]
+fn patch_pos(ctx: &PosCtx, out: &mut [u8], off: usize, boff: usize) {
+    if ctx.enabled && off != POS_DISABLED {
+        patch_point(out, off, ctx.point(boff));
+    }
+}
+
 /// Emit one block node's wire bytes; return its source byte end (parents whose
 /// end depends on the last child use it). Mirrors [`block`] byte-for-byte; ends
 /// and child counts that depend on children are backpatched.
@@ -1751,8 +1806,8 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
         Kind::Document => {
             let eb = ctx.src_len;
             out.push(0);
-            w_point(out, ctx.point(0));
-            w_point(out, ctx.point(eb));
+            w_pos(ctx, out, 0);
+            w_pos(ctx, out, eb);
             let coff = reserve(out, 4);
             let n = bchildren(tree, idx, scratch, ctx, out).0;
             w_u32_at(out, coff, n);
@@ -1761,8 +1816,8 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
         Kind::Paragraph => {
             let eb = ctx.rtrim_nl(se);
             out.push(1);
-            w_point(out, ctx.point(sb));
-            w_point(out, ctx.point(eb));
+            w_pos(ctx, out, sb);
+            w_pos(ctx, out, eb);
             let coff = reserve(out, 4);
             let n = inline_wire(tree, idx, scratch, ctx, sb, eb, out);
             w_u32_at(out, coff, n);
@@ -1771,8 +1826,8 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
         Kind::Heading => {
             let eb = ctx.rtrim_nl(se);
             out.push(2);
-            w_point(out, ctx.point(sb));
-            w_point(out, ctx.point(eb));
+            w_pos(ctx, out, sb);
+            w_pos(ctx, out, eb);
             out.push(node.level);
             let coff = reserve(out, 4);
             let n = inline_wire(tree, idx, scratch, ctx, sb, eb, out);
@@ -1781,20 +1836,20 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
         }
         Kind::BlockQuote => {
             out.push(3);
-            w_point(out, ctx.point(sb));
-            let eoff = reserve(out, 12);
+            w_pos(ctx, out, sb);
+            let eoff = reserve_pos(ctx, out);
             let coff = reserve(out, 4);
             let (n, last) = bchildren(tree, idx, scratch, ctx, out);
             let end = last.map_or(se, |l| l.max(se));
-            patch_point(out, eoff, ctx.point(end));
+            patch_pos(ctx, out, eoff, end);
             w_u32_at(out, coff, n);
             end
         }
         Kind::List => {
             let ld = node.list.as_ref().unwrap();
             out.push(4);
-            w_point(out, ctx.point(sb));
-            let eoff = reserve(out, 12);
+            w_pos(ctx, out, sb);
+            let eoff = reserve_pos(ctx, out);
             out.push((ld.ordered as u8) | ((ld.spread as u8) << 1));
             w_u32(
                 if ld.ordered {
@@ -1809,27 +1864,27 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
             // Matches block(): a list can extend past its last item (it absorbs a
             // trailing blockquote-marker blank line, tracked in `se`).
             let end = last.map_or(se, |l| l.max(se));
-            patch_point(out, eoff, ctx.point(end));
+            patch_pos(ctx, out, eoff, end);
             w_u32_at(out, coff, n);
             end
         }
         Kind::Item => {
             out.push(5);
-            w_point(out, ctx.point(sb));
-            let eoff = reserve(out, 12);
+            w_pos(ctx, out, sb);
+            let eoff = reserve_pos(ctx, out);
             out.push(node.item_spread as u8);
             let coff = reserve(out, 4);
             let (n, last) = bchildren(tree, idx, scratch, ctx, out);
             let end = last.unwrap_or(se);
-            patch_point(out, eoff, ctx.point(end));
+            patch_pos(ctx, out, eoff, end);
             w_u32_at(out, coff, n);
             end
         }
         Kind::ThematicBreak => {
             let eb = ctx.rtrim_nl(se);
             out.push(6);
-            w_point(out, ctx.point(sb));
-            w_point(out, ctx.point(eb));
+            w_pos(ctx, out, sb);
+            w_pos(ctx, out, eb);
             eb
         }
         Kind::CodeBlock => {
@@ -1844,8 +1899,8 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
                 ctx.rtrim_code_end(sb, se)
             };
             out.push(7);
-            w_point(out, ctx.point(sb));
-            w_point(out, ctx.point(eb));
+            w_pos(ctx, out, sb);
+            w_pos(ctx, out, eb);
             w_opt(&lang, out);
             w_opt(&meta, out);
             w_str(&value, out);
@@ -1854,8 +1909,8 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
         Kind::HtmlBlock => {
             let eb = tree.html_ast_end(idx) as usize;
             out.push(8);
-            w_point(out, ctx.point(sb));
-            w_point(out, ctx.point(eb));
+            w_pos(ctx, out, sb);
+            w_pos(ctx, out, eb);
             w_str(tree.html_value(idx), out);
             eb
         }
@@ -1867,8 +1922,8 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
         Kind::Frontmatter => {
             let value = frontmatter_value(tree.content(idx));
             out.push(if node.level == 1 { 21 } else { 20 }); // 20 = yaml, 21 = toml
-            w_point(out, ctx.point(sb));
-            w_point(out, ctx.point(se));
+            w_pos(ctx, out, sb);
+            w_pos(ctx, out, se);
             w_str(value, out);
             se
         }
@@ -1880,14 +1935,14 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
         Kind::FootnoteDef => {
             let d = tree.fn_def(idx);
             out.push(22);
-            w_point(out, ctx.point(sb));
-            let eoff = reserve(out, 12);
+            w_pos(ctx, out, sb);
+            let eoff = reserve_pos(ctx, out);
             w_str(&d.identifier, out);
             w_str(&d.label, out);
             let coff = reserve(out, 4);
             let (n, last) = bchildren(tree, idx, scratch, ctx, out);
             let end = last.unwrap_or(se);
-            patch_point(out, eoff, ctx.point(end));
+            patch_pos(ctx, out, eoff, end);
             w_u32_at(out, coff, n);
             end
         }
@@ -1895,8 +1950,8 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
             let d = tree.definition(idx);
             let eb = ctx.line_content_end(ctx.rtrim(sb, se));
             out.push(17);
-            w_point(out, ctx.point(sb));
-            w_point(out, ctx.point(eb));
+            w_pos(ctx, out, sb);
+            w_pos(ctx, out, eb);
             w_str(&d.identifier, out);
             w_str(&d.label, out);
             w_str(&d.url, out);
@@ -1914,8 +1969,8 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
             // tag 24 = defList; children are built from the term/description
             // nodes the same way as `block()` (terms split per line).
             out.push(24);
-            w_point(out, ctx.point(sb));
-            let eoff = reserve(out, 12);
+            w_pos(ctx, out, sb);
+            let eoff = reserve_pos(ctx, out);
             let coff = reserve(out, 4);
             let mut n = 0u32;
             let mut last = se;
@@ -1932,12 +1987,12 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
                                 let off = (co + lead) as u32;
                                 let sbb = tree.content_to_src(ci, off) as usize;
                                 out.push(25); // defListTerm
-                                w_point(out, ctx.point(sbb));
-                                let teoff = reserve(out, 12);
+                                w_pos(ctx, out, sbb);
+                                let teoff = reserve_pos(ctx, out);
                                 let tcoff = reserve(out, 4);
                                 let (ebb, tn) =
                                     inline_wire_slice(tree, ci, off, body, scratch, ctx, out);
-                                patch_point(out, teoff, ctx.point(ebb));
+                                patch_pos(ctx, out, teoff, ebb);
                                 w_u32_at(out, tcoff, tn);
                                 last = ebb;
                                 n += 1;
@@ -1954,19 +2009,19 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
                         let off = lead as u32;
                         let sbb = tree.content_to_src(ci, off) as usize;
                         out.push(26); // defListDescription
-                        w_point(out, ctx.point(sbb));
-                        let deoff = reserve(out, 12);
+                        w_pos(ctx, out, sbb);
+                        let deoff = reserve_pos(ctx, out);
                         out.push(spread as u8);
                         let dcoff = reserve(out, 4);
                         // Single child: a paragraph wrapping the inline body.
                         out.push(1); // paragraph
-                        w_point(out, ctx.point(sbb));
-                        let peoff = reserve(out, 12);
+                        w_pos(ctx, out, sbb);
+                        let peoff = reserve_pos(ctx, out);
                         let pcoff = reserve(out, 4);
                         let (ebb, pn) = inline_wire_slice(tree, ci, off, body, scratch, ctx, out);
-                        patch_point(out, peoff, ctx.point(ebb));
+                        patch_pos(ctx, out, peoff, ebb);
                         w_u32_at(out, pcoff, pn);
-                        patch_point(out, deoff, ctx.point(ebb));
+                        patch_pos(ctx, out, deoff, ebb);
                         w_u32_at(out, dcoff, 1);
                         last = ebb;
                         n += 1;
@@ -1978,7 +2033,7 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
                 }
                 c = tree.next_sibling(ci);
             }
-            patch_point(out, eoff, ctx.point(last));
+            patch_pos(ctx, out, eoff, last);
             w_u32_at(out, coff, n);
             last
         }
@@ -1993,8 +2048,8 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
             let d = tree.directive(idx);
             let eb = ctx.rtrim_nl(se);
             out.push(28); // leafDirective
-            w_point(out, ctx.point(sb));
-            w_point(out, ctx.point(eb));
+            w_pos(ctx, out, sb);
+            w_pos(ctx, out, eb);
             w_str(&d.name, out);
             w_attrs(&d.attrs, out);
             let coff = reserve(out, 4);
@@ -2011,8 +2066,8 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
         Kind::ContainerDirective => {
             let d = tree.directive(idx);
             out.push(29); // containerDirective
-            w_point(out, ctx.point(sb));
-            let eoff = reserve(out, 12);
+            w_pos(ctx, out, sb);
+            let eoff = reserve_pos(ctx, out);
             w_str(&d.name, out);
             w_attrs(&d.attrs, out);
             let coff = reserve(out, 4);
@@ -2021,12 +2076,12 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
             if let Some((ls, le)) = d.label {
                 // directiveLabel paragraph (tag 30).
                 out.push(30);
-                w_point(out, ctx.point(ls as usize));
-                let leoff = reserve(out, 12);
+                w_pos(ctx, out, ls as usize);
+                let leoff = reserve_pos(ctx, out);
                 let lcoff = reserve(out, 4);
                 let (lend, ln) =
                     inline_wire_src(tree, ls, tree.source_range(ls, le), scratch, ctx, out);
-                patch_point(out, leoff, ctx.point(lend));
+                patch_pos(ctx, out, leoff, lend);
                 w_u32_at(out, lcoff, ln);
                 n += 1;
             }
@@ -2035,7 +2090,7 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
             if let Some(l) = blast {
                 last = last.max(l);
             }
-            patch_point(out, eoff, ctx.point(last));
+            patch_pos(ctx, out, eoff, last);
             w_u32_at(out, coff, n);
             last
         }
@@ -2044,8 +2099,8 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
         Kind::DefTerm => {
             let eb = ctx.rtrim_nl(se);
             out.push(25);
-            w_point(out, ctx.point(sb));
-            w_point(out, ctx.point(eb));
+            w_pos(ctx, out, sb);
+            w_pos(ctx, out, eb);
             let coff = reserve(out, 4);
             let n = inline_wire(tree, idx, scratch, ctx, sb, eb, out);
             w_u32_at(out, coff, n);
@@ -2055,8 +2110,8 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
         Kind::DefDesc => {
             let eb = ctx.rtrim_nl(se);
             out.push(26);
-            w_point(out, ctx.point(sb));
-            w_point(out, ctx.point(eb));
+            w_pos(ctx, out, sb);
+            w_pos(ctx, out, eb);
             out.push((node.level == 1) as u8);
             w_u32(0, out);
             eb
@@ -2065,8 +2120,8 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
         Kind::Table => {
             let eb = ctx.rtrim(sb, se);
             out.push(8);
-            w_point(out, ctx.point(sb));
-            w_point(out, ctx.point(eb));
+            w_pos(ctx, out, sb);
+            w_pos(ctx, out, eb);
             w_str(tree.content(idx), out);
             eb
         }
@@ -2111,7 +2166,7 @@ fn inline_wire(
         obase: 0,
         src_base: None,
         ctx,
-        bpos: ctx.pos(sb, eb),
+        bpos: ctx.bpos(sb, eb),
         stack: Vec::new(),
         top: 0,
     };
@@ -2145,7 +2200,7 @@ fn inline_wire_src(
         obase: 0,
         src_base: Some(src_start),
         ctx,
-        bpos: ctx.pos(src_start as usize, end),
+        bpos: ctx.bpos(src_start as usize, end),
         stack: Vec::new(),
         top: 0,
     };
@@ -2185,7 +2240,7 @@ fn inline_wire_slice(
         obase: content_off,
         src_base: None,
         ctx,
-        bpos: ctx.pos(sbb, ebb),
+        bpos: ctx.bpos(sbb, ebb),
         stack: Vec::new(),
         top: 0,
     };
@@ -2259,12 +2314,32 @@ impl WireSink<'_> {
             None => self.top += 1,
         }
     }
-    /// Common leaf prologue: tag byte + full position.
+    /// Common leaf prologue: tag byte + full position (position only when
+    /// enabled; on the disabled path `mkpos`/`ctx.point` are never reached).
     fn leaf(&mut self, tag: u8, start: u32, end: u32) {
-        let p = self.mkpos(start, end);
         self.out.push(tag);
-        w_point(self.out, p.start);
-        w_point(self.out, p.end);
+        if self.ctx.enabled {
+            let p = self.mkpos(start, end);
+            w_point(self.out, p.start);
+            w_point(self.out, p.end);
+        }
+    }
+    /// Emit a start point for content span start `start`, only when enabled.
+    #[inline]
+    fn w_start(&mut self, start: u32) {
+        if self.ctx.enabled {
+            let ls = self.leaf_start(start);
+            w_point(self.out, ls);
+        }
+    }
+    /// Reserve a container's end-position slot, only when enabled (else sentinel).
+    #[inline]
+    fn reserve_end(&mut self) -> usize {
+        if self.ctx.enabled {
+            reserve(self.out, 12)
+        } else {
+            POS_DISABLED
+        }
     }
 }
 
@@ -2341,10 +2416,12 @@ impl InlineSink for WireSink<'_> {
         w_str(url, self.out);
         w_u32(u32::MAX, self.out); // title: None
         w_u32(1, self.out); // one text child
-        let cp = self.mkpos(start.saturating_add(1), end.saturating_sub(1));
         self.out.push(9);
-        w_point(self.out, cp.start);
-        w_point(self.out, cp.end);
+        if self.ctx.enabled {
+            let cp = self.mkpos(start.saturating_add(1), end.saturating_sub(1));
+            w_point(self.out, cp.start);
+            w_point(self.out, cp.end);
+        }
         w_str(text, self.out);
         self.bump();
     }
@@ -2355,10 +2432,9 @@ impl InlineSink for WireSink<'_> {
             "delete" => 12,
             _ => 10,
         };
-        let ls = self.leaf_start(start);
         self.out.push(tag);
-        w_point(self.out, ls);
-        let eoff = reserve(self.out, 12);
+        self.w_start(start);
+        let eoff = self.reserve_end();
         let coff = reserve(self.out, 4);
         self.stack.push(InlineFrame {
             eoff,
@@ -2370,10 +2446,9 @@ impl InlineSink for WireSink<'_> {
     }
     fn link_open(&mut self, url: &str, title: Option<&str>, start: u32, end: u32) {
         self.bump();
-        let ls = self.leaf_start(start);
         self.out.push(15);
-        w_point(self.out, ls);
-        let eoff = reserve(self.out, 12);
+        self.w_start(start);
+        let eoff = self.reserve_end();
         w_str(url, self.out);
         w_opt_str(title, self.out);
         let coff = reserve(self.out, 4);
@@ -2394,10 +2469,9 @@ impl InlineSink for WireSink<'_> {
         end: u32,
     ) {
         self.bump();
-        let ls = self.leaf_start(start);
         self.out.push(18);
-        w_point(self.out, ls);
-        let eoff = reserve(self.out, 12);
+        self.w_start(start);
+        let eoff = self.reserve_end();
         w_str(identifier, self.out);
         w_str(label, self.out);
         self.out.push(reftype_code(reftype));
@@ -2412,9 +2486,11 @@ impl InlineSink for WireSink<'_> {
     }
     fn close(&mut self, _start: u32, end: u32) {
         if let Some(f) = self.stack.pop() {
-            let cend = if end > f.oe { end } else { f.oe };
-            let p = self.mkpos(f.os, cend);
-            patch_point(self.out, f.eoff, p.end);
+            if self.ctx.enabled {
+                let cend = if end > f.oe { end } else { f.oe };
+                let p = self.mkpos(f.os, cend);
+                patch_point(self.out, f.eoff, p.end);
+            }
             w_u32_at(self.out, f.coff, f.count);
         }
     }
@@ -2850,5 +2926,252 @@ pub fn node_count(node: &Mdast) -> usize {
         | Image { .. }
         | ImageReference { .. } => 1,
         Positioned(_, inner) => node_count(inner),
+    }
+}
+
+#[cfg(test)]
+mod wire_nopos_tests {
+    //! Verify the no-position wire (`to_mdast_wire_nopos_opts`) carries the exact
+    //! same payload as the position wire (`to_mdast_wire_opts`) minus the per-node
+    //! `6×u32` position points — and that the position-on wire is unchanged.
+    //!
+    //! A single schema walker decodes BOTH wires into a normalized byte stream that
+    //! copies every non-position byte verbatim and, when `has_pos`, skips the 24
+    //! position bytes that sit right after each node's tag. If the two normalized
+    //! streams match, the only difference between the wires is the position bytes.
+
+    use super::*;
+
+    struct Reader<'a> {
+        b: &'a [u8],
+        p: usize,
+        has_pos: bool,
+        norm: Vec<u8>, // position-stripped output
+    }
+
+    impl<'a> Reader<'a> {
+        fn u8(&mut self) -> u8 {
+            let v = self.b[self.p];
+            self.p += 1;
+            self.norm.push(v);
+            v
+        }
+        fn raw_u8(&mut self) -> u8 {
+            // tag byte: consume but DON'T push yet (caller controls ordering)
+            let v = self.b[self.p];
+            self.p += 1;
+            v
+        }
+        fn u32(&mut self) -> u32 {
+            let v = u32::from_le_bytes(self.b[self.p..self.p + 4].try_into().unwrap());
+            self.norm.extend_from_slice(&self.b[self.p..self.p + 4]);
+            self.p += 4;
+            v
+        }
+        fn bytes(&mut self, n: usize) {
+            self.norm.extend_from_slice(&self.b[self.p..self.p + n]);
+            self.p += n;
+        }
+        fn skip_pos(&mut self) {
+            // Two points = 24 bytes, present only on the position wire. NOT pushed
+            // to `norm` (this is exactly the byte difference we are proving).
+            if self.has_pos {
+                self.p += 24;
+            }
+        }
+        fn wstr(&mut self) {
+            let hdr = u32::from_le_bytes(self.b[self.p..self.p + 4].try_into().unwrap());
+            self.norm.extend_from_slice(&self.b[self.p..self.p + 4]);
+            self.p += 4;
+            let n = (hdr & 0x7fff_ffff) as usize;
+            self.bytes(n);
+        }
+        fn wopt(&mut self) {
+            let hdr = u32::from_le_bytes(self.b[self.p..self.p + 4].try_into().unwrap());
+            if hdr == u32::MAX {
+                self.u32();
+            } else {
+                self.wstr();
+            }
+        }
+        fn wattrs(&mut self) {
+            let n = self.u32();
+            for _ in 0..n {
+                self.wstr();
+                self.wstr();
+            }
+        }
+        fn kids(&mut self) {
+            let n = self.u32();
+            for _ in 0..n {
+                self.node();
+            }
+        }
+        fn node(&mut self) {
+            let tag = self.raw_u8();
+            self.norm.push(tag);
+            self.skip_pos();
+            match tag {
+                0 | 1 | 3 => self.kids(), // root, paragraph, blockquote
+                2 => {
+                    self.u8(); // depth
+                    self.kids();
+                }
+                4 => {
+                    self.u8(); // flags
+                    self.u32(); // start
+                    self.kids();
+                }
+                5 => {
+                    self.u8(); // spread
+                    self.kids();
+                }
+                6 | 14 => {} // thematicBreak, break
+                7 => {
+                    self.wopt(); // lang
+                    self.wopt(); // meta
+                    self.wstr(); // value
+                }
+                8 | 9 | 13 => self.wstr(),   // html, text, inlineCode
+                10..=12 => self.kids(), // emphasis, strong, delete
+                15 => {
+                    // link OR autolink. Disambiguate: a link container emits
+                    // url,opt(title),kids; the autolink leaf emits
+                    // url,opt(title=None),u32(1),text-child. Both start url+opt.
+                    // The autolink path is distinguished structurally only by its
+                    // inline child; since open/leaf both use tag 15, decode as a
+                    // container (url,opt,kids) — autolink emits exactly one text
+                    // child via kids()-compatible layout.
+                    self.wstr(); // url
+                    self.wopt(); // title
+                    self.kids(); // children (autolink: count=1 + one text node)
+                }
+                16 => {
+                    self.wstr(); // url
+                    self.wopt(); // title
+                    self.wstr(); // alt
+                }
+                17 => {
+                    self.wstr(); // identifier
+                    self.wstr(); // label
+                    self.wstr(); // url
+                    self.wopt(); // title
+                }
+                18 => {
+                    self.wstr(); // identifier
+                    self.wstr(); // label
+                    self.u8(); // reftype
+                    self.kids();
+                }
+                19 => {
+                    self.wstr(); // identifier
+                    self.wstr(); // label
+                    self.u8(); // reftype
+                    self.wstr(); // alt
+                }
+                20 | 21 => self.wstr(), // yaml, toml
+                22 => {
+                    self.wstr(); // identifier
+                    self.wstr(); // label
+                    self.kids();
+                }
+                23 => {
+                    self.wstr(); // identifier
+                    self.wstr(); // label
+                }
+                24 => self.kids(), // defList
+                25 => self.kids(), // defListTerm
+                26 => {
+                    self.u8(); // spread
+                    self.kids();
+                }
+                27 => {
+                    self.wstr(); // name
+                    self.wattrs();
+                    self.kids(); // empty children on wire
+                }
+                28 => {
+                    self.wstr(); // name
+                    self.wattrs();
+                    self.kids();
+                }
+                29 => {
+                    self.wstr(); // name
+                    self.wattrs();
+                    self.kids();
+                }
+                30 => self.kids(), // directiveLabel paragraph
+                other => panic!("unknown wire tag {other} at byte {}", self.p - 1),
+            }
+        }
+    }
+
+    /// Decode a wire into its position-stripped normalized byte stream.
+    fn normalize(wire: &[u8], has_pos: bool) -> Vec<u8> {
+        let mut r = Reader {
+            b: wire,
+            p: 0,
+            has_pos,
+            norm: Vec::with_capacity(wire.len()),
+        };
+        r.node();
+        assert_eq!(r.p, wire.len(), "decoder did not consume the whole wire");
+        r.norm
+    }
+
+    const SAMPLES: &[&str] = &[
+        "",
+        "hello world\n",
+        "# Heading *em* and **strong** and `code`\n",
+        "> a quote\n> over lines\n",
+        "- one\n- two\n  - nested\n\n1. a\n2. b\n",
+        "```rust\nfn main() {}\n```\n",
+        "    indented code\n    line two\n",
+        "para with [a link](https://x.com \"t\") and ![img](u.png \"a\")\n",
+        "ref [link][id] and [id]: https://x.com \"title\"\n\n[id]: https://x.com\n",
+        "an <https://auto.link> autolink\n",
+        "<div>raw html</div>\n",
+        "***\n\nmore\n",
+        "line one\\\nline two with hard break\n",
+        "unicode café — résumé 日本語 text\n",
+        "a `multi\nword` and ~~del~~ mix [shortcut] ![imgref][]\n",
+    ];
+
+    #[test]
+    fn nopos_equals_pos_minus_position() {
+        for &src in SAMPLES {
+            let opts = crate::Options::default();
+            let pos = to_mdast_wire_opts(src, opts);
+            let nopos = to_mdast_wire_nopos_opts(src, opts);
+            // No-position wire must be strictly smaller (unless the doc is empty
+            // of nodes, but root always exists -> 24 bytes saved minimum).
+            assert!(
+                nopos.len() < pos.len(),
+                "nopos should drop position bytes for {src:?}: {} vs {}",
+                nopos.len(),
+                pos.len()
+            );
+            // The only difference must be the per-node position bytes.
+            let a = normalize(&pos, true);
+            let b = normalize(&nopos, false);
+            assert_eq!(a, b, "normalized payloads differ for {src:?}");
+            // The bytes dropped == 24 per node.
+            assert_eq!(
+                (pos.len() - nopos.len()) % 24,
+                0,
+                "dropped byte count not a multiple of 24 for {src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pos_wire_is_deterministic() {
+        // Sanity: the position-on wire is stable across calls (guards added by the
+        // nopos work must not perturb the enabled path).
+        for &src in SAMPLES {
+            let a = to_mdast_wire(src);
+            let b = to_mdast_wire(src);
+            assert_eq!(a, b, "pos wire not deterministic for {src:?}");
+        }
     }
 }

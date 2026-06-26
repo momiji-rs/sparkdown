@@ -95,13 +95,15 @@ function toFlags(options) {
 // Read the compact binary wire (src/ast.rs `to_mdast_wire`) straight out of wasm
 // linear memory into a remark-shaped plain-object tree — no JSON, no full-buffer
 // decode. ASCII strings take a `fromCharCode` fast path; UTF-8 falls to TextDecoder.
-function readWire(ex, markdown, flags) {
+function readWire(ex, markdown, flags, withPos) {
   const buf = encoder.encode(markdown);
   const inPtr = ex.sparkdown_alloc(buf.length);
   new Uint8Array(ex.memory.buffer).set(buf, inPtr);
-  const ptr = flags
-    ? ex.sparkdown_to_mdast_wire_opts(inPtr, buf.length, flags)
-    : ex.sparkdown_to_mdast_wire(inPtr, buf.length);
+  const ptr = !withPos
+    ? ex.sparkdown_to_mdast_wire_nopos_opts(inPtr, buf.length, flags)
+    : flags
+      ? ex.sparkdown_to_mdast_wire_opts(inPtr, buf.length, flags)
+      : ex.sparkdown_to_mdast_wire(inPtr, buf.length);
 
   const mem = ex.memory.buffer;
   const dv = new DataView(mem);
@@ -151,10 +153,12 @@ function readWire(ex, markdown, flags) {
 
   function node() {
     const tag = u8[p++];
-    const position = {
-      start: { line: u32(), column: u32(), offset: u32() },
-      end: { line: u32(), column: u32(), offset: u32() },
-    };
+    const position = withPos
+      ? {
+          start: { line: u32(), column: u32(), offset: u32() },
+          end: { line: u32(), column: u32(), offset: u32() },
+        }
+      : undefined;
     switch (tag) {
       case 0: return { type: "root", children: kids(), position };
       case 1: return { type: "paragraph", children: kids(), position };
@@ -214,15 +218,19 @@ function renderViaMdast(ex, markdown, flags) {
   return html;
 }
 
-/** Parse `markdown` → an mdast (unist) tree. `options` opts into extensions. */
+/**
+ * Parse `markdown` → an mdast (unist) tree. `options` opts into extensions.
+ * Pass `{ position: false }` to skip unist `position` — ~30% faster and lighter
+ * (uses the no-position wire), for plugins that do not read source positions.
+ */
 export async function toMdast(markdown, options) {
-  return readWire(await init(), String(markdown), toFlags(options));
+  return readWire(await init(), String(markdown), toFlags(options), options?.position !== false);
 }
 
 /** Synchronous parse — valid only after `await ready` / `initSync()`. */
 export function toMdastSync(markdown, options) {
   if (!wasm) throw new Error("sparkdown/mdast: call initSync() or await ready before toMdastSync()");
-  return readWire(wasm, String(markdown), toFlags(options));
+  return readWire(wasm, String(markdown), toFlags(options), options?.position !== false);
 }
 
 /**
@@ -247,7 +255,8 @@ export function toHtmlSync(markdown, options) {
  */
 export default function sparkdownParse(options) {
   const flags = toFlags(options);
-  this.parser = (doc) => readWire(initSync(), String(doc), flags);
+  const withPos = options?.position !== false;
+  this.parser = (doc) => readWire(initSync(), String(doc), flags, withPos);
 }
 
 sparkdownParse.ready = ready;

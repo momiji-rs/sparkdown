@@ -90,6 +90,12 @@ const h1 = mdast.toMdastSync("# hi");
 if (h1.children[0]?.type !== "heading" || h1.children[0].depth !== 1 || h1.children[0].children[0]?.value !== "hi") {
   fail(`mdast: toMdastSync("# hi") shape → ${JSON.stringify(h1.children[0])}`);
 }
+if (h1.children[0].position === undefined) fail("mdast: default parse should carry position");
+const noPos = mdast.toMdastSync("# hi", { position: false });
+if (noPos.position !== undefined || noPos.children[0].position !== undefined) {
+  fail("mdast: { position: false } should omit position");
+}
+if (noPos.children[0].children[0]?.value !== "hi") fail("mdast: { position: false } tree shape");
 if (mdast.toHtmlSync("# *hi*\n") !== "<h1><em>hi</em></h1>\n") fail("mdast: toHtmlSync render");
 if (typeof sparkdownParse !== "function") fail("mdast: default export must be the unified Parser plugin");
 // The plugin installs `this.parser`; emulate unified attaching it.
