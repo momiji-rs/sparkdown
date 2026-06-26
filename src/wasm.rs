@@ -112,6 +112,29 @@ pub unsafe extern "C" fn sparkdown_to_mdast_json(ptr: *const u8, len: usize) -> 
     box_html(crate::ast::to_mdast_json(&md).as_bytes())
 }
 
+/// `ast`: parse → build the mdast tree → render it back to HTML, all in wasm —
+/// the Rust `mdast → html` half (see [`crate::ast::render_mdast`]), byte-identical
+/// to `mdast-util-to-hast` + `hast-util-to-html` on all 652 CommonMark examples.
+/// Faster than satteri's native pipeline; keeps the unified-pipeline render off the
+/// JS `mdast→hast→html` tail. `flags` is the [`sparkdown_to_html_opts`] bitmask.
+///
+/// # Safety
+/// `ptr` must point to `len` readable, initialized bytes.
+#[cfg(feature = "ast")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sparkdown_to_html_via_mdast_opts(
+    ptr: *const u8,
+    len: usize,
+    flags: u32,
+) -> *mut u8 {
+    let input = unsafe { core::slice::from_raw_parts(ptr, len) };
+    let md = String::from_utf8_lossy(input);
+    let tree = crate::ast::to_mdast_opts_nopos(&md, opts_from_flags(flags));
+    let mut out = String::with_capacity(md.len() + md.len() / 8 + 64);
+    crate::ast::render_mdast_into(&tree, &mut out);
+    box_html(out.as_bytes())
+}
+
 /// SPIKE (`ast` feature, route A): parse `len` UTF-8 bytes at `ptr` and return the
 /// mdast in the compact **binary wire format** (see [`crate::ast::to_mdast_wire`]),
 /// in the same `[u32 little-endian length][bytes]` framing as the others. The host

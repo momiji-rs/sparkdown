@@ -166,6 +166,7 @@ struct PosCtx {
     u16: Vec<u32>,        // u16[b] = UTF-16 units in src[0..b] (exact at char boundaries)
     src_len: usize,
     src: Vec<u8>,
+    enabled: bool, // when false, `wrap` returns bare nodes and no position work is done
 }
 
 impl PosCtx {
@@ -188,6 +189,43 @@ impl PosCtx {
             u16,
             src_len: src.len(),
             src: src.as_bytes().to_vec(),
+            enabled: true,
+        }
+    }
+
+    /// A no-position context: builds NO prefix table and copies NO source, so the
+    /// render path can build the owned tree without the UTF-16 table + source copy
+    /// (~400 KB of allocations) and without wrapping every node in `Positioned`.
+    fn disabled() -> Self {
+        PosCtx {
+            line_off: Vec::new(),
+            u16: Vec::new(),
+            src_len: 0,
+            src: Vec::new(),
+            enabled: false,
+        }
+    }
+
+    /// Wrap `inner` in its unist `position` when enabled; otherwise return it bare.
+    fn wrap(&self, start: usize, end: usize, inner: Mdast) -> Mdast {
+        if self.enabled {
+            Mdast::Positioned(self.pos(start, end), Box::new(inner))
+        } else {
+            inner
+        }
+    }
+
+    /// The block-fallback `bpos` passed to [`build_inline`]: the real position when
+    /// enabled, a dummy zero `Pos` when disabled (it is never read on that path, and
+    /// the empty prefix tables must not be indexed).
+    fn bpos(&self, start: usize, end: usize) -> Pos {
+        if self.enabled {
+            self.pos(start, end)
+        } else {
+            Pos {
+                start: (0, 0, 0),
+                end: (0, 0, 0),
+            }
         }
     }
 
@@ -209,6 +247,9 @@ impl PosCtx {
 
     /// Drop trailing whitespace (spaces/tabs/line endings) from a byte range end.
     fn rtrim(&self, start: usize, mut end: usize) -> usize {
+        if !self.enabled {
+            return end;
+        }
         while end > start && matches!(self.src[end - 1], b' ' | b'\t' | b'\n' | b'\r') {
             end -= 1;
         }
@@ -230,6 +271,9 @@ impl PosCtx {
     /// *zero-width* (empty) lines and the final newline. Drop newlines and the
     /// empty lines they terminate, stopping at the first line that has content.
     fn rtrim_code_end(&self, start: usize, mut end: usize) -> usize {
+        if !self.enabled {
+            return end;
+        }
         loop {
             // Drop one trailing line ending; stop if there is none.
             if end > start && self.src[end - 1] == b'\n' {
@@ -251,6 +295,9 @@ impl PosCtx {
 
     /// Drop a single trailing line ending.
     fn rtrim_nl(&self, mut end: usize) -> usize {
+        if !self.enabled {
+            return end;
+        }
         if end > 0 && self.src[end - 1] == b'\n' {
             end -= 1;
             if end > 0 && self.src[end - 1] == b'\r' {
@@ -259,6 +306,609 @@ impl PosCtx {
         }
         end
     }
+}
+
+/// Render an mdast tree to HTML entirely in Rust, **byte-identical** to the
+/// unified JS pipeline `mdast-util-to-hast` + `hast-util-to-html` (rehype's
+/// `toHast(tree)` → `toHtml(...)`), with the default options (no
+/// `allowDangerousHtml`). See [`emit`] for the per-node mapping.
+///
+/// Note: the caller appends the trailing `\n` that rehype-stringify adds.
+pub fn render_mdast(node: &Mdast) -> String {
+    let mut out = String::with_capacity(1024);
+    render_mdast_into(node, &mut out);
+    out
+}
+
+/// Render into a caller-owned buffer — lets the caller pre-size it from the
+/// source length (one allocation instead of ~log2(N) growth reallocs on a large
+/// document).
+pub fn render_mdast_into(node: &Mdast, out: &mut String) {
+    // `mdast-util-to-hast` resolves link/image references against a map of every
+    // `definition` in the tree (first wins, CommonMark-normalized identifier,
+    // upper-cased as the key). Build it once per document.
+    let mut defs: std::collections::HashMap<&str, (&str, Option<&str>)> =
+        std::collections::HashMap::new();
+    collect_definitions(node, &mut defs);
+    emit(node, out, &defs);
+    // rehype-stringify appends a trailing newline to the document.
+    out.push('\n');
+}
+
+/// Unwrap a [`Mdast::Positioned`] wrapper to its inner node (position carries no
+/// render meaning).
+#[inline]
+fn unwrap_pos(node: &Mdast) -> &Mdast {
+    let mut n = node;
+    while let Mdast::Positioned(_, inner) = n {
+        n = inner;
+    }
+    n
+}
+
+/// Walk the tree collecting every link-reference `definition` (first occurrence
+/// per identifier wins — `state.definitionById` in `mdast-util-to-hast`).
+fn collect_definitions<'a>(
+    node: &'a Mdast,
+    defs: &mut std::collections::HashMap<&'a str, (&'a str, Option<&'a str>)>,
+) {
+    use Mdast::*;
+    match unwrap_pos(node) {
+        Definition { identifier, url, title, .. } => {
+            defs.entry(identifier.as_str())
+                .or_insert((url.as_str(), title.as_deref()));
+        }
+        Root(c) | Paragraph(c) | Blockquote(c) | Heading { children: c, .. }
+        | List { children: c, .. } | ListItem { children: c, .. }
+        | Emphasis(c) | Strong(c) | Delete(c)
+        | Link { children: c, .. } | LinkReference { children: c, .. } => {
+            for ch in c {
+                collect_definitions(ch, defs);
+            }
+        }
+        #[cfg(feature = "footnotes")]
+        FootnoteDefinition { children, .. } => {
+            for ch in children {
+                collect_definitions(ch, defs);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `true` once the node (after unwrapping `Positioned`) maps to a hast `<p>`
+/// element — used by list-item rendering to decide tight-paragraph unwrapping.
+#[inline]
+fn is_paragraph(node: &Mdast) -> bool {
+    matches!(unwrap_pos(node), Mdast::Paragraph(_))
+}
+
+/// `true` if the node renders to *no* hast output (so it is absent from the
+/// hast `results` array). With default options, raw `html` nodes are dropped
+/// (`allowDangerousHtml: false`), as are link-reference `definition`s.
+fn renders_empty(node: &Mdast) -> bool {
+    match unwrap_pos(node) {
+        Mdast::Html(_) | Mdast::Definition { .. } => true,
+        #[cfg(feature = "frontmatter")]
+        Mdast::Yaml(_) | Mdast::Toml(_) => true,
+        _ => false,
+    }
+}
+
+/// Append `s` to `out` escaped as hast-util-to-html escapes **text** content:
+/// only `&` → `&#x26;` and `<` → `&#x3C;` (the `['<', '&']` subset, numeric).
+fn esc_text(s: &str, out: &mut String) {
+    let bytes = s.as_bytes();
+    let mut clean = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        let rep = match b {
+            b'&' => "&#x26;",
+            b'<' => "&#x3C;",
+            _ => continue,
+        };
+        out.push_str(&s[clean..i]);
+        out.push_str(rep);
+        clean = i + 1;
+    }
+    out.push_str(&s[clean..]);
+}
+
+/// Append `s` to `out` escaped as hast-util-to-html escapes a double-quoted
+/// **attribute** value: `&` → `&#x26;`, `"` → `&#x22;`, `'` → `&#x27;`,
+/// `` ` `` → `&#x60;` (the `['"', '&', "'", "`"]` subset, numeric).
+fn esc_attr(s: &str, out: &mut String) {
+    let bytes = s.as_bytes();
+    let mut clean = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        let rep = match b {
+            b'&' => "&#x26;",
+            b'"' => "&#x22;",
+            b'\'' => "&#x27;",
+            b'`' => "&#x60;",
+            _ => continue,
+        };
+        out.push_str(&s[clean..i]);
+        out.push_str(rep);
+        clean = i + 1;
+    }
+    out.push_str(&s[clean..]);
+}
+
+/// `true` if `b` is in `normalizeUri`'s safe ASCII set `[!#$&-;=?-Z_a-z~]`
+/// (left verbatim; everything else ASCII is percent-encoded).
+#[inline]
+fn uri_safe(b: u8) -> bool {
+    matches!(b,
+        b'!' | b'#'
+        | 0x24..=0x3B   // $ % & ' ( ) * + , - . / 0-9 : ;
+        | b'='
+        | 0x3F..=0x5A   // ? @ A-Z
+        | b'_'
+        | b'a'..=b'z'
+        | b'~')
+}
+
+#[inline]
+fn utf8_len(b: u8) -> usize {
+    if b >= 0xF0 {
+        4
+    } else if b >= 0xE0 {
+        3
+    } else if b >= 0xC0 {
+        2
+    } else {
+        1
+    }
+}
+
+#[inline]
+fn push_pct(b: u8, out: &mut String) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    out.push('%');
+    out.push(HEX[(b >> 4) as usize] as char);
+    out.push(HEX[(b & 0xf) as usize] as char);
+}
+
+/// Emit a normalized URL into a double-quoted attribute: `normalizeUri` then the
+/// attribute escaper. Fused so the URL is normalized straight into `out` and
+/// only the raw `&`/`'` need attribute escaping.
+fn emit_uri_attr(url: &str, out: &mut String) {
+    // normalizeUri leaves only `&` and `'` from the attribute-escape subset
+    // (`"` and backtick are percent-encoded by normalizeUri). Normalize into a
+    // scratch via the same buffer is awkward; do it in one pass: normalize, and
+    // for the two escapable survivors emit the entity directly.
+    let bytes = url.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'%'
+            && i + 2 < bytes.len()
+            && bytes[i + 1].is_ascii_alphanumeric()
+            && bytes[i + 2].is_ascii_alphanumeric()
+        {
+            out.push('%');
+            out.push(bytes[i + 1] as char);
+            out.push(bytes[i + 2] as char);
+            i += 3;
+            continue;
+        }
+        if b == b'&' {
+            out.push_str("&#x26;");
+            i += 1;
+        } else if b == b'\'' {
+            out.push_str("&#x27;");
+            i += 1;
+        } else if b < 0x80 {
+            if uri_safe(b) {
+                out.push(b as char);
+            } else {
+                push_pct(b, out);
+            }
+            i += 1;
+        } else {
+            let len = utf8_len(b);
+            for &cb in &bytes[i..(i + len).min(bytes.len())] {
+                push_pct(cb, out);
+            }
+            i += len;
+        }
+    }
+}
+
+/// `trim-lines`: strip spaces/tabs at the start of each line except the first,
+/// and at the end of each line except the last, then emit as escaped text.
+fn emit_text_trimmed(s: &str, out: &mut String) {
+    let bytes = s.as_bytes();
+    let mut line_start = 0;
+    let mut first = true;
+    let mut i = 0;
+    while i <= bytes.len() {
+        // Find end of the current line (at `\n`, `\r\n`, `\r`, or string end).
+        let at_end = i == bytes.len();
+        let is_break = !at_end && (bytes[i] == b'\n' || bytes[i] == b'\r');
+        if at_end || is_break {
+            let mut a = line_start;
+            let mut b = i;
+            if !first {
+                while a < b && (bytes[a] == b' ' || bytes[a] == b'\t') {
+                    a += 1;
+                }
+            }
+            if !at_end {
+                while b > a && (bytes[b - 1] == b' ' || bytes[b - 1] == b'\t') {
+                    b -= 1;
+                }
+            }
+            if b > a {
+                esc_text(&s[a..b], out);
+            }
+            if at_end {
+                break;
+            }
+            // Emit the line break verbatim (`\r\n` is two bytes).
+            if bytes[i] == b'\r' && i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+                out.push_str("\r\n");
+                i += 2;
+            } else {
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+            line_start = i;
+            first = false;
+            continue;
+        }
+        i += 1;
+    }
+}
+
+type DefMap<'a> = std::collections::HashMap<&'a str, (&'a str, Option<&'a str>)>;
+
+/// `state.wrap(results, loose)` over a slice of block children, emitting `\n`
+/// between every rendered (non-empty) child, and additionally at the start and
+/// end when `loose`. Dropped nodes (raw html, definitions) are skipped.
+fn emit_wrapped(children: &[Mdast], loose: bool, out: &mut String, defs: &DefMap) {
+    // `wrap`: a leading `\n` is pushed unconditionally when `loose` (even with no
+    // children — an empty blockquote is `<blockquote>\n</blockquote>`).
+    if loose {
+        out.push('\n');
+    }
+    let mut any = false;
+    for ch in children {
+        if renders_empty(ch) {
+            continue;
+        }
+        if any {
+            out.push('\n');
+        }
+        emit(ch, out, defs);
+        any = true;
+    }
+    // The trailing `\n` is only added when at least one node was rendered.
+    if loose && any {
+        out.push('\n');
+    }
+}
+
+/// Emit inline children in document order (no wrapping line endings).
+fn emit_inline(children: &[Mdast], out: &mut String, defs: &DefMap) {
+    for ch in children {
+        emit(ch, out, defs);
+    }
+}
+
+/// `listLoose(list)`: a list is loose if its own `spread` is set, or any item is
+/// loose (`item.spread`, or — when unset — `item.children.len() > 1`). Here
+/// `spread` is always concrete on our nodes, so it is read directly.
+fn list_is_loose(spread: bool, children: &[Mdast]) -> bool {
+    if spread {
+        return true;
+    }
+    children.iter().any(|c| matches!(unwrap_pos(c), Mdast::ListItem { spread, .. } if *spread))
+}
+
+fn emit(node: &Mdast, out: &mut String, defs: &DefMap) {
+    use Mdast::*;
+    use std::fmt::Write;
+    match node {
+        Positioned(_, inner) => emit(inner, out, defs),
+        // root: wrap(all, false) — `\n` between blocks, none at start/end.
+        Root(c) => emit_wrapped(c, false, out, defs),
+        Paragraph(c) => {
+            out.push_str("<p>");
+            emit_inline(c, out, defs);
+            out.push_str("</p>");
+        }
+        Heading { depth, children } => {
+            let _ = write!(out, "<h{depth}>");
+            emit_inline(children, out, defs);
+            let _ = write!(out, "</h{depth}>");
+        }
+        // blockquote: wrap(all, true).
+        Blockquote(c) => {
+            out.push_str("<blockquote>");
+            emit_wrapped(c, true, out, defs);
+            out.push_str("</blockquote>");
+        }
+        List { ordered, start, spread, children } => {
+            if *ordered {
+                match start {
+                    Some(n) if *n != 1 => {
+                        let _ = write!(out, "<ol start=\"{n}\">");
+                    }
+                    _ => out.push_str("<ol>"),
+                }
+            } else {
+                out.push_str("<ul>");
+            }
+            // list children are always wrapped loose: `\n` around every item.
+            let loose = list_is_loose(*spread, children);
+            out.push('\n');
+            let mut first = true;
+            for ch in children {
+                if !first {
+                    out.push('\n');
+                }
+                first = false;
+                emit_list_item(ch, loose, out, defs);
+            }
+            out.push('\n');
+            out.push_str(if *ordered { "</ol>" } else { "</ul>" });
+        }
+        // A bare ListItem (not reached via List) — render loosely standalone.
+        ListItem { children, .. } => emit_list_item_inner(children, true, out, defs),
+        ThematicBreak => out.push_str("<hr>"),
+        Code { lang, value, .. } => {
+            out.push_str("<pre><code");
+            if let Some(l) = lang {
+                // CM/GH keep only the first whitespace-delimited token.
+                let first = l.split([' ', '\t', '\n', '\r', '\x0c']).next().unwrap_or("");
+                if !first.is_empty() {
+                    out.push_str(" class=\"language-");
+                    esc_attr(first, out);
+                    out.push('"');
+                }
+            }
+            out.push('>');
+            // `value ? value + '\n' : ''` — empty code emits no trailing newline.
+            if !value.is_empty() {
+                esc_text(value, out);
+                out.push('\n');
+            }
+            out.push_str("</code></pre>");
+        }
+        // Raw html is dropped with default options (`allowDangerousHtml: false`).
+        Html(_) => {}
+        Text(s) => emit_text_trimmed(s, out),
+        Emphasis(c) => {
+            out.push_str("<em>");
+            emit_inline(c, out, defs);
+            out.push_str("</em>");
+        }
+        Strong(c) => {
+            out.push_str("<strong>");
+            emit_inline(c, out, defs);
+            out.push_str("</strong>");
+        }
+        Delete(c) => {
+            out.push_str("<del>");
+            emit_inline(c, out, defs);
+            out.push_str("</del>");
+        }
+        InlineCode(s) => {
+            out.push_str("<code>");
+            // inlineCode: newlines collapse to a single space, then text-escape.
+            emit_inline_code(s, out);
+            out.push_str("</code>");
+        }
+        Break => out.push_str("<br>\n"),
+        Link { url, title, children } => {
+            out.push_str("<a href=\"");
+            emit_uri_attr(url, out);
+            out.push('"');
+            if let Some(t) = title {
+                out.push_str(" title=\"");
+                esc_attr(t, out);
+                out.push('"');
+            }
+            out.push('>');
+            emit_inline(children, out, defs);
+            out.push_str("</a>");
+        }
+        Image { url, title, alt } => {
+            out.push_str("<img src=\"");
+            emit_uri_attr(url, out);
+            out.push_str("\" alt=\"");
+            esc_attr(alt, out);
+            out.push('"');
+            if let Some(t) = title {
+                out.push_str(" title=\"");
+                esc_attr(t, out);
+                out.push('"');
+            }
+            out.push('>');
+        }
+        LinkReference { identifier, label, reftype, children } => {
+            match defs.get(identifier.as_str()) {
+                Some(&(url, title)) => {
+                    out.push_str("<a href=\"");
+                    emit_uri_attr(url, out);
+                    out.push('"');
+                    if let Some(t) = title {
+                        out.push_str(" title=\"");
+                        esc_attr(t, out);
+                        out.push('"');
+                    }
+                    out.push('>');
+                    emit_inline(children, out, defs);
+                    out.push_str("</a>");
+                }
+                None => revert_link(children, label, identifier, reftype, out, defs),
+            }
+        }
+        ImageReference { identifier, label, reftype, alt } => {
+            match defs.get(identifier.as_str()) {
+                Some(&(url, title)) => {
+                    out.push_str("<img src=\"");
+                    emit_uri_attr(url, out);
+                    out.push_str("\" alt=\"");
+                    esc_attr(alt, out);
+                    out.push('"');
+                    if let Some(t) = title {
+                        out.push_str(" title=\"");
+                        esc_attr(t, out);
+                        out.push('"');
+                    }
+                    out.push('>');
+                }
+                None => {
+                    // revert: `![alt` + suffix, as one escaped text node.
+                    let mut s = String::with_capacity(alt.len() + label.len() + 6);
+                    s.push_str("![");
+                    s.push_str(alt);
+                    push_ref_suffix(&mut s, label, identifier, reftype);
+                    esc_text(&s, out);
+                }
+            }
+        }
+        // Link reference definitions render nothing.
+        Definition { .. } => {}
+        // Extension nodes — minimal coverage so the match is exhaustive in every
+        // feature build (the CommonMark corpus this spike times never produces them).
+        #[cfg(feature = "frontmatter")]
+        Yaml(_) | Toml(_) => {}
+        #[cfg(feature = "footnotes")]
+        FootnoteDefinition { children, .. } => emit_wrapped(children, false, out, defs),
+        #[cfg(feature = "footnotes")]
+        FootnoteReference { .. } => {}
+        #[cfg(feature = "deflist")]
+        DefList(c) => {
+            out.push_str("<dl>\n");
+            for ch in c {
+                emit(ch, out, defs);
+                out.push('\n');
+            }
+            out.push_str("</dl>");
+        }
+        #[cfg(feature = "deflist")]
+        DefListTerm(c) => {
+            out.push_str("<dt>");
+            emit_inline(c, out, defs);
+            out.push_str("</dt>");
+        }
+        #[cfg(feature = "deflist")]
+        DefListDescription { children, .. } => {
+            out.push_str("<dd>");
+            emit_inline(children, out, defs);
+            out.push_str("</dd>");
+        }
+        #[cfg(feature = "directives")]
+        ContainerDirective { children, .. }
+        | LeafDirective { children, .. }
+        | DirectiveLabel(children)
+        | TextDirective { children, .. } => emit_inline(children, out, defs),
+    }
+}
+
+/// Render one list item with the `loose` flag of its parent list, opening the
+/// `<li>` (the `\n`-wrapping around items is the caller's job).
+fn emit_list_item(node: &Mdast, loose: bool, out: &mut String, defs: &DefMap) {
+    match unwrap_pos(node) {
+        Mdast::ListItem { children, .. } => emit_list_item_inner(children, loose, out, defs),
+        // Defensive: anything else just renders inline.
+        other => emit(other, out, defs),
+    }
+}
+
+/// The `list-item` hast handler: insert a `\n` before each child *except* a
+/// tight first-paragraph; unwrap a tight `<p>` child to its inline content; and
+/// append a trailing `\n` unless the last child is a tight `<p>`.
+fn emit_list_item_inner(children: &[Mdast], loose: bool, out: &mut String, defs: &DefMap) {
+    out.push_str("<li>");
+    // Build the filtered "results" list (dropped nodes are absent in hast).
+    let results: Vec<&Mdast> = children
+        .iter()
+        .map(unwrap_pos)
+        .filter(|c| !renders_empty(c))
+        .collect();
+    for (index, &child) in results.iter().enumerate() {
+        let is_p = is_paragraph(child);
+        if loose || index != 0 || !is_p {
+            out.push('\n');
+        }
+        if is_p && !loose {
+            if let Mdast::Paragraph(c) = child {
+                emit_inline(c, out, defs);
+            }
+        } else {
+            emit(child, out, defs);
+        }
+    }
+    if let Some(&tail) = results.last() {
+        if loose || !is_paragraph(tail) {
+            out.push('\n');
+        }
+    }
+    out.push_str("</li>");
+}
+
+/// Append the reference suffix used by `revert`: `]` (shortcut), `][]`
+/// (collapsed), or `][label]` (full).
+fn push_ref_suffix(out: &mut String, label: &str, identifier: &str, reftype: &str) {
+    out.push(']');
+    match reftype {
+        "collapsed" => out.push_str("[]"),
+        "full" => {
+            out.push('[');
+            out.push_str(if label.is_empty() { identifier } else { label });
+            out.push(']');
+        }
+        _ => {}
+    }
+}
+
+/// `revert` for an undefined link reference: emit `[` + children + suffix, where
+/// the leading `[` fuses into the first text child and the suffix into the last.
+fn revert_link(
+    children: &[Mdast],
+    label: &str,
+    identifier: &str,
+    reftype: &str,
+    out: &mut String,
+    defs: &DefMap,
+) {
+    // The bracket/suffix join into adjacent text nodes (so they share one
+    // escaped text run). We model that by emitting a leading `[` text and a
+    // trailing-suffix text; escaping is identical whether fused or not.
+    let mut lead = String::with_capacity(1);
+    lead.push('[');
+    esc_text(&lead, out);
+    emit_inline(children, out, defs);
+    let mut suffix = String::with_capacity(identifier.len() + 2);
+    push_ref_suffix(&mut suffix, label, identifier, reftype);
+    esc_text(&suffix, out);
+}
+
+/// `inlineCode`: collapse CR/LF (and CRLF) to a single space, then text-escape.
+fn emit_inline_code(s: &str, out: &mut String) {
+    let bytes = s.as_bytes();
+    let mut clean = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\n' || b == b'\r' {
+            esc_text(&s[clean..i], out);
+            out.push(' ');
+            if b == b'\r' && i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+                i += 2;
+            } else {
+                i += 1;
+            }
+            clean = i;
+            continue;
+        }
+        i += 1;
+    }
+    esc_text(&s[clean..], out);
 }
 
 /// Parse `src` and build the nested mdast tree (CommonMark), with accurate unist
@@ -272,6 +922,18 @@ pub fn to_mdast_opts(src: &str, opts: crate::Options) -> Mdast {
     let tree = crate::block::parse_with_opts(src, opts);
     let mut scratch = fn_scratch(&tree);
     let ctx = PosCtx::new(src);
+    block(&tree, tree.root, &mut scratch, &ctx).0
+}
+
+/// Like [`to_mdast_opts`] but builds the tree WITHOUT unist `position` — for the
+/// HTML-render path, which never reads it. Skips the UTF-16 prefix-table build and
+/// the source copy in [`PosCtx`], and emits bare nodes instead of wrapping every
+/// one in `Mdast::Positioned`. The resulting tree renders byte-identically; only
+/// the `position` metadata (unused by the renderer) is absent.
+pub fn to_mdast_opts_nopos(src: &str, opts: crate::Options) -> Mdast {
+    let tree = crate::block::parse_with_opts(src, opts);
+    let mut scratch = fn_scratch(&tree);
+    let ctx = PosCtx::disabled();
     block(&tree, tree.root, &mut scratch, &ctx).0
 }
 
@@ -470,10 +1132,12 @@ fn block(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> (Mdast
                                 let off = (co + lead) as u32;
                                 last = tree.content_to_src(ci, off + body.len() as u32) as usize;
                                 let (pos, inl) = inline_span(tree, ci, off, body, scratch, ctx);
-                                kids.push(Mdast::Positioned(
-                                    pos,
-                                    Box::new(Mdast::DefListTerm(inl)),
-                                ));
+                                let term = Mdast::DefListTerm(inl);
+                                kids.push(if ctx.enabled {
+                                    Mdast::Positioned(pos, Box::new(term))
+                                } else {
+                                    term
+                                });
                             }
                             co += line.len();
                         }
@@ -486,14 +1150,20 @@ fn block(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> (Mdast
                         let body = content.trim_matches([' ', '\t', '\n', '\r']);
                         last = tree.content_to_src(ci, (lead + body.len()) as u32) as usize;
                         let (pos, inl) = inline_span(tree, ci, lead as u32, body, scratch, ctx);
-                        let para = Mdast::Positioned(pos.clone(), Box::new(Mdast::Paragraph(inl)));
-                        kids.push(Mdast::Positioned(
-                            pos,
-                            Box::new(Mdast::DefListDescription {
-                                spread,
-                                children: vec![para],
-                            }),
-                        ));
+                        let para = if ctx.enabled {
+                            Mdast::Positioned(pos.clone(), Box::new(Mdast::Paragraph(inl)))
+                        } else {
+                            Mdast::Paragraph(inl)
+                        };
+                        let desc = Mdast::DefListDescription {
+                            spread,
+                            children: vec![para],
+                        };
+                        kids.push(if ctx.enabled {
+                            Mdast::Positioned(pos, Box::new(desc))
+                        } else {
+                            desc
+                        });
                     }
                     _ => {
                         let (m, eb) = block(tree, ci, scratch, ctx);
@@ -519,10 +1189,7 @@ fn block(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> (Mdast
         #[cfg(feature = "deflist")]
         Kind::DefDesc => {
             let eb = ctx.rtrim_nl(se);
-            let para = Mdast::Positioned(
-                ctx.pos(sb, eb),
-                Box::new(Mdast::Paragraph(inline(tree, idx, scratch, ctx, sb, eb))),
-            );
+            let para = ctx.wrap(sb, eb, Mdast::Paragraph(inline(tree, idx, scratch, ctx, sb, eb)));
             (
                 Mdast::DefListDescription {
                     spread: node.level == 1,
@@ -563,10 +1230,10 @@ fn block(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> (Mdast
             if let Some((ls, le)) = d.label {
                 let label = directive_label_children(tree, d, scratch, ctx);
                 // remark-directive spans the label paragraph over the brackets.
-                let lpos = ctx.pos(ls as usize - 1, le as usize + 1);
-                kids.push(Mdast::Positioned(
-                    lpos,
-                    Box::new(Mdast::DirectiveLabel(label)),
+                kids.push(ctx.wrap(
+                    ls as usize - 1,
+                    le as usize + 1,
+                    Mdast::DirectiveLabel(label),
                 ));
             }
             let (body, last) = block_children(tree, idx, scratch, ctx);
@@ -588,10 +1255,7 @@ fn block(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> (Mdast
             ctx.rtrim(sb, se),
         ),
     };
-    (
-        Mdast::Positioned(ctx.pos(start_b, end_b), Box::new(inner)),
-        end_b,
-    )
+    (ctx.wrap(start_b, end_b, inner), end_b)
 }
 
 /// Build the inline children of a block directive's `[label]` (empty when absent).
@@ -608,7 +1272,7 @@ fn directive_label_children(
     };
     let body = tree.source_range(ls, le);
     let toks = render_inline_to_tokens(body, &tree.refmap, scratch, tree.opts);
-    let bpos = ctx.pos(ls as usize, le as usize);
+    let bpos = ctx.bpos(ls as usize, le as usize);
     build_inline(
         body,
         toks,
@@ -635,7 +1299,7 @@ fn inline_span(
     let sbb = tree.content_to_src(ci, content_off) as usize;
     let ebb = tree.content_to_src(ci, content_off + body.len() as u32) as usize;
     let toks = render_inline_to_tokens(body, &tree.refmap, scratch, tree.opts);
-    let bpos = ctx.pos(sbb, ebb);
+    let bpos = ctx.bpos(sbb, ebb);
     let inl = build_inline(
         body,
         toks,
@@ -679,7 +1343,7 @@ fn inline(
     eb: usize,
 ) -> Vec<Mdast> {
     let toks = render_inline_to_tokens(tree.content(idx), &tree.refmap, scratch, tree.opts);
-    let bpos = ctx.pos(sb, eb);
+    let bpos = ctx.bpos(sb, eb);
     let map = |off: u32| tree.content_to_src(idx, off) as usize;
     build_inline(tree.content(idx), toks, tree, scratch, ctx, &map, &bpos)
 }
@@ -724,55 +1388,69 @@ fn build_inline(
             ctx.pos(map(s), send)
         }
     };
+    // Wrap an inline node in its `Positioned` (computing the span via `mkpos`) when
+    // enabled; otherwise return it bare and skip the position work entirely.
+    let wrapm = |s: u32, e: u32, inner: Mdast| -> Mdast {
+        if ctx.enabled {
+            Mdast::Positioned(mkpos(s, e), Box::new(inner))
+        } else {
+            inner
+        }
+    };
     // (frame, children, open_start, open_end).
     let mut stack: Vec<(Option<Frame>, Vec<Mdast>, u32, u32)> =
         vec![(None, Vec::new(), u32::MAX, 0)];
     for SpanTok { tok, start, end } in toks {
         match tok {
             InlineTok::Text(s) => {
-                let pos = mkpos(start, end);
                 let sib = &mut stack.last_mut().unwrap().1;
                 // Coalesce adjacent text (matching from-markdown's single run),
                 // extending the merged node's end.
-                if let Some(Mdast::Positioned(ppos, last)) = sib.last_mut()
-                    && let Mdast::Text(prev) = last.as_mut()
-                {
-                    prev.push_str(&s);
-                    ppos.end = pos.end;
-                    continue;
+                if ctx.enabled {
+                    let pos = mkpos(start, end);
+                    if let Some(Mdast::Positioned(ppos, last)) = sib.last_mut()
+                        && let Mdast::Text(prev) = last.as_mut()
+                    {
+                        prev.push_str(&s);
+                        ppos.end = pos.end;
+                        continue;
+                    }
+                    sib.push(Mdast::Positioned(pos, Box::new(Mdast::Text(s))));
+                } else {
+                    if let Some(Mdast::Text(prev)) = sib.last_mut() {
+                        prev.push_str(&s);
+                        continue;
+                    }
+                    sib.push(Mdast::Text(s));
                 }
-                sib.push(Mdast::Positioned(pos, Box::new(Mdast::Text(s))));
             }
             InlineTok::Code(v) => {
-                let p = mkpos(start, end);
                 stack
                     .last_mut()
                     .unwrap()
                     .1
-                    .push(Mdast::Positioned(p, Box::new(Mdast::InlineCode(v))));
+                    .push(wrapm(start, end, Mdast::InlineCode(v)));
             }
             InlineTok::Html(h) => {
-                let p = mkpos(start, end);
                 stack
                     .last_mut()
                     .unwrap()
                     .1
-                    .push(Mdast::Positioned(p, Box::new(Mdast::Html(h))));
+                    .push(wrapm(start, end, Mdast::Html(h)));
             }
             InlineTok::Break => {
-                let p = mkpos(start, end);
                 stack
                     .last_mut()
                     .unwrap()
                     .1
-                    .push(Mdast::Positioned(p, Box::new(Mdast::Break)));
+                    .push(wrapm(start, end, Mdast::Break));
             }
             InlineTok::Image { url, title, alt } => {
-                let p = mkpos(start, end);
-                stack.last_mut().unwrap().1.push(Mdast::Positioned(
-                    p,
-                    Box::new(Mdast::Image { url, title, alt }),
-                ));
+                stack
+                    .last_mut()
+                    .unwrap()
+                    .1
+                    .push(wrapm(start, end, Mdast::Image { url, title, alt }));
             }
             InlineTok::ImageRef {
                 identifier,
@@ -780,60 +1458,68 @@ fn build_inline(
                 reftype,
                 alt,
             } => {
-                let p = mkpos(start, end);
-                stack.last_mut().unwrap().1.push(Mdast::Positioned(
-                    p,
-                    Box::new(Mdast::ImageReference {
+                stack.last_mut().unwrap().1.push(wrapm(
+                    start,
+                    end,
+                    Mdast::ImageReference {
                         identifier,
                         label,
                         reftype,
                         alt,
-                    }),
+                    },
                 ));
             }
             #[cfg(feature = "footnotes")]
             InlineTok::FootnoteRef { identifier, label } => {
-                let p = mkpos(start, end);
-                stack.last_mut().unwrap().1.push(Mdast::Positioned(
-                    p,
-                    Box::new(Mdast::FootnoteReference { identifier, label }),
+                stack.last_mut().unwrap().1.push(wrapm(
+                    start,
+                    end,
+                    Mdast::FootnoteReference { identifier, label },
                 ));
             }
             #[cfg(feature = "directives")]
             InlineTok::TextDirective { name, attrs, label } => {
-                let p = mkpos(start, end);
                 let children = match label {
                     Some((ls, le)) => {
                         let body = &content[ls as usize..le as usize];
                         let toks2 = render_inline_to_tokens(body, &tree.refmap, scratch, tree.opts);
-                        let lpos = ctx.pos(map(ls), if le == 0 { map(0) } else { map(le - 1) + 1 });
+                        // `lpos` is only read (as a fallback `bpos`) on the
+                        // position-on path; skip computing it when disabled so the
+                        // empty prefix tables are never indexed.
+                        let lpos = if ctx.enabled {
+                            ctx.pos(map(ls), if le == 0 { map(0) } else { map(le - 1) + 1 })
+                        } else {
+                            bpos.clone()
+                        };
                         build_inline(body, toks2, tree, scratch, ctx, &|o| map(ls + o), &lpos)
                     }
                     None => Vec::new(),
                 };
-                stack.last_mut().unwrap().1.push(Mdast::Positioned(
-                    p,
-                    Box::new(Mdast::TextDirective {
+                stack.last_mut().unwrap().1.push(wrapm(
+                    start,
+                    end,
+                    Mdast::TextDirective {
                         name,
                         attributes: attrs,
                         children,
-                    }),
+                    },
                 ));
             }
             InlineTok::Autolink { url, text } => {
                 // The link spans `<url>`; its text child spans the url itself.
-                let child = Mdast::Positioned(
-                    mkpos(start.saturating_add(1), end.saturating_sub(1)),
-                    Box::new(Mdast::Text(text)),
+                let child = wrapm(
+                    start.saturating_add(1),
+                    end.saturating_sub(1),
+                    Mdast::Text(text),
                 );
-                let p = mkpos(start, end);
-                stack.last_mut().unwrap().1.push(Mdast::Positioned(
-                    p,
-                    Box::new(Mdast::Link {
+                stack.last_mut().unwrap().1.push(wrapm(
+                    start,
+                    end,
+                    Mdast::Link {
                         url,
                         title: None,
                         children: vec![child],
-                    }),
+                    },
                 ));
             }
             InlineTok::Open(kind) => {
@@ -888,12 +1574,7 @@ fn build_inline(
                 // link opener already carries the whole link's end; emphasis
                 // opener carries only its marker, so the closer extends it.
                 let cend = if end > oe { end } else { oe };
-                let p = mkpos(os, cend);
-                stack
-                    .last_mut()
-                    .unwrap()
-                    .1
-                    .push(Mdast::Positioned(p, Box::new(node)));
+                stack.last_mut().unwrap().1.push(wrapm(os, cend, node));
             }
         }
     }
