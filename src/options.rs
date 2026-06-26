@@ -35,6 +35,9 @@ pub struct Options {
     /// of the document (the remark-frontmatter grammar). Renders to nothing; with
     /// the `ast` feature it becomes a `yaml`/`toml` mdast node. Not GFM-gated.
     pub frontmatter: bool,
+    /// Emoji shortcodes: inline `:smile:` → 😄 (the remark-gemoji dataset).
+    /// Effective only with the `emoji` Cargo feature (it carries the data table).
+    pub emoji: bool,
     /// GFM footnotes: inline `[^label]` references and `[^label]: …` block
     /// definitions (the remark-gfm grammar). References resolve only when a
     /// matching definition exists. mdast: `footnoteReference`/`footnoteDefinition`;
@@ -62,6 +65,14 @@ impl Options {
     #[cfg(not(feature = "diagram"))]
     pub(crate) const DIAGRAM: bool = false;
 
+    /// `true` iff the `emoji` Cargo feature is compiled in. Used as
+    /// `Options::EMOJI && opts.emoji` so the lookup and its data table fold away
+    /// entirely without the feature.
+    #[cfg(feature = "emoji")]
+    pub(crate) const EMOJI: bool = true;
+    #[cfg(not(feature = "emoji"))]
+    pub(crate) const EMOJI: bool = false;
+
     /// GitHub Flavored Markdown: every GFM extension enabled. (Effective only
     /// when the crate is built with the `gfm` feature.)
     pub const fn gfm() -> Self {
@@ -75,6 +86,7 @@ impl Options {
             diagram: false,
             heading_ids: false,
             frontmatter: false,
+            emoji: false,
             footnotes: false,
         }
     }

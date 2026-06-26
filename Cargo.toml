@@ -31,6 +31,11 @@ gfm = []
 # element (`<pre class="mermaid">`) for a browser library to pick up, instead of
 # `<pre><code>`. Render-only, zero-dependency. The template for `src/ext/*`.
 diagram = []
+# Emoji extension (opt-in, OFF by default): inline `:shortcode:` → Unicode emoji,
+# matching remark-gemoji (the gemoji dataset, ~1900 codes). Carries a generated
+# data table (src/ext/emoji_data.rs), so it is Cargo-gated to keep it out of the
+# default build.
+emoji = []
 # Mirrors rostdown: opt-in scoped global bump allocator (src/arena.rs). An
 # embedder that enables it must install `sparkdown::ScopedAlloc` as its
 # `#[global_allocator]`. The local bump (src/bump.rs) is always on.

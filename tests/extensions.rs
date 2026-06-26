@@ -1,6 +1,53 @@
 //! Tests for the opt-in `src/ext/*` extensions (beyond CommonMark + GFM). Each
 //! is gated by its Cargo feature, mirroring the GFM tests in `tests/options.rs`.
 
+#[cfg(feature = "emoji")]
+mod emoji {
+    use sparkdown::{Options, to_html, to_html_with};
+
+    fn on() -> Options {
+        Options {
+            emoji: true,
+            ..Options::default()
+        }
+    }
+
+    #[test]
+    fn basic_shortcodes() {
+        assert_eq!(to_html_with(":smile:\n", &on()), "<p>😄</p>\n");
+        // No word boundary required; `+`/`-` are valid shortcode chars.
+        assert_eq!(to_html_with("a:smile:b\n", &on()), "<p>a😄b</p>\n");
+        assert_eq!(to_html_with(":+1: :-1:\n", &on()), "<p>👍 👎</p>\n");
+    }
+
+    #[test]
+    fn unknown_and_case_sensitive_stay_literal() {
+        assert_eq!(to_html_with(":notanemoji:\n", &on()), "<p>:notanemoji:</p>\n");
+        // Shortcodes are lowercase; `:SMILE:` is not a match.
+        assert_eq!(to_html_with(":SMILE:\n", &on()), "<p>:SMILE:</p>\n");
+        // No closing colon → literal.
+        assert_eq!(to_html_with(":smile\n", &on()), "<p>:smile</p>\n");
+    }
+
+    #[test]
+    fn nested_colons_match_inner() {
+        assert_eq!(to_html_with("::smile::\n", &on()), "<p>:😄:</p>\n");
+    }
+
+    #[test]
+    fn code_span_is_untouched() {
+        assert_eq!(
+            to_html_with("`:smile:`\n", &on()),
+            "<p><code>:smile:</code></p>\n"
+        );
+    }
+
+    #[test]
+    fn off_by_default() {
+        assert_eq!(to_html(":smile:\n"), "<p>:smile:</p>\n");
+    }
+}
+
 #[cfg(feature = "diagram")]
 mod diagram {
     use sparkdown::{Options, to_html_with};

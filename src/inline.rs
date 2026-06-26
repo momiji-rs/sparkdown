@@ -13,7 +13,7 @@ use crate::options::Options;
 use crate::render::escape_html;
 use crate::scan::{
     find_emph, find_emph_gfm, find_inline, find_inline_al, find_inline_gfm, find_inline_gfm_al,
-    find_stream, find_stream_al,
+    find_stream, find_stream_al, memchr1,
 };
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -1645,12 +1645,26 @@ pub fn render_inline(
     let tf = Options::GFM && opts.tagfilter;
     let al = Options::GFM && opts.autolink;
     let fno = opts.footnotes;
+    let emo = Options::EMOJI && opts.emoji;
     match (opts.hard_wraps, Options::GFM && opts.strikethrough) {
-        (false, false) => render_inline_impl::<false, false>(src, out, refmap, scratch, tf, al, fno),
-        (false, true) => render_inline_impl::<false, true>(src, out, refmap, scratch, tf, al, fno),
-        (true, false) => render_inline_impl::<true, false>(src, out, refmap, scratch, tf, al, fno),
-        (true, true) => render_inline_impl::<true, true>(src, out, refmap, scratch, tf, al, fno),
+        (false, false) => render_inline_impl::<false, false>(src, out, refmap, scratch, tf, al, fno, emo),
+        (false, true) => render_inline_impl::<false, true>(src, out, refmap, scratch, tf, al, fno, emo),
+        (true, false) => render_inline_impl::<true, false>(src, out, refmap, scratch, tf, al, fno, emo),
+        (true, true) => render_inline_impl::<true, true>(src, out, refmap, scratch, tf, al, fno, emo),
     }
+}
+
+/// Emoji shortcode lookup, present only with the `emoji` feature (folds to `None`
+/// otherwise so the call site compiles in every build).
+#[cfg(feature = "emoji")]
+#[inline]
+fn emoji_lookup(bytes: &[u8], i: usize) -> Option<(&'static str, usize)> {
+    crate::ext::emoji::lookup(bytes, i)
+}
+#[cfg(not(feature = "emoji"))]
+#[inline]
+fn emoji_lookup(_bytes: &[u8], _i: usize) -> Option<(&'static str, usize)> {
+    None
 }
 
 /// SPIKE (`ast` feature): parse `src`'s inline content into owned [`InlineTok`]
@@ -1692,6 +1706,7 @@ pub fn render_inline_to_sink<S: InlineSink>(
 }
 
 #[allow(unused_assignments)] // `seg` is updated at segment ends; the last is unused
+#[allow(clippy::too_many_arguments)] // hot inner loop; bundling args would add indirection
 fn render_inline_impl<const HW: bool, const ST: bool>(
     src: &str,
     out: &mut String,
@@ -1700,6 +1715,7 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
     tf: bool,
     al: bool,
     fno: bool,
+    emo: bool,
 ) {
     let bytes = src.as_bytes();
     // SPIKE: AST mode captures semantic nodes instead of HTML. `ast_mode` is a
@@ -1721,7 +1737,10 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
     } else {
         find_emph(bytes)
     };
-    if gate.is_none() && !ast_mode {
+    // Emoji needs the node path only when a `:` is actually present; a `:`-free
+    // line still takes the fast stream path.
+    let emo_here = emo && memchr1(bytes, b':').is_some();
+    if gate.is_none() && !ast_mode && !emo_here {
         if al {
             stream_autolink(src, out, HW, tf);
         } else {
@@ -2087,10 +2106,18 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                     i += 1;
                 }
             }
-            b':' if al => {
-                if let Some((s, e)) = gfm_scan_url_at_colon(bytes, i) {
+            b':' if al || emo => {
+                if al && let Some((s, e)) = gfm_scan_url_at_colon(bytes, i) {
                     escape_html(&src[run..s], cur);
                     emit_url(src, s, e, cur);
+                    i = e;
+                    run = i;
+                } else if emo && let Some((emoji, e)) = emoji_lookup(bytes, i) {
+                    // Emoji is plain text in both HTML and AST mode: flush the
+                    // pending text and append the emoji to the current segment
+                    // (no node boundary), so it folds into the surrounding text.
+                    escape_html(&src[run..i], cur);
+                    cur.push_str(emoji);
                     i = e;
                     run = i;
                 } else {
@@ -2113,7 +2140,13 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                 } else {
                     find_inline(rest)
                 };
-                i += 1 + skip.unwrap_or(bytes.len() - i - 1);
+                let mut adv = 1 + skip.unwrap_or(bytes.len() - i - 1);
+                // Emoji: `:` is not in the (non-autolink) scan set, so clamp the
+                // skip to the next `:` here when looking for shortcodes.
+                if emo && let Some(c) = memchr1(&bytes[i + 1..i + adv], b':') {
+                    adv = 1 + c;
+                }
+                i += adv;
             }
         }
     }
