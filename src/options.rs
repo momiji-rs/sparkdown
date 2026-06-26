@@ -31,6 +31,10 @@ pub struct Options {
     /// common "headings get anchors" task stays on the all-wasm fast path instead
     /// of crossing into a JS plugin. Applied in `render.rs`; not GFM-gated.
     pub heading_ids: bool,
+    /// Frontmatter: a YAML (`---`) or TOML (`+++`) fenced block at the very start
+    /// of the document (the remark-frontmatter grammar). Renders to nothing; with
+    /// the `ast` feature it becomes a `yaml`/`toml` mdast node. Not GFM-gated.
+    pub frontmatter: bool,
 }
 
 impl Options {
@@ -64,6 +68,7 @@ impl Options {
             hard_wraps: false,
             diagram: false,
             heading_ids: false,
+            frontmatter: false,
         }
     }
 }

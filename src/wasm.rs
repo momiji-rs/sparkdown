@@ -102,9 +102,39 @@ pub unsafe extern "C" fn sparkdown_to_mdast_wire(ptr: *const u8, len: usize) -> 
     box_html(&crate::ast::to_mdast_wire(&md))
 }
 
+/// Like [`sparkdown_to_mdast_wire`] but applies opt-in grammar extensions from a
+/// `flags` bitmask (same bit layout as [`sparkdown_to_html_opts`]; bit 8 =
+/// frontmatter). Lets the JS boundary request a frontmatter-aware mdast tree.
+///
+/// # Safety
+/// `ptr` must point to `len` readable, initialized bytes.
+#[cfg(feature = "ast")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sparkdown_to_mdast_wire_opts(
+    ptr: *const u8,
+    len: usize,
+    flags: u32,
+) -> *mut u8 {
+    let input = unsafe { core::slice::from_raw_parts(ptr, len) };
+    let md = String::from_utf8_lossy(input);
+    let opts = crate::Options {
+        strikethrough: flags & 1 != 0,
+        tasklist: flags & 2 != 0,
+        autolink: flags & 4 != 0,
+        tagfilter: flags & 8 != 0,
+        tables: flags & 16 != 0,
+        hard_wraps: flags & 32 != 0,
+        diagram: flags & 64 != 0,
+        heading_ids: flags & 128 != 0,
+        frontmatter: flags & 256 != 0,
+    };
+    box_html(&crate::ast::to_mdast_wire_opts(&md, opts))
+}
+
 /// Like [`sparkdown_to_html`] but applies extension options from a bitmask: bit
 /// 0 strikethrough, 1 task lists, 2 autolinks, 3 tag filter, 4 tables, 5 hard
-/// wraps, 6 diagram, 7 heading ids (built-in slug transform). A bit only takes
+/// wraps, 6 diagram, 7 heading ids (built-in slug transform), 8 frontmatter
+/// (YAML `---` / TOML `+++`). A bit only takes
 /// effect if the matching Cargo feature was compiled in. Built with the `gfm`
 /// feature.
 ///
@@ -124,6 +154,7 @@ pub unsafe extern "C" fn sparkdown_to_html_opts(ptr: *const u8, len: usize, flag
         hard_wraps: flags & 32 != 0,
         diagram: flags & 64 != 0,
         heading_ids: flags & 128 != 0,
+        frontmatter: flags & 256 != 0,
     };
     RENDERER.with(|cell| {
         let mut r = cell.borrow_mut();

@@ -42,3 +42,44 @@ mod diagram {
         );
     }
 }
+
+#[cfg(feature = "ast")]
+mod frontmatter {
+    use sparkdown::Options;
+    use sparkdown::ast::to_mdast_json_opts;
+
+    fn on() -> Options {
+        Options {
+            frontmatter: true,
+            ..Options::default()
+        }
+    }
+
+    #[test]
+    fn yaml_node() {
+        // A `yaml` node whose value is the content between the fences, no newline.
+        let j = to_mdast_json_opts("---\ntitle: Hi\nx: 1\n---\n", on());
+        assert!(j.contains(r#""type":"yaml","value":"title: Hi\nx: 1""#), "{j}");
+        // Positioned at the document start, ending at the closing fence.
+        assert!(j.contains(r#""start":{"line":1,"column":1,"offset":0}"#), "{j}");
+    }
+
+    #[test]
+    fn toml_node() {
+        let j = to_mdast_json_opts("+++\na = 1\n+++\n", on());
+        assert!(j.contains(r#""type":"toml","value":"a = 1""#), "{j}");
+    }
+
+    #[test]
+    fn empty_value() {
+        let j = to_mdast_json_opts("---\n---\n", on());
+        assert!(j.contains(r#""type":"yaml","value":"""#), "{j}");
+    }
+
+    #[test]
+    fn off_by_default_is_not_frontmatter() {
+        // Without the option, the leading `---` is ordinary markdown — no yaml node.
+        let j = to_mdast_json_opts("---\ntitle: Hi\n---\n", Options::default());
+        assert!(!j.contains(r#""type":"yaml""#), "{j}");
+    }
+}

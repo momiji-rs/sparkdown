@@ -16,7 +16,7 @@
 //! nodes (block-granular — accurate per-inline offsets are a documented next
 //! step). Enough for position-reading plugins like remark-lint.
 
-use crate::block::{Kind, Tree, parse};
+use crate::block::{Kind, Tree};
 use crate::inline::{
     InlineSink, InlineTok, Scratch, SpanTok, render_inline_to_sink, render_inline_to_tokens,
 };
@@ -38,6 +38,10 @@ pub enum Mdast {
     Definition { identifier: String, label: String, url: String, title: Option<String> },
     /// Raw HTML — block (here) or inline (from the inline stream).
     Html(String),
+    /// YAML frontmatter (`---`); `value` is the text between the fences.
+    Yaml(String),
+    /// TOML frontmatter (`+++`); `value` is the text between the fences.
+    Toml(String),
     // --- inline ---
     Text(String),
     Emphasis(Vec<Mdast>),
@@ -161,10 +165,23 @@ impl PosCtx {
 /// Parse `src` and build the nested mdast tree (CommonMark), with accurate unist
 /// `position` (UTF-16 line/column/offset) on every node.
 pub fn to_mdast(src: &str) -> Mdast {
-    let tree = parse(src);
+    to_mdast_opts(src, crate::Options::default())
+}
+
+/// Like [`to_mdast`] but with opt-in grammar extensions (e.g. frontmatter).
+pub fn to_mdast_opts(src: &str, opts: crate::Options) -> Mdast {
+    let tree = crate::block::parse_with_opts(src, opts);
     let mut scratch = Scratch::new();
     let ctx = PosCtx::new(src);
     block(&tree, tree.root, &mut scratch, &ctx).0
+}
+
+/// The mdast `value` of a frontmatter node: the raw text between the fences with
+/// exactly one trailing line ending dropped. Internal line endings are kept
+/// verbatim — remark-frontmatter does not normalize CRLF inside the value.
+fn frontmatter_value(raw: &str) -> &str {
+    let raw = raw.strip_suffix('\n').unwrap_or(raw);
+    raw.strip_suffix('\r').unwrap_or(raw)
 }
 
 /// Build a block node and return it plus its source byte end (for parent
@@ -219,6 +236,14 @@ fn block(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> (Mdast
             // keeps its trailing newline; others drop one line ending) — not the
             // node's raw `src_end`, which may run past trailing blank lines.
             (Mdast::Html(tree.html_value(idx).to_owned()), sb, tree.html_ast_end(idx) as usize)
+        }
+        Kind::Frontmatter => {
+            // `level` 1 = TOML (`+++`), 0 = YAML (`---`). The span is already the
+            // exact mdast range: start at offset 0, end at the closing fence's
+            // content end (trailing spaces kept, newline dropped — set in parse).
+            let value = frontmatter_value(tree.content(idx)).to_owned();
+            let inner = if node.level == 1 { Mdast::Toml(value) } else { Mdast::Yaml(value) };
+            (inner, sb, se)
         }
         Kind::Definition => {
             let d = tree.definition(idx);
@@ -444,7 +469,12 @@ fn code_info(info: &str) -> (Option<String>, Option<String>) {
 /// (hand-rolled) so it works in the `wasm32-unknown-unknown` lib build. This is
 /// what crosses the wasm→JS boundary in the boundary spike.
 pub fn to_mdast_json(src: &str) -> String {
-    let tree = to_mdast(src);
+    to_mdast_json_opts(src, crate::Options::default())
+}
+
+/// Like [`to_mdast_json`] but with opt-in grammar extensions (e.g. frontmatter).
+pub fn to_mdast_json_opts(src: &str, opts: crate::Options) -> String {
+    let tree = to_mdast_opts(src, opts);
     // mdast JSON is roughly 3–5× the source; reserve generously to avoid regrows.
     let mut out = String::with_capacity(src.len() * 4 + 64);
     write_json(&tree, &mut out);
@@ -463,9 +493,14 @@ pub fn to_mdast_json(src: &str) -> String {
 ///   `u32 childCount` followed by that many child nodes. Strings: `u32 len` then
 ///   `len` UTF-8 bytes; an optional string uses `len == 0xFFFF_FFFF` for `None`.
 pub fn to_mdast_wire(src: &str) -> Vec<u8> {
+    to_mdast_wire_opts(src, crate::Options::default())
+}
+
+/// Like [`to_mdast_wire`] but with opt-in grammar extensions (e.g. frontmatter).
+pub fn to_mdast_wire_opts(src: &str, opts: crate::Options) -> Vec<u8> {
     // Emit wire bytes *directly* during the parse walk — no intermediate owned
     // `Mdast` tree (its construction was ~0.95 ms / the dominant boundary cost).
-    let tree = parse(src);
+    let tree = crate::block::parse_with_opts(src, opts);
     let mut scratch = Scratch::new();
     let ctx = PosCtx::new(src);
     let mut out = Vec::<u8>::with_capacity(src.len() * 2 + 64);
@@ -632,6 +667,14 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
             w_point(out, ctx.point(eb));
             w_str(tree.html_value(idx), out);
             eb
+        }
+        Kind::Frontmatter => {
+            let value = frontmatter_value(tree.content(idx));
+            out.push(if node.level == 1 { 21 } else { 20 }); // 20 = yaml, 21 = toml
+            w_point(out, ctx.point(sb));
+            w_point(out, ctx.point(se));
+            w_str(value, out);
+            se
         }
         Kind::Definition => {
             let d = tree.definition(idx);
@@ -1008,6 +1051,16 @@ fn write_json_pos(node: &Mdast, pos: Option<&Pos>, out: &mut String) {
             key("value", out);
             json_str(v, out);
         }
+        Mdast::Yaml(v) => {
+            out.push_str("\"yaml\",");
+            key("value", out);
+            json_str(v, out);
+        }
+        Mdast::Toml(v) => {
+            out.push_str("\"toml\",");
+            key("value", out);
+            json_str(v, out);
+        }
         Mdast::Text(v) => {
             out.push_str("\"text\",");
             key("value", out);
@@ -1127,6 +1180,8 @@ pub fn node_count(node: &Mdast) -> usize {
         | Code { .. }
         | Definition { .. }
         | Html(_)
+        | Yaml(_)
+        | Toml(_)
         | Text(_)
         | InlineCode(_)
         | Break

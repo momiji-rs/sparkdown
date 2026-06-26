@@ -52,6 +52,48 @@ fn heading_ids() {
 }
 
 #[test]
+fn frontmatter() {
+    let on = Options {
+        frontmatter: true,
+        ..Options::default()
+    };
+    // YAML frontmatter (`---`) is dropped from HTML; the body renders normally.
+    assert_eq!(
+        to_html_with("---\ntitle: Hi\n---\n# Body\n", &on),
+        "<h1>Body</h1>\n"
+    );
+    // TOML frontmatter (`+++`) likewise.
+    assert_eq!(
+        to_html_with("+++\na = 1\n+++\n# Body\n", &on),
+        "<h1>Body</h1>\n"
+    );
+    // Empty frontmatter is valid and drops to nothing.
+    assert_eq!(to_html_with("---\n---\nhi\n", &on), "<p>hi</p>\n");
+    // Off by default: a leading `---` … `---` is plain markdown (here a thematic
+    // break, then a setext heading), so the "title" text is visible.
+    assert_eq!(
+        to_html("---\ntitle: Hi\n---\n# Body\n"),
+        "<hr />\n<h2>title: Hi</h2>\n<h1>Body</h1>\n"
+    );
+    // An unterminated fence is not frontmatter even with the option on — the
+    // leading `---` is a thematic break.
+    assert_eq!(
+        to_html_with("---\nnot closed\n", &on),
+        to_html("---\nnot closed\n")
+    );
+    // Frontmatter must be at the very start; a fence after content is not it.
+    assert_eq!(
+        to_html_with("# H\n\n---\nx\n---\n", &on),
+        to_html("# H\n\n---\nx\n---\n")
+    );
+    // Four markers is not a fence (so this never opens frontmatter).
+    assert_eq!(
+        to_html_with("----\nx\n----\n", &on),
+        to_html("----\nx\n----\n")
+    );
+}
+
+#[test]
 fn renderer_carries_options() {
     let mut r = Renderer::with_options(Options {
         hard_wraps: true,

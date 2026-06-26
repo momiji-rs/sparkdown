@@ -55,12 +55,18 @@ export default function remarkSparkdown() {
 // — no JSON serialize in Rust, no whole-buffer decode, no JSON.parse.
 const REFTYPE = ['shortcut', 'collapsed', 'full'];
 
-/** Parse markdown → mdast tree via the binary wire boundary. */
-function parseToMdastWire(md) {
+/**
+ * Parse markdown → mdast tree via the binary wire boundary. `flags` (a bitmask
+ * matching `sparkdown_to_html_opts`; bit 8 = frontmatter) enables opt-in grammar
+ * extensions; 0 (the default) is pure CommonMark via the plain wire export.
+ */
+function parseToMdastWire(md, flags = 0) {
   const buf = enc.encode(md);
   const inPtr = x.sparkdown_alloc(buf.length);
   new Uint8Array(x.memory.buffer).set(buf, inPtr);
-  const ptr = x.sparkdown_to_mdast_wire(inPtr, buf.length);
+  const ptr = flags
+    ? x.sparkdown_to_mdast_wire_opts(inPtr, buf.length, flags)
+    : x.sparkdown_to_mdast_wire(inPtr, buf.length);
 
   const mem = x.memory.buffer;
   const dv = new DataView(mem);
@@ -133,6 +139,8 @@ function parseToMdastWire(md) {
       case 17: { const identifier = str(); const label = str(); const url = str(); const title = opt(); return { type: 'definition', identifier, label, url, title, position }; }
       case 18: { const identifier = str(); const label = str(); const referenceType = REFTYPE[u8[p++]]; return { type: 'linkReference', identifier, label, referenceType, children: kids(), position }; }
       case 19: { const identifier = str(); const label = str(); const referenceType = REFTYPE[u8[p++]]; const alt = str(); return { type: 'imageReference', identifier, label, referenceType, alt, position }; }
+      case 20: return { type: 'yaml', value: str(), position };
+      case 21: return { type: 'toml', value: str(), position };
       default: throw new Error('bad wire tag ' + tag);
     }
   }

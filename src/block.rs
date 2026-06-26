@@ -26,6 +26,11 @@ pub enum Kind {
     ThematicBreak,
     CodeBlock,
     HtmlBlock,
+    /// YAML (`---`) / TOML (`+++`) frontmatter at the very start of the document
+    /// (opt-in via [`Options::frontmatter`]). Renders to nothing; `level` is 0
+    /// for YAML, 1 for TOML. The content range covers the lines between the
+    /// fences (used for the mdast `yaml`/`toml` node's `value`).
+    Frontmatter,
     /// SPIKE (`ast` feature): a link reference definition `[label]: url "title"`.
     /// Renders to nothing (HTML output unchanged); carries an index into
     /// [`Tree::defs`] via [`Node::def`] for the mdast `definition` node.
@@ -930,6 +935,74 @@ impl<'a> Parser<'a> {
         }
     }
 
+    // ---- frontmatter (document-prefix grammar) --------------------------
+
+    /// Detect and consume a leading YAML (`---`) / TOML (`+++`) frontmatter
+    /// block. Returns the byte offset to resume the block loop at (just past the
+    /// closing fence line), or `None` if the input does not open with a
+    /// *complete* frontmatter block — in which case nothing is consumed and the
+    /// fence text parses normally (an unmatched `---` becomes a thematic break).
+    fn try_frontmatter(&mut self, bytes: &[u8]) -> Option<usize> {
+        // The opening fence is the very first line, unindented, exactly three
+        // `-`/`+` markers then only trailing spaces/tabs.
+        let first_end = memchr1(bytes, b'\n').map_or(bytes.len(), |p| p);
+        let first = trim_cr(&bytes[..first_end]);
+        let marker = match first.first()? {
+            b'-' => b'-',
+            b'+' => b'+',
+            _ => return None,
+        };
+        if !is_fm_fence(first, marker) {
+            return None;
+        }
+        // A closing fence is required; without a newline after the opener there
+        // can be no second line, so this is not frontmatter.
+        if first_end >= bytes.len() {
+            return None;
+        }
+        let content_start = first_end + 1;
+        let mut pos = content_start;
+        let mut lines = 1u32; // the opening fence line
+        while pos < bytes.len() {
+            let end = memchr1(&bytes[pos..], b'\n').map_or(bytes.len(), |p| pos + p);
+            let line = trim_cr(&bytes[pos..end]);
+            lines += 1;
+            if is_fm_fence(line, marker) {
+                // `cend` is the raw start of the closing line; `src_end` is the
+                // end of the closing fence's content (incl. trailing spaces,
+                // excl. the line ending) — mdast keeps a frontmatter's trailing
+                // spaces but not its newline.
+                self.push_frontmatter(marker, content_start, pos, pos + line.len());
+                self.line_number = lines;
+                return Some((end + 1).min(bytes.len()));
+            }
+            pos = end + 1;
+        }
+        None
+    }
+
+    /// Create the frontmatter node as the document's (already empty) first child.
+    /// It is born closed — block phase 1 never descends into it.
+    fn push_frontmatter(&mut self, marker: u8, cstart: usize, cend: usize, src_end: usize) {
+        let idx = self.nodes.len();
+        let mut node = Node::new(Kind::Frontmatter, 0, 1);
+        node.open = false;
+        node.content_src = true;
+        node.cstart = cstart as u32;
+        node.cend = cend as u32;
+        node.level = if marker == b'+' { 1 } else { 0 }; // 0 = yaml, 1 = toml
+        #[cfg(feature = "ast")]
+        {
+            node.src_start = 0;
+            node.src_end = src_end as u32;
+        }
+        #[cfg(not(feature = "ast"))]
+        let _ = src_end;
+        self.nodes.push(node);
+        self.nodes[0].first_child = idx as u32;
+        self.nodes[0].last_child = idx as u32;
+    }
+
     // ---- main loop ------------------------------------------------------
 
     fn parse(mut self, src: &'a str) -> Tree<'a> {
@@ -942,6 +1015,15 @@ impl<'a> Parser<'a> {
         // a Vec of every line — no big allocation, one pass, vectorized split.
         let bytes = src.as_bytes();
         let mut start = 0;
+        // Frontmatter is a document-prefix grammar: a `---`/`+++` fence pair at
+        // the very first byte. Consumed before the block loop so the rest parses
+        // normally (and `---` only becomes a thematic break when there is no
+        // matching close).
+        if self.opts.frontmatter
+            && let Some(resume) = self.try_frontmatter(bytes)
+        {
+            start = resume;
+        }
         while start < bytes.len() {
             let end = memchr1(&bytes[start..], b'\n').map_or(bytes.len(), |p| start + p);
             self.line_src_start = start;
@@ -1123,6 +1205,9 @@ impl<'a> Parser<'a> {
     fn continue_block(&mut self, c: usize) -> u8 {
         match self.nodes[c].kind {
             Kind::Document => 0,
+            // Frontmatter is consumed in a pre-pass and born closed, so it is
+            // never an open container here; treat as not-matched defensively.
+            Kind::Frontmatter => 1,
             Kind::BlockQuote => {
                 if !self.indented && peek(self.line, self.next_nonspace) == Some(b'>') {
                     self.advance_next_nonspace();
@@ -1609,6 +1694,25 @@ fn maybe_special(c: Option<u8>) -> bool {
         c,
         Some(b'#' | b'>' | b'`' | b'~' | b'*' | b'+' | b'-' | b'_' | b'=' | b'<' | b'0'..=b'9')
     )
+}
+
+/// Drop a single trailing `\r` so CRLF fence lines test like LF ones.
+fn trim_cr(line: &[u8]) -> &[u8] {
+    if let [rest @ .., b'\r'] = line {
+        rest
+    } else {
+        line
+    }
+}
+
+/// A frontmatter fence: exactly three `marker` bytes then only spaces/tabs
+/// (a trailing `\r` already trimmed). Four or more markers is not a fence.
+fn is_fm_fence(line: &[u8], marker: u8) -> bool {
+    line.len() >= 3
+        && line[0] == marker
+        && line[1] == marker
+        && line[2] == marker
+        && line[3..].iter().all(|&b| b == b' ' || b == b'\t')
 }
 
 fn can_contain(parent: Kind, child: Kind) -> bool {

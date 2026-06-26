@@ -203,6 +203,8 @@ fn render_node(tree: &Tree, idx: usize, out: &mut String, scratch: &mut Scratch)
         // SPIKE (`ast` feature): reference definitions produce no HTML.
         #[cfg(feature = "ast")]
         Kind::Definition => {}
+        // Frontmatter produces no HTML output (matching remark-frontmatter).
+        Kind::Frontmatter => {}
         Kind::BlockQuote => {
             cr(out);
             out.push_str("<blockquote>");
