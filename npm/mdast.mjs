@@ -102,14 +102,16 @@ function toFlags(options) {
 // walks). Measured ~6× faster string handling than thousands of per-string decode
 // calls. The position path keeps the inline format (position dominates its cost).
 function readWire(ex, markdown, flags, withPos) {
-  const buf = encoder.encode(markdown);
-  const inPtr = ex.sparkdown_alloc(buf.length);
-  new Uint8Array(ex.memory.buffer).set(buf, inPtr);
+  // UTF-8 is ≤ 3 bytes per UTF-16 code unit; encode straight into wasm memory
+  // (no intermediate Uint8Array, no separate copy) via TextEncoder.encodeInto.
+  const cap = markdown.length * 3;
+  const inPtr = ex.sparkdown_alloc(cap);
+  const len = encoder.encodeInto(markdown, new Uint8Array(ex.memory.buffer, inPtr, cap)).written;
   const ptr = !withPos
-    ? ex.sparkdown_to_mdast_wire_fast_opts(inPtr, buf.length, flags)
+    ? ex.sparkdown_to_mdast_wire_fast_opts(inPtr, len, flags)
     : flags
-      ? ex.sparkdown_to_mdast_wire_opts(inPtr, buf.length, flags)
-      : ex.sparkdown_to_mdast_wire(inPtr, buf.length);
+      ? ex.sparkdown_to_mdast_wire_opts(inPtr, len, flags)
+      : ex.sparkdown_to_mdast_wire(inPtr, len);
 
   const mem = ex.memory.buffer;
   const dv = new DataView(mem);
@@ -216,19 +218,21 @@ function readWire(ex, markdown, flags, withPos) {
 
   const tree = node();
   ex.sparkdown_free(ptr, 4 + total);
-  ex.sparkdown_free(inPtr, buf.length);
+  ex.sparkdown_free(inPtr, cap);
   return tree;
 }
 
 function renderViaMdast(ex, markdown, flags) {
-  const input = encoder.encode(markdown);
-  const inPtr = ex.sparkdown_alloc(input.length);
-  new Uint8Array(ex.memory.buffer).set(input, inPtr);
-  const outPtr = ex.sparkdown_to_html_via_mdast_opts(inPtr, input.length, flags);
+  // Encode straight into wasm memory (no intermediate array, no copy); UTF-8 is
+  // ≤ 3 bytes per UTF-16 code unit.
+  const cap = markdown.length * 3;
+  const inPtr = ex.sparkdown_alloc(cap);
+  const inLen = encoder.encodeInto(markdown, new Uint8Array(ex.memory.buffer, inPtr, cap)).written;
+  const outPtr = ex.sparkdown_to_html_via_mdast_opts(inPtr, inLen, flags);
   const b = ex.memory.buffer;
   const len = new DataView(b).getUint32(outPtr, true);
   const html = decoder.decode(new Uint8Array(b, outPtr + 4, len));
-  ex.sparkdown_free(inPtr, input.length);
+  ex.sparkdown_free(inPtr, cap);
   ex.sparkdown_free(outPtr, 4 + len);
   return html;
 }

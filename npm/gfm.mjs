@@ -85,15 +85,16 @@ function toFlags(options) {
 }
 
 function render(ex, markdown, flags) {
-  const input = encoder.encode(markdown);
-  const inPtr = ex.sparkdown_alloc(input.length);
-  // Re-read memory.buffer after each call that may grow (and detach) it.
-  new Uint8Array(ex.memory.buffer).set(input, inPtr);
-  const outPtr = ex.sparkdown_to_html_opts(inPtr, input.length, flags);
+  // Encode straight into wasm memory (no intermediate array, no copy); UTF-8 is
+  // ≤ 3 bytes per UTF-16 code unit. The view re-reads memory.buffer after alloc.
+  const cap = markdown.length * 3;
+  const inPtr = ex.sparkdown_alloc(cap);
+  const inLen = encoder.encodeInto(markdown, new Uint8Array(ex.memory.buffer, inPtr, cap)).written;
+  const outPtr = ex.sparkdown_to_html_opts(inPtr, inLen, flags);
   const buf = ex.memory.buffer;
   const htmlLen = new DataView(buf).getUint32(outPtr, true);
   const html = decoder.decode(new Uint8Array(buf, outPtr + 4, htmlLen));
-  ex.sparkdown_free(inPtr, input.length);
+  ex.sparkdown_free(inPtr, cap);
   ex.sparkdown_free(outPtr, 4 + htmlLen);
   return html;
 }
