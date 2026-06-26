@@ -54,6 +54,7 @@ fn heading_ids() {
     );
 }
 
+#[cfg(feature = "frontmatter")]
 #[test]
 fn frontmatter() {
     let on = Options {

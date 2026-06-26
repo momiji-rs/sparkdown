@@ -117,6 +117,15 @@ impl Options {
     #[cfg(not(feature = "directives"))]
     pub(crate) const DIRECTIVES: bool = false;
 
+    /// `true` iff the `frontmatter` Cargo feature is compiled in. Used as
+    /// `Options::FRONTMATTER && opts.frontmatter` so that, without the feature, the
+    /// frontmatter check folds to `false` and its code is eliminated — the default
+    /// build is byte-for-byte the pure-CommonMark fast path.
+    #[cfg(feature = "frontmatter")]
+    pub(crate) const FRONTMATTER: bool = true;
+    #[cfg(not(feature = "frontmatter"))]
+    pub(crate) const FRONTMATTER: bool = false;
+
     /// GitHub Flavored Markdown: every GFM extension enabled. (Effective only
     /// when the crate is built with the `gfm` feature.)
     pub const fn gfm() -> Self {

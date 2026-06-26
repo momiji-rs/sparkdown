@@ -1083,6 +1083,7 @@ impl<'a> Parser<'a> {
     /// closing fence line), or `None` if the input does not open with a
     /// *complete* frontmatter block — in which case nothing is consumed and the
     /// fence text parses normally (an unmatched `---` becomes a thematic break).
+    #[cfg(feature = "frontmatter")]
     fn try_frontmatter(&mut self, bytes: &[u8]) -> Option<usize> {
         // The opening fence is the very first line, unindented, exactly three
         // `-`/`+` markers then only trailing spaces/tabs.
@@ -1124,6 +1125,7 @@ impl<'a> Parser<'a> {
 
     /// Create the frontmatter node as the document's (already empty) first child.
     /// It is born closed — block phase 1 never descends into it.
+    #[cfg(feature = "frontmatter")]
     fn push_frontmatter(&mut self, marker: u8, cstart: usize, cend: usize, src_end: usize) {
         let idx = self.nodes.len();
         let mut node = Node::new(Kind::Frontmatter, 0, 1);
@@ -1160,7 +1162,9 @@ impl<'a> Parser<'a> {
         // the very first byte. Consumed before the block loop so the rest parses
         // normally (and `---` only becomes a thematic break when there is no
         // matching close).
-        if self.opts.frontmatter
+        #[cfg(feature = "frontmatter")]
+        if Options::FRONTMATTER
+            && self.opts.frontmatter
             && let Some(resume) = self.try_frontmatter(bytes)
         {
             start = resume;
@@ -2181,6 +2185,7 @@ fn parse_footnote_label_def(line: &[u8]) -> Option<(String, usize)> {
 
 /// A frontmatter fence: exactly three `marker` bytes then only spaces/tabs
 /// (a trailing `\r` already trimmed). Four or more markers is not a fence.
+#[cfg(feature = "frontmatter")]
 fn is_fm_fence(line: &[u8], marker: u8) -> bool {
     line.len() >= 3
         && line[0] == marker

@@ -93,7 +93,7 @@ mod diagram {
     }
 }
 
-#[cfg(feature = "ast")]
+#[cfg(all(feature = "ast", feature = "frontmatter"))]
 mod frontmatter {
     use sparkdown::Options;
     use sparkdown::ast::to_mdast_json_opts;

@@ -59,8 +59,10 @@ pub enum Mdast {
     /// Raw HTML — block (here) or inline (from the inline stream).
     Html(String),
     /// YAML frontmatter (`---`); `value` is the text between the fences.
+    #[cfg(feature = "frontmatter")]
     Yaml(String),
     /// TOML frontmatter (`+++`); `value` is the text between the fences.
+    #[cfg(feature = "frontmatter")]
     Toml(String),
     /// GFM footnote definition `[^label]: …` — a block container.
     #[cfg(feature = "footnotes")]
@@ -291,6 +293,7 @@ fn fn_scratch(
 /// The mdast `value` of a frontmatter node: the raw text between the fences with
 /// exactly one trailing line ending dropped. Internal line endings are kept
 /// verbatim — remark-frontmatter does not normalize CRLF inside the value.
+#[cfg(feature = "frontmatter")]
 fn frontmatter_value(raw: &str) -> &str {
     let raw = raw.strip_suffix('\n').unwrap_or(raw);
     raw.strip_suffix('\r').unwrap_or(raw)
@@ -364,6 +367,11 @@ fn block(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> (Mdast
                 tree.html_ast_end(idx) as usize,
             )
         }
+        // The `Frontmatter` variant is always compiled (to keep the hot block
+        // matches stable), but a node only exists with the `frontmatter` feature.
+        #[cfg(not(feature = "frontmatter"))]
+        Kind::Frontmatter => unreachable!("Frontmatter node requires the `frontmatter` feature"),
+        #[cfg(feature = "frontmatter")]
         Kind::Frontmatter => {
             // `level` 1 = TOML (`+++`), 0 = YAML (`---`). The span is already the
             // exact mdast range: start at offset 0, end at the closing fence's
@@ -1132,6 +1140,11 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
             w_str(tree.html_value(idx), out);
             eb
         }
+        // The `Frontmatter` variant is always compiled (to keep the hot block
+        // matches stable), but a node only exists with the `frontmatter` feature.
+        #[cfg(not(feature = "frontmatter"))]
+        Kind::Frontmatter => unreachable!("Frontmatter node requires the `frontmatter` feature"),
+        #[cfg(feature = "frontmatter")]
         Kind::Frontmatter => {
             let value = frontmatter_value(tree.content(idx));
             out.push(if node.level == 1 { 21 } else { 20 }); // 20 = yaml, 21 = toml
@@ -1845,11 +1858,13 @@ fn write_json_pos(node: &Mdast, pos: Option<&Pos>, out: &mut String) {
             key("value", out);
             json_str(v, out);
         }
+        #[cfg(feature = "frontmatter")]
         Mdast::Yaml(v) => {
             out.push_str("\"yaml\",");
             key("value", out);
             json_str(v, out);
         }
+        #[cfg(feature = "frontmatter")]
         Mdast::Toml(v) => {
             out.push_str("\"toml\",");
             key("value", out);
@@ -2104,12 +2119,12 @@ pub fn node_count(node: &Mdast) -> usize {
         | LinkReference { children, .. } => 1 + kids(children),
         #[cfg(feature = "footnotes")]
         FootnoteReference { .. } => 1,
+        #[cfg(feature = "frontmatter")]
+        Yaml(_) | Toml(_) => 1,
         ThematicBreak
         | Code { .. }
         | Definition { .. }
         | Html(_)
-        | Yaml(_)
-        | Toml(_)
         | Text(_)
         | InlineCode(_)
         | Break

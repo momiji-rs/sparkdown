@@ -50,6 +50,12 @@ deflist = []
 # leaf `::name…`, and container `:::name … :::` directives. Off, none of this heavy
 # code is compiled — the parser stays byte-for-byte the pure-CommonMark fast path.
 directives = []
+# Frontmatter extension (opt-in, OFF by default): a YAML (`---`) or TOML (`+++`)
+# fenced block at the very start of the document (the remark-frontmatter grammar).
+# Renders to nothing; with `ast` it becomes a `yaml`/`toml` mdast node. Off, none
+# of this code is compiled — the parser stays byte-for-byte the pure-CommonMark
+# fast path.
+frontmatter = []
 # Mirrors rostdown: opt-in scoped global bump allocator (src/arena.rs). An
 # embedder that enables it must install `sparkdown::ScopedAlloc` as its
 # `#[global_allocator]`. The local bump (src/bump.rs) is always on.
