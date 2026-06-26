@@ -264,6 +264,7 @@ mod definition_lists_mdast {
     }
 }
 
+#[cfg(feature = "directives")]
 mod directives {
     use sparkdown::{Options, to_html_with};
 
@@ -326,7 +327,7 @@ mod directives {
     }
 }
 
-#[cfg(feature = "ast")]
+#[cfg(all(feature = "ast", feature = "directives"))]
 mod directives_mdast {
     use sparkdown::Options;
     use sparkdown::ast::to_mdast_json_opts;

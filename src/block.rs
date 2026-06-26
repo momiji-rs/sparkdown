@@ -55,6 +55,12 @@ pub enum Kind {
     DefDesc,
     /// Leaf directive `::name[label]{attrs}` (one line). Carries its payload via
     /// `Node::fn_idx` → [`Tree::directives`]; the `[label]` is inline content.
+    ///
+    /// The variant (and its `ContainerDirective` sibling) stays compiled even
+    /// without the `directives` feature (only their *producer* `start_directive`
+    /// and the heavy directive code are cfg'd out, so no such node is ever
+    /// created): removing a variant shrinks the hot `continue_block`/`can_contain`
+    /// matches and perturbs their codegen (measured +2% on the default path).
     LeafDirective,
     /// Container directive `:::name[label]{attrs}` … `:::` — a block container
     /// (its content parses as markdown). Colon-fenced like a code block
@@ -95,6 +101,7 @@ pub struct FnDef {
 /// `name`, ordered `attributes`, and the source byte range of its `[label]`
 /// content (if any). Indexed by `Node::fn_idx` (reused — a node is never both a
 /// footnote definition and a directive) into [`Tree::directives`].
+#[cfg(feature = "directives")]
 #[derive(Clone)]
 pub struct DirData {
     pub name: String,
@@ -236,6 +243,7 @@ pub struct Tree<'a> {
     pub footnote_ids: std::collections::HashSet<String>,
     /// Block-directive payloads (`Kind::LeafDirective`/`ContainerDirective`),
     /// indexed by `Node::fn_idx`.
+    #[cfg(feature = "directives")]
     pub directives: Vec<DirData>,
     /// SPIKE (`ast` feature): payloads for `Kind::Definition` nodes; indexed by
     /// `Node::def`.
@@ -266,11 +274,13 @@ impl Tree<'_> {
     }
 
     /// Block-directive payload for a `Kind::LeafDirective`/`ContainerDirective`.
+    #[cfg(feature = "directives")]
     pub fn directive(&self, idx: usize) -> &DirData {
         &self.directives[self.nodes[idx].fn_idx as usize]
     }
 
     /// A raw slice of the original source by byte range (e.g. a directive label).
+    #[cfg(feature = "directives")]
     pub fn source_range(&self, start: u32, end: u32) -> &str {
         &self.source[start as usize..end as usize]
     }
@@ -437,6 +447,7 @@ struct Parser<'a> {
     footnote_ids: std::collections::HashSet<String>,
     /// Block-directive payloads, in creation order; a node's `Node::fn_idx`
     /// indexes here.
+    #[cfg(feature = "directives")]
     directives: Vec<DirData>,
     /// SPIKE (`ast` feature): payloads for `Kind::Definition` nodes, in creation
     /// order; a node's `Node::def` indexes here.
@@ -490,6 +501,7 @@ impl<'a> Parser<'a> {
             fn_defs: Vec::new(),
             #[cfg(feature = "footnotes")]
             footnote_ids: std::collections::HashSet::new(),
+            #[cfg(feature = "directives")]
             directives: Vec::new(),
             #[cfg(feature = "ast")]
             defs: Vec::new(),
@@ -1180,6 +1192,7 @@ impl<'a> Parser<'a> {
             fn_defs: self.fn_defs,
             #[cfg(feature = "footnotes")]
             footnote_ids: self.footnote_ids,
+            #[cfg(feature = "directives")]
             directives: self.directives,
             #[cfg(feature = "ast")]
             defs: self.defs,
@@ -1251,7 +1264,8 @@ impl<'a> Parser<'a> {
             // `maybe_special`); let `:` lines through to their matchers when
             // either extension is enabled.
             let fast_skip = fast_skip
-                && !(((Options::DEFLIST && self.opts.deflist) || self.opts.directives)
+                && !(((Options::DEFLIST && self.opts.deflist)
+                    || (Options::DIRECTIVES && self.opts.directives))
                     && first == Some(b':'));
             if fast_skip {
                 self.advance_next_nonspace();
@@ -1441,7 +1455,11 @@ impl<'a> Parser<'a> {
             // A container directive runs until its closing colon fence (a line of
             // ≥ the opening colon count); otherwise its content flows in as
             // markdown with no prefix stripping.
+            // Arm stays compiled (keeps the hot continue match stable); without
+            // the `directives` feature no `ContainerDirective` node is ever
+            // created, so the body is gated out and the arm folds into `0`.
             Kind::ContainerDirective => {
+                #[cfg(feature = "directives")]
                 if !self.indented
                     && is_colon_close(self.line, self.next_nonspace, self.nodes[c].fence_len)
                 {
@@ -1536,7 +1554,13 @@ impl<'a> Parser<'a> {
             9 => self.start_def_list(container),
             #[cfg(not(feature = "deflist"))]
             9 => 0,
+            // Directive slot keeps main's index (10); its body is the only cfg'd
+            // part — a no-op `=> 0` without the feature, so the dispatch order is
+            // byte-identical to the proven-neutral baseline.
+            #[cfg(feature = "directives")]
             10 => self.start_directive(),
+            #[cfg(not(feature = "directives"))]
+            10 => 0,
             #[cfg(feature = "gfm")]
             11 => self.start_table(container),
             _ => 0,
@@ -1912,6 +1936,7 @@ impl<'a> Parser<'a> {
     /// container `:::name…` … `:::`. The leading colon run selects the form (2 =
     /// leaf, ≥3 = container). The header (`name[label]{attrs}`) is parsed once and
     /// stashed in `directives`; the opening line must hold nothing but the header.
+    #[cfg(feature = "directives")]
     fn start_directive(&mut self) -> u8 {
         if !self.opts.directives || self.indented {
             return 0;
@@ -2359,6 +2384,7 @@ fn is_closing_fence(line: &[u8], from: usize, fence_char: u8, fence_len: usize) 
 
 /// A container-directive closing fence: a run of `≥ max(fence_len, 3)` colons
 /// followed only by whitespace.
+#[cfg(feature = "directives")]
 fn is_colon_close(line: &[u8], from: usize, fence_len: usize) -> bool {
     let rest = &line[from..];
     let run = rest.iter().take_while(|&&b| b == b':').count();

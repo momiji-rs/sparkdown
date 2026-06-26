@@ -46,6 +46,10 @@ footnotes = []
 # list grammar). Off, none of this heavy code is compiled — the parser stays
 # byte-for-byte the pure-CommonMark fast path.
 deflist = []
+# remark-directive extension (opt-in, OFF by default): inline `:name[label]{attrs}`,
+# leaf `::name…`, and container `:::name … :::` directives. Off, none of this heavy
+# code is compiled — the parser stays byte-for-byte the pure-CommonMark fast path.
+directives = []
 # Mirrors rostdown: opt-in scoped global bump allocator (src/arena.rs). An
 # embedder that enables it must install `sparkdown::ScopedAlloc` as its
 # `#[global_allocator]`. The local bump (src/bump.rs) is always on.

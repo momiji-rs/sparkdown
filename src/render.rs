@@ -276,6 +276,7 @@ fn cr(out: &mut String) {
 /// convention: the name is the element, attributes become HTML attributes). The
 /// name is emitted verbatim; attribute values are HTML-escaped. Shared with the
 /// inline text-directive renderer.
+#[cfg(feature = "directives")]
 pub(crate) fn directive_open_tag(name: &str, attrs: &[(String, String)], out: &mut String) {
     out.push('<');
     out.push_str(name);
@@ -428,37 +429,45 @@ fn render_node(tree: &Tree, idx: usize, out: &mut String, scratch: &mut Scratch)
                 out.push_str("</dt>\n");
             }
         }
+        // Directive arms stay compiled (keep the hot render match stable); without
+        // the `directives` feature no such node exists, so the bodies are gated out.
         Kind::LeafDirective => {
             // Convention: the directive name is the element; the `[label]` is its
             // inline content. (HTML is not the gate-able output; mdast is.)
-            let d = tree.directive(idx);
-            cr(out);
-            directive_open_tag(&d.name, &d.attrs, out);
-            if let Some((s, e)) = d.label {
-                render_inline(
-                    tree.source_range(s, e),
-                    out,
-                    &tree.refmap,
-                    scratch,
-                    tree.opts,
-                );
+            #[cfg(feature = "directives")]
+            {
+                let d = tree.directive(idx);
+                cr(out);
+                directive_open_tag(&d.name, &d.attrs, out);
+                if let Some((s, e)) = d.label {
+                    render_inline(
+                        tree.source_range(s, e),
+                        out,
+                        &tree.refmap,
+                        scratch,
+                        tree.opts,
+                    );
+                }
+                out.push_str("</");
+                out.push_str(&d.name);
+                out.push('>');
+                cr(out);
             }
-            out.push_str("</");
-            out.push_str(&d.name);
-            out.push('>');
-            cr(out);
         }
         Kind::ContainerDirective => {
-            let d = tree.directive(idx);
-            cr(out);
-            directive_open_tag(&d.name, &d.attrs, out);
-            cr(out);
-            children(tree, idx, out, scratch);
-            cr(out);
-            out.push_str("</");
-            out.push_str(&d.name);
-            out.push('>');
-            cr(out);
+            #[cfg(feature = "directives")]
+            {
+                let d = tree.directive(idx);
+                cr(out);
+                directive_open_tag(&d.name, &d.attrs, out);
+                cr(out);
+                children(tree, idx, out, scratch);
+                cr(out);
+                out.push_str("</");
+                out.push_str(&d.name);
+                out.push('>');
+                cr(out);
+            }
         }
         Kind::DefDesc => {
             #[cfg(feature = "deflist")]

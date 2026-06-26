@@ -108,6 +108,15 @@ impl Options {
     #[cfg(not(feature = "deflist"))]
     pub(crate) const DEFLIST: bool = false;
 
+    /// `true` iff the `directives` Cargo feature is compiled in. Used as
+    /// `Options::DIRECTIVES && opts.directives` so that, without the feature, every
+    /// directive check folds to `false` and its code is eliminated — the default
+    /// build is byte-for-byte the pure-CommonMark fast path.
+    #[cfg(feature = "directives")]
+    pub(crate) const DIRECTIVES: bool = true;
+    #[cfg(not(feature = "directives"))]
+    pub(crate) const DIRECTIVES: bool = false;
+
     /// GitHub Flavored Markdown: every GFM extension enabled. (Effective only
     /// when the crate is built with the `gfm` feature.)
     pub const fn gfm() -> Self {

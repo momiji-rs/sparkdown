@@ -83,12 +83,14 @@ pub enum Mdast {
         children: Vec<Mdast>,
     },
     /// remark-directive `containerDirective` (`:::name … :::`) — block children.
+    #[cfg(feature = "directives")]
     ContainerDirective {
         name: String,
         attributes: Vec<(String, String)>,
         children: Vec<Mdast>,
     },
     /// remark-directive `leafDirective` (`::name`) — inline children (the label).
+    #[cfg(feature = "directives")]
     LeafDirective {
         name: String,
         attributes: Vec<(String, String)>,
@@ -96,6 +98,7 @@ pub enum Mdast {
     },
     /// A container directive's `[label]`: serialized as a `paragraph` carrying
     /// `data: { directiveLabel: true }` (matching remark-directive).
+    #[cfg(feature = "directives")]
     DirectiveLabel(Vec<Mdast>),
     // --- inline ---
     Text(String),
@@ -133,6 +136,7 @@ pub enum Mdast {
         label: String,
     },
     /// remark-directive inline `textDirective` (`:name[label]{attrs}`).
+    #[cfg(feature = "directives")]
     TextDirective {
         name: String,
         attributes: Vec<(String, String)>,
@@ -520,6 +524,13 @@ fn block(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> (Mdast
                 eb,
             )
         }
+        // The directive variants stay compiled (to keep the hot block match
+        // stable), but a node only exists with the `directives` feature.
+        #[cfg(not(feature = "directives"))]
+        Kind::LeafDirective | Kind::ContainerDirective => {
+            unreachable!("directive nodes require the `directives` feature")
+        }
+        #[cfg(feature = "directives")]
         Kind::LeafDirective => {
             let d = tree.directive(idx);
             let eb = ctx.rtrim_nl(se);
@@ -534,6 +545,7 @@ fn block(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> (Mdast
                 eb,
             )
         }
+        #[cfg(feature = "directives")]
         Kind::ContainerDirective => {
             let d = tree.directive(idx);
             // A `[label]` on the opener becomes a leading `paragraph` carrying
@@ -576,6 +588,7 @@ fn block(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> (Mdast
 
 /// Build the inline children of a block directive's `[label]` (empty when absent).
 /// The label is a contiguous source range, so child token offsets map directly.
+#[cfg(feature = "directives")]
 fn directive_label_children(
     tree: &Tree,
     d: &crate::block::DirData,
@@ -682,10 +695,13 @@ enum Frame {
 /// source `base + o`); when `None` (buffered content) or a token span is unset,
 /// the block-granular `bpos` is used.
 fn build_inline(
-    content: &str,
+    // `content`/`tree`/`scratch` are consumed only by the `TextDirective` arm
+    // (it re-tokenizes a directive `[label]`), which is cfg'd out without the
+    // `directives` feature — so they are threaded but unread in that build.
+    #[cfg_attr(not(feature = "directives"), allow(unused_variables))] content: &str,
     toks: Vec<SpanTok>,
-    tree: &Tree,
-    scratch: &mut Scratch,
+    #[cfg_attr(not(feature = "directives"), allow(unused_variables))] tree: &Tree,
+    #[cfg_attr(not(feature = "directives"), allow(unused_variables))] scratch: &mut Scratch,
     ctx: &PosCtx,
     map: &dyn Fn(u32) -> usize,
     bpos: &Pos,
@@ -775,6 +791,7 @@ fn build_inline(
                     Box::new(Mdast::FootnoteReference { identifier, label }),
                 ));
             }
+            #[cfg(feature = "directives")]
             InlineTok::TextDirective { name, attrs, label } => {
                 let p = mkpos(start, end);
                 let children = match label {
@@ -1233,6 +1250,13 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
             w_u32_at(out, coff, n);
             last
         }
+        // The directive variants stay compiled (to keep the hot block match
+        // stable), but a node only exists with the `directives` feature.
+        #[cfg(not(feature = "directives"))]
+        Kind::LeafDirective | Kind::ContainerDirective => {
+            unreachable!("directive nodes require the `directives` feature")
+        }
+        #[cfg(feature = "directives")]
         Kind::LeafDirective => {
             let d = tree.directive(idx);
             let eb = ctx.rtrim_nl(se);
@@ -1251,6 +1275,7 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
             w_u32_at(out, coff, n);
             eb
         }
+        #[cfg(feature = "directives")]
         Kind::ContainerDirective => {
             let d = tree.directive(idx);
             out.push(29); // containerDirective
@@ -1371,6 +1396,7 @@ fn inline_wire(
 /// Emit the inline content of a raw source range `body` (starting at source byte
 /// `src_start`) to wire — used for a block directive's `[label]`. Returns the
 /// label's source byte end and its child count.
+#[cfg(feature = "directives")]
 fn inline_wire_src(
     tree: &Tree,
     src_start: u32,
@@ -1397,6 +1423,7 @@ fn inline_wire_src(
 
 /// Write an ordered attribute object to wire: `u32` count, then `(key, value)`
 /// string pairs.
+#[cfg(feature = "directives")]
 fn w_attrs(attrs: &[(String, String)], out: &mut Vec<u8>) {
     w_u32(attrs.len() as u32, out);
     for (k, v) in attrs {
@@ -1559,6 +1586,7 @@ impl InlineSink for WireSink<'_> {
         w_str(label, self.out);
         self.bump();
     }
+    #[cfg(feature = "directives")]
     fn text_directive(
         &mut self,
         name: &str,
@@ -1709,6 +1737,7 @@ fn json_opt(v: &Option<String>, out: &mut String) {
 }
 
 /// Write a directive `attributes` object `{"k":"v",…}` in insertion order.
+#[cfg(feature = "directives")]
 fn json_attrs(attrs: &[(String, String)], out: &mut String) {
     out.push('{');
     for (i, (k, v)) in attrs.iter().enumerate() {
@@ -1862,6 +1891,7 @@ fn write_json_pos(node: &Mdast, pos: Option<&Pos>, out: &mut String) {
             key("children", out);
             json_children(children, out);
         }
+        #[cfg(feature = "directives")]
         Mdast::ContainerDirective {
             name,
             attributes,
@@ -1877,6 +1907,7 @@ fn write_json_pos(node: &Mdast, pos: Option<&Pos>, out: &mut String) {
             key("children", out);
             json_children(children, out);
         }
+        #[cfg(feature = "directives")]
         Mdast::LeafDirective {
             name,
             attributes,
@@ -1892,6 +1923,7 @@ fn write_json_pos(node: &Mdast, pos: Option<&Pos>, out: &mut String) {
             key("children", out);
             json_children(children, out);
         }
+        #[cfg(feature = "directives")]
         Mdast::TextDirective {
             name,
             attributes,
@@ -1907,6 +1939,7 @@ fn write_json_pos(node: &Mdast, pos: Option<&Pos>, out: &mut String) {
             key("children", out);
             json_children(children, out);
         }
+        #[cfg(feature = "directives")]
         Mdast::DirectiveLabel(children) => {
             out.push_str("\"paragraph\",");
             key("data", out);
@@ -2051,21 +2084,23 @@ pub fn node_count(node: &Mdast) -> usize {
     use Mdast::*;
     let kids = |c: &[Mdast]| c.iter().map(node_count).sum::<usize>();
     match node {
-        Root(c) | Paragraph(c) | Blockquote(c) | Emphasis(c) | Strong(c) | Delete(c)
-        | DirectiveLabel(c) => 1 + kids(c),
+        Root(c) | Paragraph(c) | Blockquote(c) | Emphasis(c) | Strong(c) | Delete(c) => 1 + kids(c),
+        #[cfg(feature = "directives")]
+        DirectiveLabel(c) => 1 + kids(c),
         #[cfg(feature = "deflist")]
         DefList(c) | DefListTerm(c) => 1 + kids(c),
         #[cfg(feature = "deflist")]
         DefListDescription { children, .. } => 1 + kids(children),
         #[cfg(feature = "footnotes")]
         FootnoteDefinition { children, .. } => 1 + kids(children),
+        #[cfg(feature = "directives")]
+        ContainerDirective { children, .. }
+        | LeafDirective { children, .. }
+        | TextDirective { children, .. } => 1 + kids(children),
         Heading { children, .. }
         | List { children, .. }
         | ListItem { children, .. }
         | Link { children, .. }
-        | ContainerDirective { children, .. }
-        | LeafDirective { children, .. }
-        | TextDirective { children, .. }
         | LinkReference { children, .. } => 1 + kids(children),
         #[cfg(feature = "footnotes")]
         FootnoteReference { .. } => 1,

@@ -654,6 +654,7 @@ enum Sem {
     FootnoteRef { identifier: String, label: String },
     /// remark-directive inline `:name[label]{attrs}` → mdast `textDirective`. The
     /// `label` is a content byte range (re-tokenized into children at build time).
+    #[cfg(feature = "directives")]
     TextDirective {
         name: String,
         attrs: Vec<(String, String)>,
@@ -719,6 +720,7 @@ pub enum InlineTok {
     FootnoteRef { identifier: String, label: String },
     /// mdast `textDirective`. `label` is a content byte range whose inline content
     /// becomes the directive's children (re-tokenized by the AST builder).
+    #[cfg(feature = "directives")]
     TextDirective {
         name: String,
         attrs: Vec<(String, String)>,
@@ -850,6 +852,7 @@ fn list_to_tokens(list: &List, cur: &str, sem: &[Sem], out: &mut Vec<SpanTok>) {
                     identifier: identifier.clone(),
                     label: label.clone(),
                 },
+                #[cfg(feature = "directives")]
                 Sem::TextDirective { name, attrs, label } => InlineTok::TextDirective {
                     name: name.clone(),
                     attrs: attrs.clone(),
@@ -906,6 +909,7 @@ pub trait InlineSink {
     fn footnote_ref(&mut self, identifier: &str, label: &str, start: u32, end: u32);
     /// A remark-directive `textDirective`. `label` is a content byte range whose
     /// inline content forms the children (the wire emitter resolves it best-effort).
+    #[cfg(feature = "directives")]
     fn text_directive(
         &mut self,
         name: &str,
@@ -1010,6 +1014,7 @@ fn emit_inline<S: InlineSink>(list: &List, cur: &str, sem: &[Sem], sink: &mut S)
                     Sem::FootnoteRef { identifier, label } => {
                         sink.footnote_ref(identifier, label, s, e)
                     }
+                    #[cfg(feature = "directives")]
                     Sem::TextDirective { name, attrs, label } => {
                         sink.text_directive(name, attrs, *label, s, e)
                     }
@@ -1753,7 +1758,7 @@ pub fn render_inline(
     let al = Options::GFM && opts.autolink;
     let fno = Options::FOOTNOTES && opts.footnotes;
     let emo = Options::EMOJI && opts.emoji;
-    let dir = opts.directives;
+    let dir = Options::DIRECTIVES && opts.directives;
     match (opts.hard_wraps, Options::GFM && opts.strikethrough) {
         (false, false) => render_inline_impl::<false, false>(
             src, out, refmap, scratch, tf, al, fno, emo, dir, opts,
@@ -1835,7 +1840,9 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
     #[cfg_attr(not(feature = "footnotes"), allow(unused_variables))] fno: bool,
     emo: bool,
     dir: bool,
-    opts: Options,
+    // Without the `directives` feature its only consumer (the inline text-directive
+    // sub-render in the `b':'` arm) is cfg'd out, so it may be threaded but unread.
+    #[cfg_attr(not(feature = "directives"), allow(unused_variables))] opts: Options,
 ) {
     let bytes = src.as_bytes();
     // SPIKE: AST mode captures semantic nodes instead of HTML. `ast_mode` is a
@@ -2258,50 +2265,63 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                     cur.push_str(emoji);
                     i = e;
                     run = i;
-                } else if dir
-                    && !(i > 0 && bytes[i - 1] == b':')
-                    && bytes.get(i + 1) != Some(&b':')
-                    && let Some(h) = crate::directive::parse_header(&bytes[i + 1..])
-                    // A trailing `:` means this is a `:shortcode:`-shaped token, not
-                    // a text directive (matches micromark-extension-directive).
-                    && bytes.get(i + 1 + h.consumed) != Some(&b':')
-                {
-                    let ac = i + 1;
-                    let after = ac + h.consumed;
-                    let name = src[ac + h.name_start..ac + h.name_end].to_owned();
-                    let label = h.label.map(|(ls, le)| (ac + ls, ac + le));
-                    escape_html(&src[run..i], cur);
-                    if ast_mode {
-                        flush!(i);
-                        let si = sem.len() as u32;
-                        sem.push(Sem::TextDirective {
-                            name,
-                            attrs: h.attrs,
-                            label: label.map(|(s, e)| (s as u32, e as u32)),
-                        });
-                        let did = list.push(Node::Sem(si));
-                        cspan!(did, i, after);
-                        seg = cur.len();
-                    } else {
-                        // HTML convention: <name attrs>label</name>; the label is
-                        // inline content (sub-rendered with a scratch of its own).
-                        crate::render::directive_open_tag(&name, &h.attrs, cur);
-                        if let Some((ls, le)) = label {
-                            // The label is inline content; sub-render it with a
-                            // scratch of its own (the live one is mid-parse).
-                            let mut tmp = Scratch::new();
-                            let mut html = String::new();
-                            render_inline(&src[ls..le], &mut html, refmap, &mut tmp, opts);
-                            cur.push_str(&html);
-                        }
-                        cur.push_str("</");
-                        cur.push_str(&name);
-                        cur.push('>');
-                    }
-                    i = after;
-                    run = i;
                 } else {
-                    i += 1;
+                    // remark-directive inline `:name[label]{attrs}`. Without the
+                    // `directives` feature `dir` const-folds to `false` and this
+                    // whole detection is cfg'd out, so every other `:` advances by
+                    // one byte (the pure-CommonMark fast path).
+                    #[cfg(feature = "directives")]
+                    let handled = if dir
+                        && !(i > 0 && bytes[i - 1] == b':')
+                        && bytes.get(i + 1) != Some(&b':')
+                        && let Some(h) = crate::directive::parse_header(&bytes[i + 1..])
+                        // A trailing `:` means this is a `:shortcode:`-shaped token,
+                        // not a text directive (matches micromark-extension-directive).
+                        && bytes.get(i + 1 + h.consumed) != Some(&b':')
+                    {
+                        let ac = i + 1;
+                        let after = ac + h.consumed;
+                        let name = src[ac + h.name_start..ac + h.name_end].to_owned();
+                        let label = h.label.map(|(ls, le)| (ac + ls, ac + le));
+                        escape_html(&src[run..i], cur);
+                        if ast_mode {
+                            flush!(i);
+                            let si = sem.len() as u32;
+                            sem.push(Sem::TextDirective {
+                                name,
+                                attrs: h.attrs,
+                                label: label.map(|(s, e)| (s as u32, e as u32)),
+                            });
+                            let did = list.push(Node::Sem(si));
+                            cspan!(did, i, after);
+                            seg = cur.len();
+                        } else {
+                            // HTML convention: <name attrs>label</name>; the label is
+                            // inline content (sub-rendered with a scratch of its own).
+                            crate::render::directive_open_tag(&name, &h.attrs, cur);
+                            if let Some((ls, le)) = label {
+                                // The label is inline content; sub-render it with a
+                                // scratch of its own (the live one is mid-parse).
+                                let mut tmp = Scratch::new();
+                                let mut html = String::new();
+                                render_inline(&src[ls..le], &mut html, refmap, &mut tmp, opts);
+                                cur.push_str(&html);
+                            }
+                            cur.push_str("</");
+                            cur.push_str(&name);
+                            cur.push('>');
+                        }
+                        i = after;
+                        run = i;
+                        true
+                    } else {
+                        false
+                    };
+                    #[cfg(not(feature = "directives"))]
+                    let handled = false;
+                    if !handled {
+                        i += 1;
+                    }
                 }
             }
             // Skip plain text to the next significant byte in one SIMD pass —
@@ -2560,10 +2580,9 @@ fn ast_image_alt(list: &List, op_node: usize, rb_node: usize, cur: &str, sem: &[
                 Sem::Html(h) => s.push_str(h),
                 #[cfg(feature = "footnotes")]
                 Sem::FootnoteRef { .. } => {}
-                Sem::LinkOpen { .. }
-                | Sem::LinkRef { .. }
-                | Sem::Break
-                | Sem::TextDirective { .. } => {}
+                #[cfg(feature = "directives")]
+                Sem::TextDirective { .. } => {}
+                Sem::LinkOpen { .. } | Sem::LinkRef { .. } | Sem::Break => {}
             },
             Node::LinkClose => {}
         }
