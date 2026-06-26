@@ -109,7 +109,10 @@ fn main() {
 
     println!("\nfeature-tax — CommonMark spec ({kb} KB), {iters} iters");
     println!("build features: {feats}\n");
-    println!("  {:<26} {:>9} {:>9} {:>8}", "path", "us/op", "MB/s", "vs base");
+    println!(
+        "  {:<26} {:>9} {:>9} {:>8}",
+        "path", "us/op", "MB/s", "vs base"
+    );
     println!("  {:-<26} {:->9} {:->9} {:->8}", "", "", "", "");
     for (label, ns) in &rows {
         println!(

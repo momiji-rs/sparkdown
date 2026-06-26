@@ -22,7 +22,10 @@ mod emoji {
 
     #[test]
     fn unknown_and_case_sensitive_stay_literal() {
-        assert_eq!(to_html_with(":notanemoji:\n", &on()), "<p>:notanemoji:</p>\n");
+        assert_eq!(
+            to_html_with(":notanemoji:\n", &on()),
+            "<p>:notanemoji:</p>\n"
+        );
         // Shortcodes are lowercase; `:SMILE:` is not a match.
         assert_eq!(to_html_with(":SMILE:\n", &on()), "<p>:SMILE:</p>\n");
         // No closing colon → literal.
@@ -106,9 +109,15 @@ mod frontmatter {
     fn yaml_node() {
         // A `yaml` node whose value is the content between the fences, no newline.
         let j = to_mdast_json_opts("---\ntitle: Hi\nx: 1\n---\n", on());
-        assert!(j.contains(r#""type":"yaml","value":"title: Hi\nx: 1""#), "{j}");
+        assert!(
+            j.contains(r#""type":"yaml","value":"title: Hi\nx: 1""#),
+            "{j}"
+        );
         // Positioned at the document start, ending at the closing fence.
-        assert!(j.contains(r#""start":{"line":1,"column":1,"offset":0}"#), "{j}");
+        assert!(
+            j.contains(r#""start":{"line":1,"column":1,"offset":0}"#),
+            "{j}"
+        );
     }
 
     #[test]
@@ -197,7 +206,10 @@ mod definition_lists {
     #[test]
     fn marker_requires_space() {
         // `:NoSpace` is not a marker → plain paragraph.
-        assert_eq!(to_html_with("Term\n:NoSpace\n", &on()), "<p>Term\n:NoSpace</p>\n");
+        assert_eq!(
+            to_html_with("Term\n:NoSpace\n", &on()),
+            "<p>Term\n:NoSpace</p>\n"
+        );
         // An orphan marker (no preceding term) stays literal.
         assert_eq!(to_html_with(": orphan\n", &on()), "<p>: orphan</p>\n");
     }
@@ -229,13 +241,19 @@ mod definition_lists_mdast {
         let j = to_mdast_json_opts("Term\n: Def\n", on());
         assert!(j.contains(r#""type":"defList""#), "{j}");
         assert!(j.contains(r#""type":"defListTerm""#), "{j}");
-        assert!(j.contains(r#""type":"defListDescription","spread":false"#), "{j}");
+        assert!(
+            j.contains(r#""type":"defListDescription","spread":false"#),
+            "{j}"
+        );
     }
 
     #[test]
     fn loose_sets_spread() {
         let j = to_mdast_json_opts("Term\n\n: Def\n", on());
-        assert!(j.contains(r#""type":"defListDescription","spread":true"#), "{j}");
+        assert!(
+            j.contains(r#""type":"defListDescription","spread":true"#),
+            "{j}"
+        );
     }
 
     #[test]
@@ -323,7 +341,9 @@ mod directives_mdast {
     fn text_directive_node() {
         let j = to_mdast_json_opts(":name[label]{#id key=val}\n", on());
         assert!(
-            j.contains(r#""type":"textDirective","name":"name","attributes":{"id":"id","key":"val"}"#),
+            j.contains(
+                r#""type":"textDirective","name":"name","attributes":{"id":"id","key":"val"}"#
+            ),
             "{j}"
         );
         // The label is inline children.
@@ -335,7 +355,10 @@ mod directives_mdast {
         let j = to_mdast_json_opts("::leaf{.warn}\n", on());
         assert!(j.contains(r#""type":"leafDirective","name":"leaf""#), "{j}");
         let c = to_mdast_json_opts(":::note\nbody\n:::\n", on());
-        assert!(c.contains(r#""type":"containerDirective","name":"note""#), "{c}");
+        assert!(
+            c.contains(r#""type":"containerDirective","name":"note""#),
+            "{c}"
+        );
     }
 
     #[test]
@@ -366,14 +389,23 @@ mod footnotes {
     #[test]
     fn reference_and_definition() {
         let j = to_mdast_json_opts("A[^a]\n\n[^a]: note\n", on());
-        assert!(j.contains(r#""type":"footnoteReference","identifier":"a","label":"a""#), "{j}");
-        assert!(j.contains(r#""type":"footnoteDefinition","identifier":"a","label":"a""#), "{j}");
+        assert!(
+            j.contains(r#""type":"footnoteReference","identifier":"a","label":"a""#),
+            "{j}"
+        );
+        assert!(
+            j.contains(r#""type":"footnoteDefinition","identifier":"a","label":"a""#),
+            "{j}"
+        );
     }
 
     #[test]
     fn identifier_is_lowercased() {
         let j = to_mdast_json_opts("A[^Foo]\n\n[^Foo]: note\n", on());
-        assert!(j.contains(r#""type":"footnoteReference","identifier":"foo","label":"Foo""#), "{j}");
+        assert!(
+            j.contains(r#""type":"footnoteReference","identifier":"foo","label":"Foo""#),
+            "{j}"
+        );
     }
 
     #[test]

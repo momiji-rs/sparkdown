@@ -33,7 +33,7 @@ pub enum Kind {
     Frontmatter,
     /// GFM footnote definition `[^label]: …` (opt-in via [`Options::footnotes`]).
     /// A block container (fixed 4-space content indent, lazy paragraph
-    /// continuation) carrying its label via [`Node::fn_idx`] → [`Tree::fn_defs`].
+    /// continuation) carrying its label via `Node::fn_idx` → [`Tree::fn_defs`].
     FootnoteDef,
     /// Definition list container (`<dl>`), opt-in via [`Options::deflist`]. Holds
     /// an alternating sequence of [`Kind::DefTerm`] and [`Kind::DefDesc`] children.
@@ -47,15 +47,15 @@ pub enum Kind {
     /// preceded the `:` marker, so the body is wrapped in `<p>`), 0 when tight.
     DefDesc,
     /// Leaf directive `::name[label]{attrs}` (one line). Carries its payload via
-    /// [`Node::fn_idx`] → [`Tree::directives`]; the `[label]` is inline content.
+    /// `Node::fn_idx` → [`Tree::directives`]; the `[label]` is inline content.
     LeafDirective,
     /// Container directive `:::name[label]{attrs}` … `:::` — a block container
     /// (its content parses as markdown). Colon-fenced like a code block
-    /// (`fence_char`/`fence_len`); payload via [`Node::fn_idx`].
+    /// (`fence_char`/`fence_len`); payload via `Node::fn_idx`.
     ContainerDirective,
     /// SPIKE (`ast` feature): a link reference definition `[label]: url "title"`.
     /// Renders to nothing (HTML output unchanged); carries an index into
-    /// [`Tree::defs`] via [`Node::def`] for the mdast `definition` node.
+    /// [`Tree::defs`] via `Node::def` for the mdast `definition` node.
     #[cfg(feature = "ast")]
     Definition,
     /// GFM pipe table (opt-in). Content holds the raw rows (header, delimiter,
@@ -85,7 +85,7 @@ pub struct FnDef {
 
 /// Payload for a block directive (`leafDirective` / `containerDirective`): its
 /// `name`, ordered `attributes`, and the source byte range of its `[label]`
-/// content (if any). Indexed by [`Node::fn_idx`] (reused — a node is never both a
+/// content (if any). Indexed by `Node::fn_idx` (reused — a node is never both a
 /// footnote definition and a directive) into [`Tree::directives`].
 #[derive(Clone)]
 pub struct DirData {
@@ -219,16 +219,16 @@ pub struct Tree<'a> {
     source: &'a str,
     /// Buffer for assembled text (block quotes, lists, code/HTML literals).
     buf: String,
-    /// GFM footnote-definition payloads, indexed by [`Node::fn_idx`].
+    /// GFM footnote-definition payloads, indexed by `Node::fn_idx`.
     pub fn_defs: Vec<FnDef>,
     /// GFM footnote labels (lowercased) that have ≥1 definition — the set a
     /// `[^label]` reference must hit to be a `footnoteReference`.
     pub footnote_ids: std::collections::HashSet<String>,
     /// Block-directive payloads (`Kind::LeafDirective`/`ContainerDirective`),
-    /// indexed by [`Node::fn_idx`].
+    /// indexed by `Node::fn_idx`.
     pub directives: Vec<DirData>,
     /// SPIKE (`ast` feature): payloads for `Kind::Definition` nodes; indexed by
-    /// [`Node::def`].
+    /// `Node::def`.
     #[cfg(feature = "ast")]
     pub defs: Vec<DefData>,
     /// SPIKE (`ast` feature): piecewise `buf`→source map (see the parser field).
@@ -334,11 +334,15 @@ impl Tree<'_> {
     }
 
     /// SPIKE (`ast` feature): the mdast `value` of a `Kind::HtmlBlock` (keeps the
-    /// trailing newline per mdast's rule, unlike the HTML-render [`content`]).
+    /// trailing newline per mdast's rule, unlike the HTML-render [`Self::content`]).
     #[cfg(feature = "ast")]
     pub fn html_value(&self, idx: usize) -> &str {
         let n = &self.nodes[idx];
-        let store = if n.content_src { self.source } else { &self.buf };
+        let store = if n.content_src {
+            self.source
+        } else {
+            &self.buf
+        };
         &store[n.cstart as usize..n.html_ast_cend as usize]
     }
 
@@ -414,15 +418,15 @@ struct Parser<'a> {
     partially_consumed_tab: bool,
     opts: Options,
     /// GFM footnote-definition payloads, in creation order; a node's
-    /// [`Node::fn_idx`] indexes here.
+    /// `Node::fn_idx` indexes here.
     fn_defs: Vec<FnDef>,
     /// GFM footnote labels (lowercased) seen as definitions — the reference set.
     footnote_ids: std::collections::HashSet<String>,
-    /// Block-directive payloads, in creation order; a node's [`Node::fn_idx`]
+    /// Block-directive payloads, in creation order; a node's `Node::fn_idx`
     /// indexes here.
     directives: Vec<DirData>,
     /// SPIKE (`ast` feature): payloads for `Kind::Definition` nodes, in creation
-    /// order; a node's [`Node::def`] indexes here.
+    /// order; a node's `Node::def` indexes here.
     #[cfg(feature = "ast")]
     defs: Vec<DefData>,
     /// SPIKE (`ast` feature): piecewise `buf`→source map for buffered content
@@ -559,8 +563,10 @@ impl<'a> Parser<'a> {
         let mut node = Node::new(kind, parent, self.line_number);
         // Paragraphs try to borrow a contiguous source slice; other leaves
         // (ATX heading, code, HTML) assemble into `buf`. Set the buffered start.
-        node.content_src =
-            matches!(kind, Kind::Paragraph | Kind::CodeBlock | Kind::HtmlBlock | Kind::DefDesc);
+        node.content_src = matches!(
+            kind,
+            Kind::Paragraph | Kind::CodeBlock | Kind::HtmlBlock | Kind::DefDesc
+        );
         node.cstart = self.buf.len() as u32;
         node.cend = node.cstart;
         // SPIKE (`ast`): the block's mdast `position.start` is its first non-space
@@ -680,8 +686,8 @@ impl<'a> Parser<'a> {
         #[cfg(feature = "ast")]
         {
             let line_end = self.line_src_start + self.line.len();
-            let nl = (line_end < self.source.len()
-                && self.source.as_bytes()[line_end] == b'\n') as usize;
+            let nl = (line_end < self.source.len() && self.source.as_bytes()[line_end] == b'\n')
+                as usize;
             if self.nodes[tip].src_start == u32::MAX {
                 self.nodes[tip].src_start = (self.line_src_start + self.offset) as u32;
             }
@@ -722,8 +728,10 @@ impl<'a> Parser<'a> {
         // `line_src_start + offset` — record the breakpoint so inline nodes in
         // buffered blocks recover source positions.
         #[cfg(feature = "ast")]
-        self.buf_segs
-            .push((self.buf.len() as u32, (self.line_src_start + self.offset) as u32));
+        self.buf_segs.push((
+            self.buf.len() as u32,
+            (self.line_src_start + self.offset) as u32,
+        ));
         let rest = &self.line[self.offset..];
         // line never contains an embedded NUL; push as UTF-8.
         self.buf.push_str(std::str::from_utf8(rest).unwrap_or(""));
@@ -824,8 +832,7 @@ impl<'a> Parser<'a> {
                     #[cfg(feature = "ast")]
                     {
                         let cs = (bs + hl) as u32;
-                        self.nodes[idx].src_start =
-                            if csrc { cs } else { self.map_buf_off(cs) };
+                        self.nodes[idx].src_start = if csrc { cs } else { self.map_buf_off(cs) };
                     }
                 }
             }
@@ -894,20 +901,19 @@ impl<'a> Parser<'a> {
                 {
                     let store: &str = if csrc { self.source } else { &self.buf };
                     let bytes = store.as_bytes();
-                    let ast_end = if self.nodes[idx].html_kind == 1
-                        && !self.nodes[idx].html_closed_by_cond
-                    {
-                        e
-                    } else {
-                        let mut x = e;
-                        if x > s && bytes[x - 1] == b'\n' {
-                            x -= 1;
-                            if x > s && bytes[x - 1] == b'\r' {
+                    let ast_end =
+                        if self.nodes[idx].html_kind == 1 && !self.nodes[idx].html_closed_by_cond {
+                            e
+                        } else {
+                            let mut x = e;
+                            if x > s && bytes[x - 1] == b'\n' {
                                 x -= 1;
+                                if x > s && bytes[x - 1] == b'\r' {
+                                    x -= 1;
+                                }
                             }
-                        }
-                        x
-                    };
+                            x
+                        };
                     self.nodes[idx].html_ast_cend = ast_end as u32;
                 }
                 self.nodes[idx].cend = (s + keep) as u32;
@@ -1219,8 +1225,8 @@ impl<'a> Parser<'a> {
             // Definition-list markers and directives both start with `:` (not in
             // `maybe_special`); let `:` lines through to their matchers when
             // either extension is enabled.
-            let fast_skip = fast_skip
-                && !((self.opts.deflist || self.opts.directives) && first == Some(b':'));
+            let fast_skip =
+                fast_skip && !((self.opts.deflist || self.opts.directives) && first == Some(b':'));
             if fast_skip {
                 self.advance_next_nonspace();
                 break;
@@ -1892,7 +1898,11 @@ impl<'a> Parser<'a> {
         let base = self.line_src_start + self.next_nonspace + colons;
         let label = h.label.map(|(s, e)| ((base + s) as u32, (base + e) as u32));
         let di = self.directives.len() as u32;
-        self.directives.push(DirData { name, attrs: h.attrs, label });
+        self.directives.push(DirData {
+            name,
+            attrs: h.attrs,
+            label,
+        });
         self.close_unmatched_blocks();
         #[cfg(feature = "ast")]
         let src_start = (self.line_src_start + self.next_nonspace) as u32;

@@ -43,19 +43,31 @@ pub(crate) fn parse_header(s: &[u8]) -> Option<Header> {
     // Optional `[label]` — a balanced bracket span (backslash escapes ignored for
     // bracket matching, matching the common case).
     let mut label = None;
-    if i < n && s[i] == b'[' && let Some(end) = label_end(s, i) {
+    if i < n
+        && s[i] == b'['
+        && let Some(end) = label_end(s, i)
+    {
         label = Some((i + 1, end));
         i = end + 1;
     }
 
     // Optional `{attributes}`.
     let mut attrs = Vec::new();
-    if i < n && s[i] == b'{' && let Some(end) = attr_end(s, i) {
+    if i < n
+        && s[i] == b'{'
+        && let Some(end) = attr_end(s, i)
+    {
         parse_attrs(&s[i + 1..end], &mut attrs);
         i = end + 1;
     }
 
-    Some(Header { name_start, name_end, label, attrs, consumed: i })
+    Some(Header {
+        name_start,
+        name_end,
+        label,
+        attrs,
+        consumed: i,
+    })
 }
 
 /// Index of the `]` matching the `[` at `open`, respecting nested brackets and

@@ -28,14 +28,34 @@ pub enum Mdast {
     // --- blocks ---
     Root(Vec<Mdast>),
     Paragraph(Vec<Mdast>),
-    Heading { depth: u8, children: Vec<Mdast> },
+    Heading {
+        depth: u8,
+        children: Vec<Mdast>,
+    },
     Blockquote(Vec<Mdast>),
-    List { ordered: bool, start: Option<u64>, spread: bool, children: Vec<Mdast> },
-    ListItem { spread: bool, children: Vec<Mdast> },
+    List {
+        ordered: bool,
+        start: Option<u64>,
+        spread: bool,
+        children: Vec<Mdast>,
+    },
+    ListItem {
+        spread: bool,
+        children: Vec<Mdast>,
+    },
     ThematicBreak,
-    Code { lang: Option<String>, meta: Option<String>, value: String },
+    Code {
+        lang: Option<String>,
+        meta: Option<String>,
+        value: String,
+    },
     /// A link reference definition `[label]: url "title"`.
-    Definition { identifier: String, label: String, url: String, title: Option<String> },
+    Definition {
+        identifier: String,
+        label: String,
+        url: String,
+        title: Option<String>,
+    },
     /// Raw HTML — block (here) or inline (from the inline stream).
     Html(String),
     /// YAML frontmatter (`---`); `value` is the text between the fences.
@@ -43,18 +63,33 @@ pub enum Mdast {
     /// TOML frontmatter (`+++`); `value` is the text between the fences.
     Toml(String),
     /// GFM footnote definition `[^label]: …` — a block container.
-    FootnoteDefinition { identifier: String, label: String, children: Vec<Mdast> },
+    FootnoteDefinition {
+        identifier: String,
+        label: String,
+        children: Vec<Mdast>,
+    },
     /// Definition list container (remark-definition-list `defList`).
     DefList(Vec<Mdast>),
     /// One term of a definition list (`defListTerm`); children are inline.
     DefListTerm(Vec<Mdast>),
     /// One description of a definition list (`defListDescription`). `spread` is
     /// true when loose; children are block content (a wrapping `paragraph`).
-    DefListDescription { spread: bool, children: Vec<Mdast> },
+    DefListDescription {
+        spread: bool,
+        children: Vec<Mdast>,
+    },
     /// remark-directive `containerDirective` (`:::name … :::`) — block children.
-    ContainerDirective { name: String, attributes: Vec<(String, String)>, children: Vec<Mdast> },
+    ContainerDirective {
+        name: String,
+        attributes: Vec<(String, String)>,
+        children: Vec<Mdast>,
+    },
     /// remark-directive `leafDirective` (`::name`) — inline children (the label).
-    LeafDirective { name: String, attributes: Vec<(String, String)>, children: Vec<Mdast> },
+    LeafDirective {
+        name: String,
+        attributes: Vec<(String, String)>,
+        children: Vec<Mdast>,
+    },
     /// A container directive's `[label]`: serialized as a `paragraph` carrying
     /// `data: { directiveLabel: true }` (matching remark-directive).
     DirectiveLabel(Vec<Mdast>),
@@ -65,14 +100,39 @@ pub enum Mdast {
     Delete(Vec<Mdast>),
     InlineCode(String),
     Break,
-    Link { url: String, title: Option<String>, children: Vec<Mdast> },
-    Image { url: String, title: Option<String>, alt: String },
-    LinkReference { identifier: String, label: String, reftype: &'static str, children: Vec<Mdast> },
-    ImageReference { identifier: String, label: String, reftype: &'static str, alt: String },
+    Link {
+        url: String,
+        title: Option<String>,
+        children: Vec<Mdast>,
+    },
+    Image {
+        url: String,
+        title: Option<String>,
+        alt: String,
+    },
+    LinkReference {
+        identifier: String,
+        label: String,
+        reftype: &'static str,
+        children: Vec<Mdast>,
+    },
+    ImageReference {
+        identifier: String,
+        label: String,
+        reftype: &'static str,
+        alt: String,
+    },
     /// GFM footnote reference `[^label]` (inline leaf).
-    FootnoteReference { identifier: String, label: String },
+    FootnoteReference {
+        identifier: String,
+        label: String,
+    },
     /// remark-directive inline `textDirective` (`:name[label]{attrs}`).
-    TextDirective { name: String, attributes: Vec<(String, String)>, children: Vec<Mdast> },
+    TextDirective {
+        name: String,
+        attributes: Vec<(String, String)>,
+        children: Vec<Mdast>,
+    },
     /// SPIKE: wraps a block node with its unist `position`. Kept as a wrapper
     /// (rather than a field on every variant) to minimize churn; the serializer
     /// folds it into the inner node's JSON object as `"position": …`.
@@ -112,7 +172,12 @@ impl PosCtx {
             acc += ch.len_utf16() as u32;
         }
         u16.push(acc); // sentinel for `src_len`
-        PosCtx { line_off, u16, src_len: src.len(), src: src.as_bytes().to_vec() }
+        PosCtx {
+            line_off,
+            u16,
+            src_len: src.len(),
+            src: src.as_bytes().to_vec(),
+        }
     }
 
     /// A `(line, column, offset)` point at a byte offset — column/offset in UTF-16.
@@ -125,7 +190,10 @@ impl PosCtx {
     }
 
     fn pos(&self, start: usize, end: usize) -> Pos {
-        Pos { start: self.point(start), end: self.point(end) }
+        Pos {
+            start: self.point(start),
+            end: self.point(end),
+        }
     }
 
     /// Drop trailing whitespace (spaces/tabs/line endings) from a byte range end.
@@ -230,14 +298,21 @@ fn block(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> (Mdast
             // mdast keeps trailing spaces on the last line (only the newline is
             // dropped); the text node's value trims them separately.
             let eb = ctx.rtrim_nl(se);
-            (Mdast::Paragraph(inline(tree, idx, scratch, ctx, sb, eb)), sb, eb)
+            (
+                Mdast::Paragraph(inline(tree, idx, scratch, ctx, sb, eb)),
+                sb,
+                eb,
+            )
         }
         Kind::Heading => {
             // atx/setext span the whole line(s); the text child is trimmed.
             let eb = ctx.rtrim_nl(se);
             let depth = node.level;
             (
-                Mdast::Heading { depth, children: inline(tree, idx, scratch, ctx, sb, eb) },
+                Mdast::Heading {
+                    depth,
+                    children: inline(tree, idx, scratch, ctx, sb, eb),
+                },
                 sb,
                 eb,
             )
@@ -259,21 +334,33 @@ fn block(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> (Mdast
             // Fenced blocks span their full source (incl. the closing fence, or
             // the trailing newline of an unclosed block); indented blocks trim
             // trailing blank lines.
-            let eb = if node.fenced { se } else { ctx.rtrim_code_end(sb, se) };
+            let eb = if node.fenced {
+                se
+            } else {
+                ctx.rtrim_code_end(sb, se)
+            };
             (Mdast::Code { lang, meta, value }, sb, eb)
         }
         Kind::HtmlBlock => {
             // The position end matches where the `value` ends (type-1-at-EOF
             // keeps its trailing newline; others drop one line ending) — not the
             // node's raw `src_end`, which may run past trailing blank lines.
-            (Mdast::Html(tree.html_value(idx).to_owned()), sb, tree.html_ast_end(idx) as usize)
+            (
+                Mdast::Html(tree.html_value(idx).to_owned()),
+                sb,
+                tree.html_ast_end(idx) as usize,
+            )
         }
         Kind::Frontmatter => {
             // `level` 1 = TOML (`+++`), 0 = YAML (`---`). The span is already the
             // exact mdast range: start at offset 0, end at the closing fence's
             // content end (trailing spaces kept, newline dropped — set in parse).
             let value = frontmatter_value(tree.content(idx)).to_owned();
-            let inner = if node.level == 1 { Mdast::Toml(value) } else { Mdast::Yaml(value) };
+            let inner = if node.level == 1 {
+                Mdast::Toml(value)
+            } else {
+                Mdast::Yaml(value)
+            };
             (inner, sb, se)
         }
         Kind::FootnoteDef => {
@@ -281,7 +368,11 @@ fn block(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> (Mdast
             let (identifier, label) = (d.identifier.clone(), d.label.clone());
             let (kids, last) = block_children(tree, idx, scratch, ctx);
             (
-                Mdast::FootnoteDefinition { identifier, label, children: kids },
+                Mdast::FootnoteDefinition {
+                    identifier,
+                    label,
+                    children: kids,
+                },
                 sb,
                 last.unwrap_or(se),
             )
@@ -317,7 +408,14 @@ fn block(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> (Mdast
         }
         Kind::Item => {
             let (kids, last) = block_children(tree, idx, scratch, ctx);
-            (Mdast::ListItem { spread: node.item_spread, children: kids }, sb, last.unwrap_or(se))
+            (
+                Mdast::ListItem {
+                    spread: node.item_spread,
+                    children: kids,
+                },
+                sb,
+                last.unwrap_or(se),
+            )
         }
         Kind::DefList => {
             // Build the custom remark-definition-list shape: each term line is a
@@ -354,13 +452,14 @@ fn block(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> (Mdast
                             content.len() - content.trim_start_matches([' ', '\t', '\n']).len();
                         let body = content.trim_matches([' ', '\t', '\n', '\r']);
                         last = tree.content_to_src(ci, (lead + body.len()) as u32) as usize;
-                        let (pos, inl) =
-                            inline_span(tree, ci, lead as u32, body, scratch, ctx);
-                        let para =
-                            Mdast::Positioned(pos.clone(), Box::new(Mdast::Paragraph(inl)));
+                        let (pos, inl) = inline_span(tree, ci, lead as u32, body, scratch, ctx);
+                        let para = Mdast::Positioned(pos.clone(), Box::new(Mdast::Paragraph(inl)));
                         kids.push(Mdast::Positioned(
                             pos,
-                            Box::new(Mdast::DefListDescription { spread, children: vec![para] }),
+                            Box::new(Mdast::DefListDescription {
+                                spread,
+                                children: vec![para],
+                            }),
                         ));
                     }
                     _ => {
@@ -377,14 +476,23 @@ fn block(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> (Mdast
         // arms keep the match exhaustive and are not reached in practice.
         Kind::DefTerm => {
             let eb = ctx.rtrim_nl(se);
-            (Mdast::DefListTerm(inline(tree, idx, scratch, ctx, sb, eb)), sb, eb)
+            (
+                Mdast::DefListTerm(inline(tree, idx, scratch, ctx, sb, eb)),
+                sb,
+                eb,
+            )
         }
         Kind::DefDesc => {
             let eb = ctx.rtrim_nl(se);
-            let para =
-                Mdast::Positioned(ctx.pos(sb, eb), Box::new(Mdast::Paragraph(inline(tree, idx, scratch, ctx, sb, eb))));
+            let para = Mdast::Positioned(
+                ctx.pos(sb, eb),
+                Box::new(Mdast::Paragraph(inline(tree, idx, scratch, ctx, sb, eb))),
+            );
             (
-                Mdast::DefListDescription { spread: node.level == 1, children: vec![para] },
+                Mdast::DefListDescription {
+                    spread: node.level == 1,
+                    children: vec![para],
+                },
                 sb,
                 eb,
             )
@@ -413,7 +521,10 @@ fn block(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> (Mdast
                 let label = directive_label_children(tree, d, scratch, ctx);
                 // remark-directive spans the label paragraph over the brackets.
                 let lpos = ctx.pos(ls as usize - 1, le as usize + 1);
-                kids.push(Mdast::Positioned(lpos, Box::new(Mdast::DirectiveLabel(label))));
+                kids.push(Mdast::Positioned(
+                    lpos,
+                    Box::new(Mdast::DirectiveLabel(label)),
+                ));
             }
             let (body, last) = block_children(tree, idx, scratch, ctx);
             kids.extend(body);
@@ -428,9 +539,16 @@ fn block(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> (Mdast
             )
         }
         #[cfg(feature = "gfm")]
-        Kind::Table => (Mdast::Html(tree.content(idx).to_owned()), sb, ctx.rtrim(sb, se)),
+        Kind::Table => (
+            Mdast::Html(tree.content(idx).to_owned()),
+            sb,
+            ctx.rtrim(sb, se),
+        ),
     };
-    (Mdast::Positioned(ctx.pos(start_b, end_b), Box::new(inner)), end_b)
+    (
+        Mdast::Positioned(ctx.pos(start_b, end_b), Box::new(inner)),
+        end_b,
+    )
 }
 
 /// Build the inline children of a block directive's `[label]` (empty when absent).
@@ -447,7 +565,15 @@ fn directive_label_children(
     let body = tree.source_range(ls, le);
     let toks = render_inline_to_tokens(body, &tree.refmap, scratch, tree.opts);
     let bpos = ctx.pos(ls as usize, le as usize);
-    build_inline(body, toks, tree, scratch, ctx, &|o| ls as usize + o as usize, &bpos)
+    build_inline(
+        body,
+        toks,
+        tree,
+        scratch,
+        ctx,
+        &|o| ls as usize + o as usize,
+        &bpos,
+    )
 }
 
 /// Tokenize and position-map a single inline run `body` that starts at content
@@ -517,8 +643,15 @@ fn inline(
 /// An open inline container awaiting its close.
 enum Frame {
     Container(&'static str), // "emphasis" | "strong" | "delete"
-    Link { url: String, title: Option<String> },
-    LinkRef { identifier: String, label: String, reftype: &'static str },
+    Link {
+        url: String,
+        title: Option<String>,
+    },
+    LinkRef {
+        identifier: String,
+        label: String,
+        reftype: &'static str,
+    },
 }
 
 /// Fold the [`SpanTok`] stream into a nested, positioned mdast. `base` is the
@@ -565,15 +698,27 @@ fn build_inline(
             }
             InlineTok::Code(v) => {
                 let p = mkpos(start, end);
-                stack.last_mut().unwrap().1.push(Mdast::Positioned(p, Box::new(Mdast::InlineCode(v))));
+                stack
+                    .last_mut()
+                    .unwrap()
+                    .1
+                    .push(Mdast::Positioned(p, Box::new(Mdast::InlineCode(v))));
             }
             InlineTok::Html(h) => {
                 let p = mkpos(start, end);
-                stack.last_mut().unwrap().1.push(Mdast::Positioned(p, Box::new(Mdast::Html(h))));
+                stack
+                    .last_mut()
+                    .unwrap()
+                    .1
+                    .push(Mdast::Positioned(p, Box::new(Mdast::Html(h))));
             }
             InlineTok::Break => {
                 let p = mkpos(start, end);
-                stack.last_mut().unwrap().1.push(Mdast::Positioned(p, Box::new(Mdast::Break)));
+                stack
+                    .last_mut()
+                    .unwrap()
+                    .1
+                    .push(Mdast::Positioned(p, Box::new(Mdast::Break)));
             }
             InlineTok::Image { url, title, alt } => {
                 let p = mkpos(start, end);
@@ -582,11 +727,21 @@ fn build_inline(
                     Box::new(Mdast::Image { url, title, alt }),
                 ));
             }
-            InlineTok::ImageRef { identifier, label, reftype, alt } => {
+            InlineTok::ImageRef {
+                identifier,
+                label,
+                reftype,
+                alt,
+            } => {
                 let p = mkpos(start, end);
                 stack.last_mut().unwrap().1.push(Mdast::Positioned(
                     p,
-                    Box::new(Mdast::ImageReference { identifier, label, reftype, alt }),
+                    Box::new(Mdast::ImageReference {
+                        identifier,
+                        label,
+                        reftype,
+                        alt,
+                    }),
                 ));
             }
             InlineTok::FootnoteRef { identifier, label } => {
@@ -609,7 +764,11 @@ fn build_inline(
                 };
                 stack.last_mut().unwrap().1.push(Mdast::Positioned(
                     p,
-                    Box::new(Mdast::TextDirective { name, attributes: attrs, children }),
+                    Box::new(Mdast::TextDirective {
+                        name,
+                        attributes: attrs,
+                        children,
+                    }),
                 ));
             }
             InlineTok::Autolink { url, text } => {
@@ -621,7 +780,11 @@ fn build_inline(
                 let p = mkpos(start, end);
                 stack.last_mut().unwrap().1.push(Mdast::Positioned(
                     p,
-                    Box::new(Mdast::Link { url, title: None, children: vec![child] }),
+                    Box::new(Mdast::Link {
+                        url,
+                        title: None,
+                        children: vec![child],
+                    }),
                 ));
             }
             InlineTok::Open(kind) => {
@@ -630,19 +793,41 @@ fn build_inline(
             InlineTok::LinkOpen { url, title } => {
                 stack.push((Some(Frame::Link { url, title }), Vec::new(), start, end))
             }
-            InlineTok::LinkRefOpen { identifier, label, reftype } => {
-                stack.push((Some(Frame::LinkRef { identifier, label, reftype }), Vec::new(), start, end))
-            }
+            InlineTok::LinkRefOpen {
+                identifier,
+                label,
+                reftype,
+            } => stack.push((
+                Some(Frame::LinkRef {
+                    identifier,
+                    label,
+                    reftype,
+                }),
+                Vec::new(),
+                start,
+                end,
+            )),
             InlineTok::Close(_) | InlineTok::LinkClose => {
                 let (frame, children, os, oe) = stack.pop().unwrap();
                 let node = match frame {
                     Some(Frame::Container("strong")) => Mdast::Strong(children),
                     Some(Frame::Container("delete")) => Mdast::Delete(children),
                     Some(Frame::Container(_)) => Mdast::Emphasis(children),
-                    Some(Frame::Link { url, title }) => Mdast::Link { url, title, children },
-                    Some(Frame::LinkRef { identifier, label, reftype }) => {
-                        Mdast::LinkReference { identifier, label, reftype, children }
-                    }
+                    Some(Frame::Link { url, title }) => Mdast::Link {
+                        url,
+                        title,
+                        children,
+                    },
+                    Some(Frame::LinkRef {
+                        identifier,
+                        label,
+                        reftype,
+                    }) => Mdast::LinkReference {
+                        identifier,
+                        label,
+                        reftype,
+                        children,
+                    },
                     None => {
                         for c in children {
                             stack.last_mut().unwrap().1.push(c);
@@ -655,7 +840,11 @@ fn build_inline(
                 // opener carries only its marker, so the closer extends it.
                 let cend = if end > oe { end } else { oe };
                 let p = mkpos(os, cend);
-                stack.last_mut().unwrap().1.push(Mdast::Positioned(p, Box::new(node)));
+                stack
+                    .last_mut()
+                    .unwrap()
+                    .1
+                    .push(Mdast::Positioned(p, Box::new(node)));
             }
         }
     }
@@ -677,7 +866,10 @@ fn code_info(info: &str) -> (Option<String>, Option<String>) {
     match trimmed.split_once(char::is_whitespace) {
         Some((lang, rest)) => {
             let meta = rest.trim();
-            (Some(lang.to_owned()), (!meta.is_empty()).then(|| meta.to_owned()))
+            (
+                Some(lang.to_owned()),
+                (!meta.is_empty()).then(|| meta.to_owned()),
+            )
         }
         None => (Some(trimmed.to_owned()), None),
     }
@@ -836,7 +1028,14 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
             w_point(out, ctx.point(sb));
             let eoff = reserve(out, 12);
             out.push((ld.ordered as u8) | ((ld.spread as u8) << 1));
-            w_u32(if ld.ordered { ld.start as u32 } else { u32::MAX }, out);
+            w_u32(
+                if ld.ordered {
+                    ld.start as u32
+                } else {
+                    u32::MAX
+                },
+                out,
+            );
             let coff = reserve(out, 4);
             let (n, last) = bchildren(tree, idx, scratch, ctx, out);
             // Matches block(): a list can extend past its last item (it absorbs a
@@ -871,7 +1070,11 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
             if value.ends_with('\n') {
                 value.pop();
             }
-            let eb = if node.fenced { se } else { ctx.rtrim_code_end(sb, se) };
+            let eb = if node.fenced {
+                se
+            } else {
+                ctx.rtrim_code_end(sb, se)
+            };
             out.push(7);
             w_point(out, ctx.point(sb));
             w_point(out, ctx.point(eb));
@@ -975,8 +1178,7 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
                         w_point(out, ctx.point(sbb));
                         let peoff = reserve(out, 12);
                         let pcoff = reserve(out, 4);
-                        let (ebb, pn) =
-                            inline_wire_slice(tree, ci, off, body, scratch, ctx, out);
+                        let (ebb, pn) = inline_wire_slice(tree, ci, off, body, scratch, ctx, out);
                         patch_point(out, peoff, ctx.point(ebb));
                         w_u32_at(out, pcoff, pn);
                         patch_point(out, deoff, ctx.point(ebb));
@@ -1118,7 +1320,13 @@ fn inline_wire(
         stack: Vec::new(),
         top: 0,
     };
-    render_inline_to_sink(tree.content(idx), &tree.refmap, scratch, tree.opts, &mut sink);
+    render_inline_to_sink(
+        tree.content(idx),
+        &tree.refmap,
+        scratch,
+        tree.opts,
+        &mut sink,
+    );
     sink.top
 }
 
@@ -1232,7 +1440,11 @@ impl WireSink<'_> {
         if s == u32::MAX {
             self.bpos.clone()
         } else {
-            let send = if e == 0 { self.map(0) } else { self.map(e - 1) + 1 };
+            let send = if e == 0 {
+                self.map(0)
+            } else {
+                self.map(e - 1) + 1
+            };
             self.ctx.pos(self.map(s), send)
         }
     }
@@ -1349,7 +1561,13 @@ impl InlineSink for WireSink<'_> {
         w_point(self.out, ls);
         let eoff = reserve(self.out, 12);
         let coff = reserve(self.out, 4);
-        self.stack.push(InlineFrame { eoff, coff, os: start, oe: end, count: 0 });
+        self.stack.push(InlineFrame {
+            eoff,
+            coff,
+            os: start,
+            oe: end,
+            count: 0,
+        });
     }
     fn link_open(&mut self, url: &str, title: Option<&str>, start: u32, end: u32) {
         self.bump();
@@ -1360,7 +1578,13 @@ impl InlineSink for WireSink<'_> {
         w_str(url, self.out);
         w_opt_str(title, self.out);
         let coff = reserve(self.out, 4);
-        self.stack.push(InlineFrame { eoff, coff, os: start, oe: end, count: 0 });
+        self.stack.push(InlineFrame {
+            eoff,
+            coff,
+            os: start,
+            oe: end,
+            count: 0,
+        });
     }
     fn linkref_open(
         &mut self,
@@ -1379,7 +1603,13 @@ impl InlineSink for WireSink<'_> {
         w_str(label, self.out);
         self.out.push(reftype_code(reftype));
         let coff = reserve(self.out, 4);
-        self.stack.push(InlineFrame { eoff, coff, os: start, oe: end, count: 0 });
+        self.stack.push(InlineFrame {
+            eoff,
+            coff,
+            os: start,
+            oe: end,
+            count: 0,
+        });
     }
     fn close(&mut self, _start: u32, end: u32) {
         if let Some(f) = self.stack.pop() {
@@ -1501,7 +1731,12 @@ fn write_json_pos(node: &Mdast, pos: Option<&Pos>, out: &mut String) {
             key("children", out);
             json_children(c, out);
         }
-        Mdast::List { ordered, start, spread, children } => {
+        Mdast::List {
+            ordered,
+            start,
+            spread,
+            children,
+        } => {
             out.push_str("\"list\",");
             key("ordered", out);
             out.push_str(if *ordered { "true," } else { "false," });
@@ -1552,7 +1787,11 @@ fn write_json_pos(node: &Mdast, pos: Option<&Pos>, out: &mut String) {
             key("value", out);
             json_str(v, out);
         }
-        Mdast::FootnoteDefinition { identifier, label, children } => {
+        Mdast::FootnoteDefinition {
+            identifier,
+            label,
+            children,
+        } => {
             out.push_str("\"footnoteDefinition\",");
             key("identifier", out);
             json_str(identifier, out);
@@ -1580,7 +1819,11 @@ fn write_json_pos(node: &Mdast, pos: Option<&Pos>, out: &mut String) {
             key("children", out);
             json_children(children, out);
         }
-        Mdast::ContainerDirective { name, attributes, children } => {
+        Mdast::ContainerDirective {
+            name,
+            attributes,
+            children,
+        } => {
             out.push_str("\"containerDirective\",");
             key("name", out);
             json_str(name, out);
@@ -1591,7 +1834,11 @@ fn write_json_pos(node: &Mdast, pos: Option<&Pos>, out: &mut String) {
             key("children", out);
             json_children(children, out);
         }
-        Mdast::LeafDirective { name, attributes, children } => {
+        Mdast::LeafDirective {
+            name,
+            attributes,
+            children,
+        } => {
             out.push_str("\"leafDirective\",");
             key("name", out);
             json_str(name, out);
@@ -1602,7 +1849,11 @@ fn write_json_pos(node: &Mdast, pos: Option<&Pos>, out: &mut String) {
             key("children", out);
             json_children(children, out);
         }
-        Mdast::TextDirective { name, attributes, children } => {
+        Mdast::TextDirective {
+            name,
+            attributes,
+            children,
+        } => {
             out.push_str("\"textDirective\",");
             key("name", out);
             json_str(name, out);
@@ -1654,7 +1905,11 @@ fn write_json_pos(node: &Mdast, pos: Option<&Pos>, out: &mut String) {
             json_str(v, out);
         }
         Mdast::Break => out.push_str("\"break\""),
-        Mdast::Link { url, title, children } => {
+        Mdast::Link {
+            url,
+            title,
+            children,
+        } => {
             out.push_str("\"link\",");
             key("url", out);
             json_str(url, out);
@@ -1676,7 +1931,12 @@ fn write_json_pos(node: &Mdast, pos: Option<&Pos>, out: &mut String) {
             key("alt", out);
             json_str(alt, out);
         }
-        Mdast::Definition { identifier, label, url, title } => {
+        Mdast::Definition {
+            identifier,
+            label,
+            url,
+            title,
+        } => {
             out.push_str("\"definition\",");
             key("identifier", out);
             json_str(identifier, out);
@@ -1690,7 +1950,12 @@ fn write_json_pos(node: &Mdast, pos: Option<&Pos>, out: &mut String) {
             key("title", out);
             json_opt(title, out);
         }
-        Mdast::LinkReference { identifier, label, reftype, children } => {
+        Mdast::LinkReference {
+            identifier,
+            label,
+            reftype,
+            children,
+        } => {
             out.push_str("\"linkReference\",");
             key("identifier", out);
             json_str(identifier, out);
@@ -1704,7 +1969,12 @@ fn write_json_pos(node: &Mdast, pos: Option<&Pos>, out: &mut String) {
             key("children", out);
             json_children(children, out);
         }
-        Mdast::ImageReference { identifier, label, reftype, alt } => {
+        Mdast::ImageReference {
+            identifier,
+            label,
+            reftype,
+            alt,
+        } => {
             out.push_str("\"imageReference\",");
             key("identifier", out);
             json_str(identifier, out);

@@ -123,9 +123,8 @@ fn render_footnote_section(tree: &Tree, out: &mut String, scratch: &mut Scratch)
 /// The first `FootnoteDef` node whose identifier matches (definitions are matched
 /// first-wins, like link reference definitions).
 fn first_footnote_def(tree: &Tree, id: &str) -> Option<usize> {
-    (0..tree.nodes.len()).find(|&n| {
-        tree.nodes[n].kind == Kind::FootnoteDef && tree.fn_def(n).identifier == id
-    })
+    (0..tree.nodes.len())
+        .find(|&n| tree.nodes[n].kind == Kind::FootnoteDef && tree.fn_def(n).identifier == id)
 }
 
 /// Append `↩` backref anchor(s) for footnote `num` (one per reference, `1..=count`).
@@ -329,7 +328,13 @@ fn render_node(tree: &Tree, idx: usize, out: &mut String, scratch: &mut Scratch)
                 // Built-in transform: render the inline once into a scratch buffer,
                 // derive the id from it, then reuse the buffer (no double render).
                 let mut inner = String::new();
-                render_inline(tree.content(idx), &mut inner, &tree.refmap, scratch, tree.opts);
+                render_inline(
+                    tree.content(idx),
+                    &mut inner,
+                    &tree.refmap,
+                    scratch,
+                    tree.opts,
+                );
                 let slug = heading_slug(&inner, &mut scratch.slugs);
                 out.push_str(" id=\"");
                 out.push_str(&slug);
@@ -413,7 +418,13 @@ fn render_node(tree: &Tree, idx: usize, out: &mut String, scratch: &mut Scratch)
             cr(out);
             directive_open_tag(&d.name, &d.attrs, out);
             if let Some((s, e)) = d.label {
-                render_inline(tree.source_range(s, e), out, &tree.refmap, scratch, tree.opts);
+                render_inline(
+                    tree.source_range(s, e),
+                    out,
+                    &tree.refmap,
+                    scratch,
+                    tree.opts,
+                );
             }
             out.push_str("</");
             out.push_str(&d.name);

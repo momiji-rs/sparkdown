@@ -37,11 +37,19 @@ fn main() {
     });
 
     let us = |ns: f64| ns / 1000.0;
-    println!("\nmdast build cost — CommonMark spec ({} KB), {iters} iters\n", DATA.len() / 1024);
+    println!(
+        "\nmdast build cost — CommonMark spec ({} KB), {iters} iters\n",
+        DATA.len() / 1024
+    );
     println!("  nested mdast nodes : {nodes}\n");
     println!("  {:<20} {:>9} {:>8}", "path", "us/op", "vs fast");
     println!("  {:-<20} {:->9} {:->8}", "", "", "");
     println!("  {:<20} {:>9.2} {:>7.2}x", "fast (to_html)", us(fast), 1.0);
-    println!("  {:<20} {:>9.2} {:>7.2}x", "to_mdast", us(mdast), mdast / fast);
+    println!(
+        "  {:<20} {:>9.2} {:>7.2}x",
+        "to_mdast",
+        us(mdast),
+        mdast / fast
+    );
     println!();
 }

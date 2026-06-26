@@ -623,7 +623,11 @@ enum Sem {
     /// (NOT the percent-encoded `href` — that is unrecoverable from the output).
     LinkOpen { url: String, title: Option<String> },
     /// `![alt](url "title")` — a leaf in mdast (alt is plain text).
-    Image { url: String, title: Option<String>, alt: String },
+    Image {
+        url: String,
+        title: Option<String>,
+        alt: String,
+    },
     /// `<url>` / `<email>` autolink → an mdast `link` with one text child.
     Autolink { url: String, text: String },
     /// Raw inline HTML, verbatim.
@@ -633,14 +637,27 @@ enum Sem {
     /// `[text][label]` etc. → mdast `linkReference` opener (children = link text,
     /// closed by [`Node::LinkClose`]). Carries the normalized `identifier`, the
     /// raw `label`, and `reftype` (`"shortcut"`/`"collapsed"`/`"full"`).
-    LinkRef { identifier: String, label: String, reftype: &'static str },
+    LinkRef {
+        identifier: String,
+        label: String,
+        reftype: &'static str,
+    },
     /// `![alt][label]` etc. → mdast `imageReference` (a leaf; alt is plain text).
-    ImageRef { identifier: String, label: String, reftype: &'static str, alt: String },
+    ImageRef {
+        identifier: String,
+        label: String,
+        reftype: &'static str,
+        alt: String,
+    },
     /// GFM `[^label]` → mdast `footnoteReference` (a leaf).
     FootnoteRef { identifier: String, label: String },
     /// remark-directive inline `:name[label]{attrs}` → mdast `textDirective`. The
     /// `label` is a content byte range (re-tokenized into children at build time).
-    TextDirective { name: String, attrs: Vec<(String, String)>, label: Option<(u32, u32)> },
+    TextDirective {
+        name: String,
+        attrs: Vec<(String, String)>,
+        label: Option<(u32, u32)>,
+    },
 }
 
 /// SPIKE: reference-resolution metadata produced by [`parse_link_target`] in AST
@@ -670,7 +687,11 @@ pub enum InlineTok {
     /// Close the matching `link`.
     LinkClose,
     /// mdast `image` (leaf).
-    Image { url: String, title: Option<String>, alt: String },
+    Image {
+        url: String,
+        title: Option<String>,
+        alt: String,
+    },
     /// mdast `inlineCode`.
     Code(String),
     /// mdast `link` from an autolink (single text child).
@@ -680,14 +701,27 @@ pub enum InlineTok {
     /// mdast `break` (hard line break).
     Break,
     /// Open an mdast `linkReference` (closed by the matching [`LinkClose`]).
-    LinkRefOpen { identifier: String, label: String, reftype: &'static str },
+    LinkRefOpen {
+        identifier: String,
+        label: String,
+        reftype: &'static str,
+    },
     /// mdast `imageReference` (leaf).
-    ImageRef { identifier: String, label: String, reftype: &'static str, alt: String },
+    ImageRef {
+        identifier: String,
+        label: String,
+        reftype: &'static str,
+        alt: String,
+    },
     /// mdast `footnoteReference` (leaf).
     FootnoteRef { identifier: String, label: String },
     /// mdast `textDirective`. `label` is a content byte range whose inline content
     /// becomes the directive's children (re-tokenized by the AST builder).
-    TextDirective { name: String, attrs: Vec<(String, String)>, label: Option<(u32, u32)> },
+    TextDirective {
+        name: String,
+        attrs: Vec<(String, String)>,
+        label: Option<(u32, u32)>,
+    },
 }
 
 /// SPIKE (`ast`): an [`InlineTok`] tagged with the content byte range
@@ -745,7 +779,13 @@ fn list_to_tokens(list: &List, cur: &str, sem: &[Sem], out: &mut Vec<SpanTok>) {
     let mut node = list.head;
     while let Some(idx) = node {
         let (s, e) = list.slots[idx].cspan;
-        let mut push = |tok| out.push(SpanTok { tok, start: s, end: e });
+        let mut push = |tok| {
+            out.push(SpanTok {
+                tok,
+                start: s,
+                end: e,
+            })
+        };
         match &list.slots[idx].node {
             Node::Span { start, end } => {
                 let t = unescape_html_text(&cur[*start..*end]);
@@ -763,9 +803,9 @@ fn list_to_tokens(list: &List, cur: &str, sem: &[Sem], out: &mut Vec<SpanTok>) {
                 // Unconsumed literal brackets stay as text.
                 lit => InlineTok::Text(lit.to_owned()),
             }),
-            Node::Delim { ch, count, .. } => {
-                push(InlineTok::Text(core::iter::repeat(*ch as char).take(*count).collect()))
-            }
+            Node::Delim { ch, count, .. } => push(InlineTok::Text(
+                core::iter::repeat_n(*ch as char, *count).collect(),
+            )),
             Node::Sem(i) => push(match &sem[*i as usize] {
                 Sem::Code(v) => InlineTok::Code(v.clone()),
                 Sem::LinkOpen { url, title } => InlineTok::LinkOpen {
@@ -783,12 +823,21 @@ fn list_to_tokens(list: &List, cur: &str, sem: &[Sem], out: &mut Vec<SpanTok>) {
                 },
                 Sem::Html(h) => InlineTok::Html(h.clone()),
                 Sem::Break => InlineTok::Break,
-                Sem::LinkRef { identifier, label, reftype } => InlineTok::LinkRefOpen {
+                Sem::LinkRef {
+                    identifier,
+                    label,
+                    reftype,
+                } => InlineTok::LinkRefOpen {
                     identifier: identifier.clone(),
                     label: label.clone(),
                     reftype,
                 },
-                Sem::ImageRef { identifier, label, reftype, alt } => InlineTok::ImageRef {
+                Sem::ImageRef {
+                    identifier,
+                    label,
+                    reftype,
+                    alt,
+                } => InlineTok::ImageRef {
                     identifier: identifier.clone(),
                     label: label.clone(),
                     reftype,
@@ -833,7 +882,14 @@ pub trait InlineSink {
     fn image(&mut self, url: &str, title: Option<&str>, alt: &str, start: u32, end: u32);
     fn autolink(&mut self, url: &str, text: &str, start: u32, end: u32);
     fn link_open(&mut self, url: &str, title: Option<&str>, start: u32, end: u32);
-    fn linkref_open(&mut self, identifier: &str, label: &str, reftype: &'static str, start: u32, end: u32);
+    fn linkref_open(
+        &mut self,
+        identifier: &str,
+        label: &str,
+        reftype: &'static str,
+        start: u32,
+        end: u32,
+    );
     fn imageref(
         &mut self,
         identifier: &str,
@@ -935,12 +991,17 @@ fn emit_inline<S: InlineSink>(list: &List, cur: &str, sem: &[Sem], sink: &mut S)
                     Sem::Autolink { url, text } => sink.autolink(url, text, s, e),
                     Sem::Html(h) => sink.html(h, s, e),
                     Sem::Break => sink.brk(s, e),
-                    Sem::LinkRef { identifier, label, reftype } => {
-                        sink.linkref_open(identifier, label, reftype, s, e)
-                    }
-                    Sem::ImageRef { identifier, label, reftype, alt } => {
-                        sink.imageref(identifier, label, reftype, alt, s, e)
-                    }
+                    Sem::LinkRef {
+                        identifier,
+                        label,
+                        reftype,
+                    } => sink.linkref_open(identifier, label, reftype, s, e),
+                    Sem::ImageRef {
+                        identifier,
+                        label,
+                        reftype,
+                        alt,
+                    } => sink.imageref(identifier, label, reftype, alt, s, e),
                     Sem::FootnoteRef { identifier, label } => {
                         sink.footnote_ref(identifier, label, s, e)
                     }
@@ -1260,8 +1321,16 @@ pub(crate) fn encode_footnote_id(id: &str) -> String {
             | b')' => out.push(b as char),
             _ => {
                 out.push('%');
-                out.push(char::from_digit((b >> 4) as u32, 16).unwrap().to_ascii_uppercase());
-                out.push(char::from_digit((b & 0xf) as u32, 16).unwrap().to_ascii_uppercase());
+                out.push(
+                    char::from_digit((b >> 4) as u32, 16)
+                        .unwrap()
+                        .to_ascii_uppercase(),
+                );
+                out.push(
+                    char::from_digit((b & 0xf) as u32, 16)
+                        .unwrap()
+                        .to_ascii_uppercase(),
+                );
             }
         }
     }
@@ -1672,10 +1741,18 @@ pub fn render_inline(
     let emo = Options::EMOJI && opts.emoji;
     let dir = opts.directives;
     match (opts.hard_wraps, Options::GFM && opts.strikethrough) {
-        (false, false) => render_inline_impl::<false, false>(src, out, refmap, scratch, tf, al, fno, emo, dir, opts),
-        (false, true) => render_inline_impl::<false, true>(src, out, refmap, scratch, tf, al, fno, emo, dir, opts),
-        (true, false) => render_inline_impl::<true, false>(src, out, refmap, scratch, tf, al, fno, emo, dir, opts),
-        (true, true) => render_inline_impl::<true, true>(src, out, refmap, scratch, tf, al, fno, emo, dir, opts),
+        (false, false) => render_inline_impl::<false, false>(
+            src, out, refmap, scratch, tf, al, fno, emo, dir, opts,
+        ),
+        (false, true) => render_inline_impl::<false, true>(
+            src, out, refmap, scratch, tf, al, fno, emo, dir, opts,
+        ),
+        (true, false) => render_inline_impl::<true, false>(
+            src, out, refmap, scratch, tf, al, fno, emo, dir, opts,
+        ),
+        (true, true) => {
+            render_inline_impl::<true, true>(src, out, refmap, scratch, tf, al, fno, emo, dir, opts)
+        }
     }
 }
 
@@ -1935,7 +2012,10 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                         };
                         flush!(i);
                         let si = sem.len() as u32;
-                        sem.push(Sem::Autolink { url, text: content.to_owned() });
+                        sem.push(Sem::Autolink {
+                            url,
+                            text: content.to_owned(),
+                        });
                         let aid = list.push(Node::Sem(si));
                         cspan!(aid, i, i + consumed);
                         seg = cur.len();
@@ -2029,7 +2109,10 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                     if ast_mode {
                         flush!(i);
                         let si = sem.len() as u32;
-                        sem.push(Sem::FootnoteRef { identifier: id, label });
+                        sem.push(Sem::FootnoteRef {
+                            identifier: id,
+                            label,
+                        });
                         let fid = list.push(Node::Sem(si));
                         cspan!(fid, i, i + consumed);
                         seg = cur.len();
@@ -2078,8 +2161,7 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                 let rb_src = i;
                 i += 1;
                 look_for_link_or_image(
-                    src, bytes, &mut i, list, stack, cur, norm, refmap, rb, rb_src, ast_mode,
-                    sem,
+                    src, bytes, &mut i, list, stack, cur, norm, refmap, rb, rb_src, ast_mode, sem,
                 );
                 // A resolved link/image appended its tag to `cur` and spanned it
                 // directly; the next text segment starts after it.
@@ -2227,7 +2309,9 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                 let mut adv = 1 + skip.unwrap_or(bytes.len() - i - 1);
                 // Emoji and text directives: `:` is not in the (non-autolink) scan
                 // set, so clamp the skip to the next `:` here when either is on.
-                if (emo || dir) && let Some(c) = memchr1(&bytes[i + 1..i + adv], b':') {
+                if (emo || dir)
+                    && let Some(c) = memchr1(&bytes[i + 1..i + adv], b':')
+                {
                     adv = 1 + c;
                 }
                 i += adv;

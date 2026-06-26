@@ -38,7 +38,10 @@ fn heading_ids() {
     // Off by default — no id attribute.
     assert_eq!(to_html("# Hello\n"), "<h1>Hello</h1>\n");
     // On: github-slugger-style slug from the heading's text content.
-    assert_eq!(to_html_with("# Hello World\n", &on), "<h1 id=\"hello-world\">Hello World</h1>\n");
+    assert_eq!(
+        to_html_with("# Hello World\n", &on),
+        "<h1 id=\"hello-world\">Hello World</h1>\n"
+    );
     // Inline markup is stripped for the slug; punctuation dropped, case folded.
     assert_eq!(
         to_html_with("## Foo, *Bar* & `Baz`!\n", &on),
