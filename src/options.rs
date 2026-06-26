@@ -54,6 +54,13 @@ pub struct Options {
     /// `<dl><dt>…</dt><dd>…</dd></dl>`. A blank line before a `:` marker makes
     /// that definition loose (its body is wrapped in `<p>`). Not GFM-gated.
     pub deflist: bool,
+    /// Directives (the remark-directive grammar): inline `:name[label]{attrs}`
+    /// (text), `::name[label]{attrs}` (leaf), and `:::name[label]{attrs}` … `:::`
+    /// (container). mdast emits `textDirective`/`leafDirective`/`containerDirective`
+    /// with a `name` and an `attributes` object (the canonical, gate-able output);
+    /// HTML follows the common convention (the name becomes the element, with
+    /// `#id`/`.class`/`key=val` as its attributes). Not GFM-gated.
+    pub directives: bool,
 }
 
 impl Options {
@@ -100,6 +107,7 @@ impl Options {
             external_links: false,
             footnotes: false,
             deflist: false,
+            directives: false,
         }
     }
 }

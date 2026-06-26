@@ -245,6 +245,112 @@ mod definition_lists_mdast {
     }
 }
 
+mod directives {
+    use sparkdown::{Options, to_html_with};
+
+    fn on() -> Options {
+        Options {
+            directives: true,
+            ..Options::default()
+        }
+    }
+
+    #[test]
+    fn text_directive() {
+        // Convention: name → element, attributes → HTML attributes; label inline.
+        assert_eq!(
+            to_html_with(":name[label]{#id .cls}\n", &on()),
+            "<p><name id=\"id\" class=\"cls\">label</name></p>\n"
+        );
+    }
+
+    #[test]
+    fn text_directive_mid_paragraph() {
+        assert_eq!(
+            to_html_with("a :em[x] b\n", &on()),
+            "<p>a <em>x</em> b</p>\n"
+        );
+    }
+
+    #[test]
+    fn trailing_colon_is_not_a_directive() {
+        // `:foo:` is an emoji-shaped token, not a directive (matches micromark).
+        assert_eq!(to_html_with(":foo: bar\n", &on()), "<p>:foo: bar</p>\n");
+    }
+
+    #[test]
+    fn leaf_directive() {
+        assert_eq!(
+            to_html_with("::leaf[lab]{.warn}\n", &on()),
+            "<leaf class=\"warn\">lab</leaf>\n"
+        );
+    }
+
+    #[test]
+    fn container_directive() {
+        assert_eq!(
+            to_html_with(":::note\n## Title\n\ntext\n:::\n", &on()),
+            "<note>\n<h2>Title</h2>\n<p>text</p>\n</note>\n"
+        );
+    }
+
+    #[test]
+    fn off_by_default() {
+        assert_eq!(
+            to_html_with(":name[x]\n", &Options::default()),
+            "<p>:name[x]</p>\n"
+        );
+        assert_eq!(
+            to_html_with(":::note\nbody\n:::\n", &Options::default()),
+            "<p>:::note\nbody\n:::</p>\n"
+        );
+    }
+}
+
+#[cfg(feature = "ast")]
+mod directives_mdast {
+    use sparkdown::Options;
+    use sparkdown::ast::to_mdast_json_opts;
+
+    fn on() -> Options {
+        Options {
+            directives: true,
+            ..Options::default()
+        }
+    }
+
+    #[test]
+    fn text_directive_node() {
+        let j = to_mdast_json_opts(":name[label]{#id key=val}\n", on());
+        assert!(
+            j.contains(r#""type":"textDirective","name":"name","attributes":{"id":"id","key":"val"}"#),
+            "{j}"
+        );
+        // The label is inline children.
+        assert!(j.contains(r#""type":"text","value":"label""#), "{j}");
+    }
+
+    #[test]
+    fn leaf_and_container_nodes() {
+        let j = to_mdast_json_opts("::leaf{.warn}\n", on());
+        assert!(j.contains(r#""type":"leafDirective","name":"leaf""#), "{j}");
+        let c = to_mdast_json_opts(":::note\nbody\n:::\n", on());
+        assert!(c.contains(r#""type":"containerDirective","name":"note""#), "{c}");
+    }
+
+    #[test]
+    fn container_label_is_directive_label_paragraph() {
+        let j = to_mdast_json_opts(":::note[Title]\nbody\n:::\n", on());
+        assert!(j.contains(r#""data":{"directiveLabel":true}"#), "{j}");
+    }
+
+    #[test]
+    fn off_by_default() {
+        let j = to_mdast_json_opts(":name[x]\n", Options::default());
+        assert!(!j.contains("Directive"), "{j}");
+    }
+}
+
 #[cfg(feature = "ast")]
 mod footnotes {
     use sparkdown::Options;

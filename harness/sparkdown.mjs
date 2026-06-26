@@ -41,6 +41,21 @@ function parseToMdast(md) {
   return JSON.parse(json);
 }
 
+// Like parseToMdast, but with the opt-in extension flags bitmask (matching
+// sparkdown_to_html_opts). The JSON path carries full inline children, so it is
+// what the directive/deflist mdast gates check against the ecosystem trees.
+function parseToMdastJson(md, flags = 0) {
+  const buf = enc.encode(md);
+  const inPtr = x.sparkdown_alloc(buf.length);
+  new Uint8Array(x.memory.buffer).set(buf, inPtr);
+  const ptr = x.sparkdown_to_mdast_json_opts(inPtr, buf.length, flags);
+  const len = new DataView(x.memory.buffer).getUint32(ptr, true);
+  const json = dec.decode(new Uint8Array(x.memory.buffer, ptr + 4, len));
+  x.sparkdown_free(ptr, 4 + len);
+  x.sparkdown_free(inPtr, buf.length);
+  return JSON.parse(json);
+}
+
 /**
  * unified plugin: install sparkdown as the processor's parser.
  * (Mirrors how `remark-parse` attaches `this.parser`.)
@@ -156,4 +171,4 @@ function parseToMdastWire(md, flags = 0) {
   return tree;
 }
 
-export { parseToMdast, parseToMdastWire };
+export { parseToMdast, parseToMdastJson, parseToMdastWire };

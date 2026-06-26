@@ -638,6 +638,9 @@ enum Sem {
     ImageRef { identifier: String, label: String, reftype: &'static str, alt: String },
     /// GFM `[^label]` → mdast `footnoteReference` (a leaf).
     FootnoteRef { identifier: String, label: String },
+    /// remark-directive inline `:name[label]{attrs}` → mdast `textDirective`. The
+    /// `label` is a content byte range (re-tokenized into children at build time).
+    TextDirective { name: String, attrs: Vec<(String, String)>, label: Option<(u32, u32)> },
 }
 
 /// SPIKE: reference-resolution metadata produced by [`parse_link_target`] in AST
@@ -682,6 +685,9 @@ pub enum InlineTok {
     ImageRef { identifier: String, label: String, reftype: &'static str, alt: String },
     /// mdast `footnoteReference` (leaf).
     FootnoteRef { identifier: String, label: String },
+    /// mdast `textDirective`. `label` is a content byte range whose inline content
+    /// becomes the directive's children (re-tokenized by the AST builder).
+    TextDirective { name: String, attrs: Vec<(String, String)>, label: Option<(u32, u32)> },
 }
 
 /// SPIKE (`ast`): an [`InlineTok`] tagged with the content byte range
@@ -792,6 +798,11 @@ fn list_to_tokens(list: &List, cur: &str, sem: &[Sem], out: &mut Vec<SpanTok>) {
                     identifier: identifier.clone(),
                     label: label.clone(),
                 },
+                Sem::TextDirective { name, attrs, label } => InlineTok::TextDirective {
+                    name: name.clone(),
+                    attrs: attrs.clone(),
+                    label: *label,
+                },
             }),
             Node::LinkClose => push(InlineTok::LinkClose),
         }
@@ -833,6 +844,16 @@ pub trait InlineSink {
         end: u32,
     );
     fn footnote_ref(&mut self, identifier: &str, label: &str, start: u32, end: u32);
+    /// A remark-directive `textDirective`. `label` is a content byte range whose
+    /// inline content forms the children (the wire emitter resolves it best-effort).
+    fn text_directive(
+        &mut self,
+        name: &str,
+        attrs: &[(String, String)],
+        label: Option<(u32, u32)>,
+        start: u32,
+        end: u32,
+    );
 }
 
 /// SPIKE (`ast`): drive an [`InlineSink`] over the resolved slot list, coalescing
@@ -922,6 +943,9 @@ fn emit_inline<S: InlineSink>(list: &List, cur: &str, sem: &[Sem], sink: &mut S)
                     }
                     Sem::FootnoteRef { identifier, label } => {
                         sink.footnote_ref(identifier, label, s, e)
+                    }
+                    Sem::TextDirective { name, attrs, label } => {
+                        sink.text_directive(name, attrs, *label, s, e)
                     }
                 }
             }
@@ -1646,12 +1670,28 @@ pub fn render_inline(
     let al = Options::GFM && opts.autolink;
     let fno = opts.footnotes;
     let emo = Options::EMOJI && opts.emoji;
+    let dir = opts.directives;
     match (opts.hard_wraps, Options::GFM && opts.strikethrough) {
-        (false, false) => render_inline_impl::<false, false>(src, out, refmap, scratch, tf, al, fno, emo),
-        (false, true) => render_inline_impl::<false, true>(src, out, refmap, scratch, tf, al, fno, emo),
-        (true, false) => render_inline_impl::<true, false>(src, out, refmap, scratch, tf, al, fno, emo),
-        (true, true) => render_inline_impl::<true, true>(src, out, refmap, scratch, tf, al, fno, emo),
+        (false, false) => render_inline_impl::<false, false>(src, out, refmap, scratch, tf, al, fno, emo, dir, opts),
+        (false, true) => render_inline_impl::<false, true>(src, out, refmap, scratch, tf, al, fno, emo, dir, opts),
+        (true, false) => render_inline_impl::<true, false>(src, out, refmap, scratch, tf, al, fno, emo, dir, opts),
+        (true, true) => render_inline_impl::<true, true>(src, out, refmap, scratch, tf, al, fno, emo, dir, opts),
     }
+}
+
+/// Write a text directive's opening tag `<name k="v" …>` into `out` (the
+/// remark-directive HTML convention; attribute values are HTML-escaped).
+fn dir_open_tag(name: &str, attrs: &[(String, String)], out: &mut String) {
+    out.push('<');
+    out.push_str(name);
+    for (k, v) in attrs {
+        out.push(' ');
+        out.push_str(k);
+        out.push_str("=\"");
+        escape_html(v, out);
+        out.push('"');
+    }
+    out.push('>');
 }
 
 /// Emoji shortcode lookup, present only with the `emoji` feature (folds to `None`
@@ -1716,6 +1756,8 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
     al: bool,
     fno: bool,
     emo: bool,
+    dir: bool,
+    opts: Options,
 ) {
     let bytes = src.as_bytes();
     // SPIKE: AST mode captures semantic nodes instead of HTML. `ast_mode` is a
@@ -1737,9 +1779,9 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
     } else {
         find_emph(bytes)
     };
-    // Emoji needs the node path only when a `:` is actually present; a `:`-free
-    // line still takes the fast stream path.
-    let emo_here = emo && memchr1(bytes, b':').is_some();
+    // Emoji and text directives need the node path only when a `:` is actually
+    // present; a `:`-free line still takes the fast stream path.
+    let emo_here = (emo || dir) && memchr1(bytes, b':').is_some();
     if gate.is_none() && !ast_mode && !emo_here {
         if al {
             stream_autolink(src, out, HW, tf);
@@ -2106,7 +2148,7 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                     i += 1;
                 }
             }
-            b':' if al || emo => {
+            b':' if al || emo || dir => {
                 if al && let Some((s, e)) = gfm_scan_url_at_colon(bytes, i) {
                     escape_html(&src[run..s], cur);
                     emit_url(src, s, e, cur);
@@ -2119,6 +2161,48 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                     escape_html(&src[run..i], cur);
                     cur.push_str(emoji);
                     i = e;
+                    run = i;
+                } else if dir
+                    && !(i > 0 && bytes[i - 1] == b':')
+                    && bytes.get(i + 1) != Some(&b':')
+                    && let Some(h) = crate::directive::parse_header(&bytes[i + 1..])
+                    // A trailing `:` means this is a `:shortcode:`-shaped token, not
+                    // a text directive (matches micromark-extension-directive).
+                    && bytes.get(i + 1 + h.consumed) != Some(&b':')
+                {
+                    let ac = i + 1;
+                    let after = ac + h.consumed;
+                    let name = src[ac + h.name_start..ac + h.name_end].to_owned();
+                    let label = h.label.map(|(ls, le)| (ac + ls, ac + le));
+                    escape_html(&src[run..i], cur);
+                    if ast_mode {
+                        flush!(i);
+                        let si = sem.len() as u32;
+                        sem.push(Sem::TextDirective {
+                            name,
+                            attrs: h.attrs,
+                            label: label.map(|(s, e)| (s as u32, e as u32)),
+                        });
+                        let did = list.push(Node::Sem(si));
+                        cspan!(did, i, after);
+                        seg = cur.len();
+                    } else {
+                        // HTML convention: <name attrs>label</name>; the label is
+                        // inline content (sub-rendered with a scratch of its own).
+                        dir_open_tag(&name, &h.attrs, cur);
+                        if let Some((ls, le)) = label {
+                            // The label is inline content; sub-render it with a
+                            // scratch of its own (the live one is mid-parse).
+                            let mut tmp = Scratch::new();
+                            let mut html = String::new();
+                            render_inline(&src[ls..le], &mut html, refmap, &mut tmp, opts);
+                            cur.push_str(&html);
+                        }
+                        cur.push_str("</");
+                        cur.push_str(&name);
+                        cur.push('>');
+                    }
+                    i = after;
                     run = i;
                 } else {
                     i += 1;
@@ -2141,9 +2225,9 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                     find_inline(rest)
                 };
                 let mut adv = 1 + skip.unwrap_or(bytes.len() - i - 1);
-                // Emoji: `:` is not in the (non-autolink) scan set, so clamp the
-                // skip to the next `:` here when looking for shortcodes.
-                if emo && let Some(c) = memchr1(&bytes[i + 1..i + adv], b':') {
+                // Emoji and text directives: `:` is not in the (non-autolink) scan
+                // set, so clamp the skip to the next `:` here when either is on.
+                if (emo || dir) && let Some(c) = memchr1(&bytes[i + 1..i + adv], b':') {
                     adv = 1 + c;
                 }
                 i += adv;
@@ -2376,7 +2460,11 @@ fn ast_image_alt(list: &List, op_node: usize, rb_node: usize, cur: &str, sem: &[
                 Sem::Code(v) => s.push_str(v),
                 Sem::Autolink { text, .. } => s.push_str(text),
                 Sem::Html(h) => s.push_str(h),
-                Sem::LinkOpen { .. } | Sem::LinkRef { .. } | Sem::Break | Sem::FootnoteRef { .. } => {}
+                Sem::LinkOpen { .. }
+                | Sem::LinkRef { .. }
+                | Sem::Break
+                | Sem::FootnoteRef { .. }
+                | Sem::TextDirective { .. } => {}
             },
             Node::LinkClose => {}
         }

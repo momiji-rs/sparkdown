@@ -265,6 +265,22 @@ fn cr(out: &mut String) {
     }
 }
 
+/// Write a directive's opening tag `<name k="v" …>` (the remark-directive HTML
+/// convention: the name is the element, attributes become HTML attributes). The
+/// name is emitted verbatim; attribute values are HTML-escaped.
+fn directive_open_tag(name: &str, attrs: &[(String, String)], out: &mut String) {
+    out.push('<');
+    out.push_str(name);
+    for (k, v) in attrs {
+        out.push(' ');
+        out.push_str(k);
+        out.push_str("=\"");
+        escape_html(v, out);
+        out.push('"');
+    }
+    out.push('>');
+}
+
 fn children(tree: &Tree, idx: usize, out: &mut String, scratch: &mut Scratch) {
     // Walk the intrusive first-child/next-sibling list.
     let mut c = tree.first_child(idx);
@@ -389,6 +405,32 @@ fn render_node(tree: &Tree, idx: usize, out: &mut String, scratch: &mut Scratch)
                 render_inline(line, out, &tree.refmap, scratch, tree.opts);
                 out.push_str("</dt>\n");
             }
+        }
+        Kind::LeafDirective => {
+            // Convention: the directive name is the element; the `[label]` is its
+            // inline content. (HTML is not the gate-able output; mdast is.)
+            let d = tree.directive(idx);
+            cr(out);
+            directive_open_tag(&d.name, &d.attrs, out);
+            if let Some((s, e)) = d.label {
+                render_inline(tree.source_range(s, e), out, &tree.refmap, scratch, tree.opts);
+            }
+            out.push_str("</");
+            out.push_str(&d.name);
+            out.push('>');
+            cr(out);
+        }
+        Kind::ContainerDirective => {
+            let d = tree.directive(idx);
+            cr(out);
+            directive_open_tag(&d.name, &d.attrs, out);
+            cr(out);
+            children(tree, idx, out, scratch);
+            cr(out);
+            out.push_str("</");
+            out.push_str(&d.name);
+            out.push('>');
+            cr(out);
         }
         Kind::DefDesc => {
             let body = tree.content(idx).trim_matches([' ', '\t', '\n', '\r']);

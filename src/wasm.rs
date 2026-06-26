@@ -102,6 +102,42 @@ pub unsafe extern "C" fn sparkdown_to_mdast_wire(ptr: *const u8, len: usize) -> 
     box_html(&crate::ast::to_mdast_wire(&md))
 }
 
+/// Like [`sparkdown_to_mdast_json`] but applies opt-in grammar extensions from a
+/// `flags` bitmask (same layout as [`sparkdown_to_html_opts`]). Returns JSON in
+/// the standard `[u32 length][bytes]` framing. The JSON path carries full inline
+/// children for every node (e.g. a `textDirective`'s `[label]`), so it is the
+/// path the directive alignment gate checks against remark-directive.
+///
+/// # Safety
+/// `ptr` must point to `len` readable, initialized bytes.
+#[cfg(feature = "ast")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sparkdown_to_mdast_json_opts(
+    ptr: *const u8,
+    len: usize,
+    flags: u32,
+) -> *mut u8 {
+    let input = unsafe { core::slice::from_raw_parts(ptr, len) };
+    let md = String::from_utf8_lossy(input);
+    let opts = crate::Options {
+        strikethrough: flags & 1 != 0,
+        tasklist: flags & 2 != 0,
+        autolink: flags & 4 != 0,
+        tagfilter: flags & 8 != 0,
+        tables: flags & 16 != 0,
+        hard_wraps: flags & 32 != 0,
+        diagram: flags & 64 != 0,
+        heading_ids: flags & 128 != 0,
+        frontmatter: flags & 256 != 0,
+        emoji: flags & 1024 != 0,
+        external_links: flags & 2048 != 0,
+        footnotes: flags & 512 != 0,
+        deflist: flags & 4096 != 0,
+        directives: flags & 8192 != 0,
+    };
+    box_html(crate::ast::to_mdast_json_opts(&md, opts).as_bytes())
+}
+
 /// Like [`sparkdown_to_mdast_wire`] but applies opt-in grammar extensions from a
 /// `flags` bitmask (same bit layout as [`sparkdown_to_html_opts`]; bit 8 =
 /// frontmatter). Lets the JS boundary request a frontmatter-aware mdast tree.
@@ -131,6 +167,7 @@ pub unsafe extern "C" fn sparkdown_to_mdast_wire_opts(
         external_links: flags & 2048 != 0,
         footnotes: flags & 512 != 0,
         deflist: flags & 4096 != 0,
+        directives: flags & 8192 != 0,
     };
     box_html(&crate::ast::to_mdast_wire_opts(&md, opts))
 }
@@ -139,7 +176,7 @@ pub unsafe extern "C" fn sparkdown_to_mdast_wire_opts(
 /// 0 strikethrough, 1 task lists, 2 autolinks, 3 tag filter, 4 tables, 5 hard
 /// wraps, 6 diagram, 7 heading ids (built-in slug transform), 8 frontmatter
 /// (YAML `---` / TOML `+++`), 9 footnotes (GFM), 10 emoji, 11 external links,
-/// 12 definition lists. A bit only takes
+/// 12 definition lists, 13 directives. A bit only takes
 /// effect if the matching Cargo feature was compiled in. Built with the `gfm`
 /// feature.
 ///
@@ -164,6 +201,7 @@ pub unsafe extern "C" fn sparkdown_to_html_opts(ptr: *const u8, len: usize, flag
         external_links: flags & 2048 != 0,
         footnotes: flags & 512 != 0,
         deflist: flags & 4096 != 0,
+        directives: flags & 8192 != 0,
     };
     RENDERER.with(|cell| {
         let mut r = cell.borrow_mut();

@@ -46,6 +46,13 @@ pub enum Kind {
     /// continuation lines like a paragraph; `level` is 1 when loose (a blank line
     /// preceded the `:` marker, so the body is wrapped in `<p>`), 0 when tight.
     DefDesc,
+    /// Leaf directive `::name[label]{attrs}` (one line). Carries its payload via
+    /// [`Node::fn_idx`] → [`Tree::directives`]; the `[label]` is inline content.
+    LeafDirective,
+    /// Container directive `:::name[label]{attrs}` … `:::` — a block container
+    /// (its content parses as markdown). Colon-fenced like a code block
+    /// (`fence_char`/`fence_len`); payload via [`Node::fn_idx`].
+    ContainerDirective,
     /// SPIKE (`ast` feature): a link reference definition `[label]: url "title"`.
     /// Renders to nothing (HTML output unchanged); carries an index into
     /// [`Tree::defs`] via [`Node::def`] for the mdast `definition` node.
@@ -74,6 +81,17 @@ pub struct DefData {
 pub struct FnDef {
     pub label: String,
     pub identifier: String,
+}
+
+/// Payload for a block directive (`leafDirective` / `containerDirective`): its
+/// `name`, ordered `attributes`, and the source byte range of its `[label]`
+/// content (if any). Indexed by [`Node::fn_idx`] (reused — a node is never both a
+/// footnote definition and a directive) into [`Tree::directives`].
+#[derive(Clone)]
+pub struct DirData {
+    pub name: String,
+    pub attrs: Vec<(String, String)>,
+    pub label: Option<(u32, u32)>,
 }
 
 #[derive(Clone)]
@@ -206,6 +224,9 @@ pub struct Tree<'a> {
     /// GFM footnote labels (lowercased) that have ≥1 definition — the set a
     /// `[^label]` reference must hit to be a `footnoteReference`.
     pub footnote_ids: std::collections::HashSet<String>,
+    /// Block-directive payloads (`Kind::LeafDirective`/`ContainerDirective`),
+    /// indexed by [`Node::fn_idx`].
+    pub directives: Vec<DirData>,
     /// SPIKE (`ast` feature): payloads for `Kind::Definition` nodes; indexed by
     /// [`Node::def`].
     #[cfg(feature = "ast")]
@@ -231,6 +252,16 @@ impl Tree<'_> {
     /// `Kind::FootnoteDef` node.
     pub fn fn_def(&self, idx: usize) -> &FnDef {
         &self.fn_defs[self.nodes[idx].fn_idx as usize]
+    }
+
+    /// Block-directive payload for a `Kind::LeafDirective`/`ContainerDirective`.
+    pub fn directive(&self, idx: usize) -> &DirData {
+        &self.directives[self.nodes[idx].fn_idx as usize]
+    }
+
+    /// A raw slice of the original source by byte range (e.g. a directive label).
+    pub fn source_range(&self, start: u32, end: u32) -> &str {
+        &self.source[start as usize..end as usize]
     }
 
     /// Consume the tree, returning its buffers for reuse by `parse_with`.
@@ -387,6 +418,9 @@ struct Parser<'a> {
     fn_defs: Vec<FnDef>,
     /// GFM footnote labels (lowercased) seen as definitions — the reference set.
     footnote_ids: std::collections::HashSet<String>,
+    /// Block-directive payloads, in creation order; a node's [`Node::fn_idx`]
+    /// indexes here.
+    directives: Vec<DirData>,
     /// SPIKE (`ast` feature): payloads for `Kind::Definition` nodes, in creation
     /// order; a node's [`Node::def`] indexes here.
     #[cfg(feature = "ast")]
@@ -437,6 +471,7 @@ impl<'a> Parser<'a> {
             opts,
             fn_defs: Vec::new(),
             footnote_ids: std::collections::HashSet::new(),
+            directives: Vec::new(),
             #[cfg(feature = "ast")]
             defs: Vec::new(),
             #[cfg(feature = "ast")]
@@ -1116,6 +1151,7 @@ impl<'a> Parser<'a> {
             buf: self.buf,
             fn_defs: self.fn_defs,
             footnote_ids: self.footnote_ids,
+            directives: self.directives,
             #[cfg(feature = "ast")]
             defs: self.defs,
             #[cfg(feature = "ast")]
@@ -1180,9 +1216,11 @@ impl<'a> Parser<'a> {
             // A footnote definition starts with `[` (not in `maybe_special`); keep
             // the fast skip on for `[` lines unless footnotes are enabled.
             let fast_skip = fast_skip && !(self.opts.footnotes && first == Some(b'['));
-            // A definition-list marker starts with `:` (not in `maybe_special`);
-            // let `:` lines through to `start_def_list` when deflists are enabled.
-            let fast_skip = fast_skip && !(self.opts.deflist && first == Some(b':'));
+            // Definition-list markers and directives both start with `:` (not in
+            // `maybe_special`); let `:` lines through to their matchers when
+            // either extension is enabled.
+            let fast_skip = fast_skip
+                && !((self.opts.deflist || self.opts.directives) && first == Some(b':'));
             if fast_skip {
                 self.advance_next_nonspace();
                 break;
@@ -1367,6 +1405,25 @@ impl<'a> Parser<'a> {
             // Term holders are closed the moment their description is attached, so
             // they are never re-entered as an open container.
             Kind::DefTerm => 1,
+            // A container directive runs until its closing colon fence (a line of
+            // ≥ the opening colon count); otherwise its content flows in as
+            // markdown with no prefix stripping.
+            Kind::ContainerDirective => {
+                if !self.indented
+                    && is_colon_close(self.line, self.next_nonspace, self.nodes[c].fence_len)
+                {
+                    let cur = c;
+                    #[cfg(feature = "ast")]
+                    {
+                        self.nodes[cur].src_end = (self.line_src_start + self.line.len()) as u32;
+                    }
+                    self.finalize(cur);
+                    return 2;
+                }
+                0
+            }
+            // Leaf directives are single-line, born closed; never re-entered.
+            Kind::LeafDirective => 1,
             Kind::Heading | Kind::ThematicBreak => 1,
             // Definitions are inserted already-closed (never an open container).
             #[cfg(feature = "ast")]
@@ -1434,8 +1491,9 @@ impl<'a> Parser<'a> {
             7 => self.start_indented_code(),
             8 => self.start_footnote_def(container),
             9 => self.start_def_list(container),
+            10 => self.start_directive(),
             #[cfg(feature = "gfm")]
-            10 => self.start_table(container),
+            11 => self.start_table(container),
             _ => 0,
         }
     }
@@ -1802,6 +1860,64 @@ impl<'a> Parser<'a> {
         dl
     }
 
+    /// Block directives (remark-directive): a leaf `::name…` (one line) or a
+    /// container `:::name…` … `:::`. The leading colon run selects the form (2 =
+    /// leaf, ≥3 = container). The header (`name[label]{attrs}`) is parsed once and
+    /// stashed in `directives`; the opening line must hold nothing but the header.
+    fn start_directive(&mut self) -> u8 {
+        if !self.opts.directives || self.indented {
+            return 0;
+        }
+        let line = self.line;
+        let rest = &line[self.next_nonspace..];
+        let mut colons = 0;
+        while colons < rest.len() && rest[colons] == b':' {
+            colons += 1;
+        }
+        if colons < 2 {
+            return 0;
+        }
+        let Some(h) = crate::directive::parse_header(&rest[colons..]) else {
+            return 0;
+        };
+        // The remainder of the opening line must be blank (header only).
+        if rest[colons + h.consumed..]
+            .iter()
+            .any(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+        {
+            return 0;
+        }
+        let name =
+            String::from_utf8_lossy(&rest[colons + h.name_start..colons + h.name_end]).into_owned();
+        let base = self.line_src_start + self.next_nonspace + colons;
+        let label = h.label.map(|(s, e)| ((base + s) as u32, (base + e) as u32));
+        let di = self.directives.len() as u32;
+        self.directives.push(DirData { name, attrs: h.attrs, label });
+        self.close_unmatched_blocks();
+        #[cfg(feature = "ast")]
+        let src_start = (self.line_src_start + self.next_nonspace) as u32;
+        let kind = if colons == 2 {
+            Kind::LeafDirective
+        } else {
+            Kind::ContainerDirective
+        };
+        let node = self.add_child(kind);
+        self.nodes[node].fn_idx = di;
+        if colons >= 3 {
+            self.nodes[node].fenced = true;
+            self.nodes[node].fence_char = b':';
+            self.nodes[node].fence_len = colons;
+        }
+        #[cfg(feature = "ast")]
+        {
+            self.nodes[node].src_start = src_start;
+            self.nodes[node].src_end = (self.line_src_start + self.line.len()) as u32;
+        }
+        // Consume the whole opening line so it never becomes child content.
+        self.advance_offset(self.line.len() - self.offset, false);
+        if colons == 2 { 2 } else { 1 }
+    }
+
     fn start_indented_code(&mut self) -> u8 {
         if self.indented && self.nodes[self.tip].kind != Kind::Paragraph && !self.blank {
             // mdast indented code starts at the line content region (incl. indent).
@@ -1933,7 +2049,7 @@ impl<'a> Parser<'a> {
     }
 }
 
-const NUM_STARTS: usize = if cfg!(feature = "gfm") { 11 } else { 10 };
+const NUM_STARTS: usize = if cfg!(feature = "gfm") { 12 } else { 11 };
 
 /// Could a line whose first non-space byte is `c` begin a block other than a
 /// paragraph? (`#` ATX, `>` quote, `` ` ``/`~` fence, `*+-_` thematic/list,
@@ -1994,6 +2110,7 @@ fn is_fm_fence(line: &[u8], marker: u8) -> bool {
 fn can_contain(parent: Kind, child: Kind) -> bool {
     match parent {
         Kind::Document | Kind::BlockQuote | Kind::Item | Kind::FootnoteDef => child != Kind::Item,
+        Kind::ContainerDirective => child != Kind::Item,
         Kind::List => child == Kind::Item,
         // A definition list holds term holders and descriptions; a plain
         // paragraph child is a pending term candidate (a dangling one is evicted
@@ -2179,6 +2296,19 @@ fn is_closing_fence(line: &[u8], from: usize, fence_char: u8, fence_len: usize) 
     rest[run..]
         .iter()
         .all(|&b| b == b' ' || b == b'\t' || b == b'\n')
+}
+
+/// A container-directive closing fence: a run of `≥ max(fence_len, 3)` colons
+/// followed only by whitespace.
+fn is_colon_close(line: &[u8], from: usize, fence_len: usize) -> bool {
+    let rest = &line[from..];
+    let run = rest.iter().take_while(|&&b| b == b':').count();
+    if run < fence_len.max(3) {
+        return false;
+    }
+    rest[run..]
+        .iter()
+        .all(|&b| b == b' ' || b == b'\t' || b == b'\r' || b == b'\n')
 }
 
 /// Byte length of `s` after stripping a trailing `(\n *)+` run (HTML-block

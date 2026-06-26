@@ -51,6 +51,13 @@ pub enum Mdast {
     /// One description of a definition list (`defListDescription`). `spread` is
     /// true when loose; children are block content (a wrapping `paragraph`).
     DefListDescription { spread: bool, children: Vec<Mdast> },
+    /// remark-directive `containerDirective` (`:::name … :::`) — block children.
+    ContainerDirective { name: String, attributes: Vec<(String, String)>, children: Vec<Mdast> },
+    /// remark-directive `leafDirective` (`::name`) — inline children (the label).
+    LeafDirective { name: String, attributes: Vec<(String, String)>, children: Vec<Mdast> },
+    /// A container directive's `[label]`: serialized as a `paragraph` carrying
+    /// `data: { directiveLabel: true }` (matching remark-directive).
+    DirectiveLabel(Vec<Mdast>),
     // --- inline ---
     Text(String),
     Emphasis(Vec<Mdast>),
@@ -64,6 +71,8 @@ pub enum Mdast {
     ImageReference { identifier: String, label: String, reftype: &'static str, alt: String },
     /// GFM footnote reference `[^label]` (inline leaf).
     FootnoteReference { identifier: String, label: String },
+    /// remark-directive inline `textDirective` (`:name[label]{attrs}`).
+    TextDirective { name: String, attributes: Vec<(String, String)>, children: Vec<Mdast> },
     /// SPIKE: wraps a block node with its unist `position`. Kept as a wrapper
     /// (rather than a field on every variant) to minimize churn; the serializer
     /// folds it into the inner node's JSON object as `"position": …`.
@@ -380,10 +389,65 @@ fn block(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> (Mdast
                 eb,
             )
         }
+        Kind::LeafDirective => {
+            let d = tree.directive(idx);
+            let eb = ctx.rtrim_nl(se);
+            let children = directive_label_children(tree, d, scratch, ctx);
+            (
+                Mdast::LeafDirective {
+                    name: d.name.clone(),
+                    attributes: d.attrs.clone(),
+                    children,
+                },
+                sb,
+                eb,
+            )
+        }
+        Kind::ContainerDirective => {
+            let d = tree.directive(idx);
+            // A `[label]` on the opener becomes a leading `paragraph` carrying
+            // `data.directiveLabel` (matching remark-directive); the fenced body
+            // parses as ordinary block children.
+            let mut kids: Vec<Mdast> = Vec::new();
+            if let Some((ls, le)) = d.label {
+                let label = directive_label_children(tree, d, scratch, ctx);
+                // remark-directive spans the label paragraph over the brackets.
+                let lpos = ctx.pos(ls as usize - 1, le as usize + 1);
+                kids.push(Mdast::Positioned(lpos, Box::new(Mdast::DirectiveLabel(label))));
+            }
+            let (body, last) = block_children(tree, idx, scratch, ctx);
+            kids.extend(body);
+            (
+                Mdast::ContainerDirective {
+                    name: d.name.clone(),
+                    attributes: d.attrs.clone(),
+                    children: kids,
+                },
+                sb,
+                last.map_or(se, |l| l.max(se)),
+            )
+        }
         #[cfg(feature = "gfm")]
         Kind::Table => (Mdast::Html(tree.content(idx).to_owned()), sb, ctx.rtrim(sb, se)),
     };
     (Mdast::Positioned(ctx.pos(start_b, end_b), Box::new(inner)), end_b)
+}
+
+/// Build the inline children of a block directive's `[label]` (empty when absent).
+/// The label is a contiguous source range, so child token offsets map directly.
+fn directive_label_children(
+    tree: &Tree,
+    d: &crate::block::DirData,
+    scratch: &mut Scratch,
+    ctx: &PosCtx,
+) -> Vec<Mdast> {
+    let Some((ls, le)) = d.label else {
+        return Vec::new();
+    };
+    let body = tree.source_range(ls, le);
+    let toks = render_inline_to_tokens(body, &tree.refmap, scratch, tree.opts);
+    let bpos = ctx.pos(ls as usize, le as usize);
+    build_inline(body, toks, tree, scratch, ctx, &|o| ls as usize + o as usize, &bpos)
 }
 
 /// Tokenize and position-map a single inline run `body` that starts at content
@@ -402,7 +466,15 @@ fn inline_span(
     let ebb = tree.content_to_src(ci, content_off + body.len() as u32) as usize;
     let toks = render_inline_to_tokens(body, &tree.refmap, scratch, tree.opts);
     let bpos = ctx.pos(sbb, ebb);
-    let inl = build_inline(toks, ctx, &|o| tree.content_to_src(ci, content_off + o) as usize, &bpos);
+    let inl = build_inline(
+        body,
+        toks,
+        tree,
+        scratch,
+        ctx,
+        &|o| tree.content_to_src(ci, content_off + o) as usize,
+        &bpos,
+    );
     (bpos, inl)
 }
 
@@ -439,7 +511,7 @@ fn inline(
     let toks = render_inline_to_tokens(tree.content(idx), &tree.refmap, scratch, tree.opts);
     let bpos = ctx.pos(sb, eb);
     let map = |off: u32| tree.content_to_src(idx, off) as usize;
-    build_inline(toks, ctx, &map, &bpos)
+    build_inline(tree.content(idx), toks, tree, scratch, ctx, &map, &bpos)
 }
 
 /// An open inline container awaiting its close.
@@ -454,7 +526,10 @@ enum Frame {
 /// source `base + o`); when `None` (buffered content) or a token span is unset,
 /// the block-granular `bpos` is used.
 fn build_inline(
+    content: &str,
     toks: Vec<SpanTok>,
+    tree: &Tree,
+    scratch: &mut Scratch,
     ctx: &PosCtx,
     map: &dyn Fn(u32) -> usize,
     bpos: &Pos,
@@ -519,6 +594,22 @@ fn build_inline(
                 stack.last_mut().unwrap().1.push(Mdast::Positioned(
                     p,
                     Box::new(Mdast::FootnoteReference { identifier, label }),
+                ));
+            }
+            InlineTok::TextDirective { name, attrs, label } => {
+                let p = mkpos(start, end);
+                let children = match label {
+                    Some((ls, le)) => {
+                        let body = &content[ls as usize..le as usize];
+                        let toks2 = render_inline_to_tokens(body, &tree.refmap, scratch, tree.opts);
+                        let lpos = ctx.pos(map(ls), if le == 0 { map(0) } else { map(le - 1) + 1 });
+                        build_inline(body, toks2, tree, scratch, ctx, &|o| map(ls + o), &lpos)
+                    }
+                    None => Vec::new(),
+                };
+                stack.last_mut().unwrap().1.push(Mdast::Positioned(
+                    p,
+                    Box::new(Mdast::TextDirective { name, attributes: attrs, children }),
                 ));
             }
             InlineTok::Autolink { url, text } => {
@@ -904,6 +995,55 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
             w_u32_at(out, coff, n);
             last
         }
+        Kind::LeafDirective => {
+            let d = tree.directive(idx);
+            let eb = ctx.rtrim_nl(se);
+            out.push(28); // leafDirective
+            w_point(out, ctx.point(sb));
+            w_point(out, ctx.point(eb));
+            w_str(&d.name, out);
+            w_attrs(&d.attrs, out);
+            let coff = reserve(out, 4);
+            let n = match d.label {
+                Some((ls, le)) => {
+                    inline_wire_src(tree, ls, tree.source_range(ls, le), scratch, ctx, out).1
+                }
+                None => 0,
+            };
+            w_u32_at(out, coff, n);
+            eb
+        }
+        Kind::ContainerDirective => {
+            let d = tree.directive(idx);
+            out.push(29); // containerDirective
+            w_point(out, ctx.point(sb));
+            let eoff = reserve(out, 12);
+            w_str(&d.name, out);
+            w_attrs(&d.attrs, out);
+            let coff = reserve(out, 4);
+            let mut n = 0u32;
+            let mut last = se;
+            if let Some((ls, le)) = d.label {
+                // directiveLabel paragraph (tag 30).
+                out.push(30);
+                w_point(out, ctx.point(ls as usize));
+                let leoff = reserve(out, 12);
+                let lcoff = reserve(out, 4);
+                let (lend, ln) =
+                    inline_wire_src(tree, ls, tree.source_range(ls, le), scratch, ctx, out);
+                patch_point(out, leoff, ctx.point(lend));
+                w_u32_at(out, lcoff, ln);
+                n += 1;
+            }
+            let (bn, blast) = bchildren(tree, idx, scratch, ctx, out);
+            n += bn;
+            if let Some(l) = blast {
+                last = last.max(l);
+            }
+            patch_point(out, eoff, ctx.point(last));
+            w_u32_at(out, coff, n);
+            last
+        }
         // Built inline by their `DefList` parent; unreachable but kept exhaustive.
         Kind::DefTerm => {
             let eb = ctx.rtrim_nl(se);
@@ -972,6 +1112,7 @@ fn inline_wire(
         tree,
         idx,
         obase: 0,
+        src_base: None,
         ctx,
         bpos: ctx.pos(sb, eb),
         stack: Vec::new(),
@@ -979,6 +1120,43 @@ fn inline_wire(
     };
     render_inline_to_sink(tree.content(idx), &tree.refmap, scratch, tree.opts, &mut sink);
     sink.top
+}
+
+/// Emit the inline content of a raw source range `body` (starting at source byte
+/// `src_start`) to wire — used for a block directive's `[label]`. Returns the
+/// label's source byte end and its child count.
+fn inline_wire_src(
+    tree: &Tree,
+    src_start: u32,
+    body: &str,
+    scratch: &mut Scratch,
+    ctx: &PosCtx,
+    out: &mut Vec<u8>,
+) -> (usize, u32) {
+    let end = src_start as usize + body.len();
+    let mut sink = WireSink {
+        out,
+        tree,
+        idx: 0,
+        obase: 0,
+        src_base: Some(src_start),
+        ctx,
+        bpos: ctx.pos(src_start as usize, end),
+        stack: Vec::new(),
+        top: 0,
+    };
+    render_inline_to_sink(body, &tree.refmap, scratch, tree.opts, &mut sink);
+    (end, sink.top)
+}
+
+/// Write an ordered attribute object to wire: `u32` count, then `(key, value)`
+/// string pairs.
+fn w_attrs(attrs: &[(String, String)], out: &mut Vec<u8>) {
+    w_u32(attrs.len() as u32, out);
+    for (k, v) in attrs {
+        w_str(k, out);
+        w_str(v, out);
+    }
 }
 
 /// Like [`inline_wire`] but for a single inline run `body` that starts at content
@@ -1000,6 +1178,7 @@ fn inline_wire_slice(
         tree,
         idx: ci,
         obase: content_off,
+        src_base: None,
         ctx,
         bpos: ctx.pos(sbb, ebb),
         stack: Vec::new(),
@@ -1030,6 +1209,9 @@ struct WireSink<'a> {
     /// when emitting a sub-slice (a definition-list term/description line) whose
     /// token offsets are relative to the slice, not the node's content.
     obase: u32,
+    /// When `Some(base)`, offsets map directly to source as `base + off` (used for
+    /// a directive `[label]`, a raw source range with no owning content node).
+    src_base: Option<u32>,
     ctx: &'a PosCtx,
     bpos: Pos,
     stack: Vec<InlineFrame>,
@@ -1039,7 +1221,10 @@ struct WireSink<'a> {
 impl WireSink<'_> {
     #[inline]
     fn map(&self, off: u32) -> usize {
-        self.tree.content_to_src(self.idx, self.obase + off) as usize
+        match self.src_base {
+            Some(b) => (b + off) as usize,
+            None => self.tree.content_to_src(self.idx, self.obase + off) as usize,
+        }
     }
     /// Position for a content span `[s, e)`; `s == u32::MAX` falls back to the
     /// block span (mirrors `inline_wire`'s former `mkpos` closure exactly).
@@ -1121,6 +1306,23 @@ impl InlineSink for WireSink<'_> {
         self.leaf(23, start, end);
         w_str(identifier, self.out);
         w_str(label, self.out);
+        self.bump();
+    }
+    fn text_directive(
+        &mut self,
+        name: &str,
+        attrs: &[(String, String)],
+        _label: Option<(u32, u32)>,
+        start: u32,
+        end: u32,
+    ) {
+        // tag 27 = textDirective. The wire path has no scratch to re-tokenize the
+        // `[label]`, so its inline children are emitted empty here (the JSON mdast
+        // path — what the directive gate checks — carries the full children).
+        self.leaf(27, start, end);
+        w_str(name, self.out);
+        w_attrs(attrs, self.out);
+        w_u32(0, self.out); // children: empty (best-effort on the wire path)
         self.bump();
     }
     fn autolink(&mut self, url: &str, text: &str, start: u32, end: u32) {
@@ -1235,6 +1437,20 @@ fn json_opt(v: &Option<String>, out: &mut String) {
         Some(s) => json_str(s, out),
         None => out.push_str("null"),
     }
+}
+
+/// Write a directive `attributes` object `{"k":"v",…}` in insertion order.
+fn json_attrs(attrs: &[(String, String)], out: &mut String) {
+    out.push('{');
+    for (i, (k, v)) in attrs.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        json_str(k, out);
+        out.push(':');
+        json_str(v, out);
+    }
+    out.push('}');
 }
 
 fn write_point(p: (u32, u32, u32), out: &mut String) {
@@ -1364,6 +1580,46 @@ fn write_json_pos(node: &Mdast, pos: Option<&Pos>, out: &mut String) {
             key("children", out);
             json_children(children, out);
         }
+        Mdast::ContainerDirective { name, attributes, children } => {
+            out.push_str("\"containerDirective\",");
+            key("name", out);
+            json_str(name, out);
+            out.push(',');
+            key("attributes", out);
+            json_attrs(attributes, out);
+            out.push(',');
+            key("children", out);
+            json_children(children, out);
+        }
+        Mdast::LeafDirective { name, attributes, children } => {
+            out.push_str("\"leafDirective\",");
+            key("name", out);
+            json_str(name, out);
+            out.push(',');
+            key("attributes", out);
+            json_attrs(attributes, out);
+            out.push(',');
+            key("children", out);
+            json_children(children, out);
+        }
+        Mdast::TextDirective { name, attributes, children } => {
+            out.push_str("\"textDirective\",");
+            key("name", out);
+            json_str(name, out);
+            out.push(',');
+            key("attributes", out);
+            json_attrs(attributes, out);
+            out.push(',');
+            key("children", out);
+            json_children(children, out);
+        }
+        Mdast::DirectiveLabel(children) => {
+            out.push_str("\"paragraph\",");
+            key("data", out);
+            out.push_str("{\"directiveLabel\":true},");
+            key("children", out);
+            json_children(children, out);
+        }
         Mdast::FootnoteReference { identifier, label } => {
             out.push_str("\"footnoteReference\",");
             key("identifier", out);
@@ -1482,13 +1738,16 @@ pub fn node_count(node: &Mdast) -> usize {
     let kids = |c: &[Mdast]| c.iter().map(node_count).sum::<usize>();
     match node {
         Root(c) | Paragraph(c) | Blockquote(c) | Emphasis(c) | Strong(c) | Delete(c)
-        | DefList(c) | DefListTerm(c) => 1 + kids(c),
+        | DefList(c) | DefListTerm(c) | DirectiveLabel(c) => 1 + kids(c),
         Heading { children, .. }
         | List { children, .. }
         | ListItem { children, .. }
         | Link { children, .. }
         | FootnoteDefinition { children, .. }
         | DefListDescription { children, .. }
+        | ContainerDirective { children, .. }
+        | LeafDirective { children, .. }
+        | TextDirective { children, .. }
         | LinkReference { children, .. } => 1 + kids(children),
         ThematicBreak
         | Code { .. }
