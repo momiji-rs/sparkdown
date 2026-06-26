@@ -122,6 +122,16 @@ function parseToMdastWire(md, flags = 0) {
     for (let i = 0; i < n; i++) a[i] = node();
     return a;
   };
+  // Directive attributes: u32 count, then count (key, value) string pairs.
+  const attrs = () => {
+    const n = u32();
+    const o = {};
+    for (let i = 0; i < n; i++) {
+      const k = str();
+      o[k] = str();
+    }
+    return o;
+  };
 
   function node() {
     const tag = u8[p++];
@@ -161,6 +171,13 @@ function parseToMdastWire(md, flags = 0) {
       case 24: return { type: 'defList', children: kids(), position };
       case 25: return { type: 'defListTerm', children: kids(), position };
       case 26: { const spread = !!u8[p++]; return { type: 'defListDescription', spread, children: kids(), position }; }
+      // NB: on the wire path a textDirective's [label] children are emitted empty
+      // (the streaming sink has no scratch to re-tokenize the label); use
+      // parseToMdastJson(md, flags) for the full inline children.
+      case 27: { const name = str(); const attributes = attrs(); return { type: 'textDirective', name, attributes, children: kids(), position }; }
+      case 28: { const name = str(); const attributes = attrs(); return { type: 'leafDirective', name, attributes, children: kids(), position }; }
+      case 29: { const name = str(); const attributes = attrs(); return { type: 'containerDirective', name, attributes, children: kids(), position }; }
+      case 30: return { type: 'paragraph', data: { directiveLabel: true }, children: kids(), position };
       default: throw new Error('bad wire tag ' + tag);
     }
   }

@@ -1756,21 +1756,6 @@ pub fn render_inline(
     }
 }
 
-/// Write a text directive's opening tag `<name k="v" …>` into `out` (the
-/// remark-directive HTML convention; attribute values are HTML-escaped).
-fn dir_open_tag(name: &str, attrs: &[(String, String)], out: &mut String) {
-    out.push('<');
-    out.push_str(name);
-    for (k, v) in attrs {
-        out.push(' ');
-        out.push_str(k);
-        out.push_str("=\"");
-        escape_html(v, out);
-        out.push('"');
-    }
-    out.push('>');
-}
-
 /// Emoji shortcode lookup, present only with the `emoji` feature (folds to `None`
 /// otherwise so the call site compiles in every build).
 #[cfg(feature = "emoji")]
@@ -2271,7 +2256,7 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                     } else {
                         // HTML convention: <name attrs>label</name>; the label is
                         // inline content (sub-rendered with a scratch of its own).
-                        dir_open_tag(&name, &h.attrs, cur);
+                        crate::render::directive_open_tag(&name, &h.attrs, cur);
                         if let Some((ls, le)) = label {
                             // The label is inline content; sub-render it with a
                             // scratch of its own (the live one is mid-parse).

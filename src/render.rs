@@ -266,8 +266,9 @@ fn cr(out: &mut String) {
 
 /// Write a directive's opening tag `<name k="v" …>` (the remark-directive HTML
 /// convention: the name is the element, attributes become HTML attributes). The
-/// name is emitted verbatim; attribute values are HTML-escaped.
-fn directive_open_tag(name: &str, attrs: &[(String, String)], out: &mut String) {
+/// name is emitted verbatim; attribute values are HTML-escaped. Shared with the
+/// inline text-directive renderer.
+pub(crate) fn directive_open_tag(name: &str, attrs: &[(String, String)], out: &mut String) {
     out.push('<');
     out.push_str(name);
     for (k, v) in attrs {

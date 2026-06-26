@@ -51,4 +51,4 @@ const g2 = runGate({
   limit: 14,
 });
 
-process.exit(g1.ok ? 0 : 1);
+process.exit(g1.ok && g2.ok ? 0 : 1);

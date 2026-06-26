@@ -213,8 +213,9 @@ It emits **plain unist objects**, not opaque handles, so every existing remark
 plugin works without rewriting. Verified against the reference: sparkdown's tree
 **deep-equals `mdast-util-from-markdown` on all 652** CommonMark examples —
 *including* `position` (line/column/offset) — and a unified pipeline with real
-plugins (remark-toc, remark-emoji, rehype-slug, remark-lint) produces
-**652/652 byte-identical HTML** to the same pipeline on `remark-parse`.
+plugins (remark-toc, remark-emoji, rehype-slug, remark-lint) produces HTML
+**identical to the same pipeline on `remark-parse` for all 652** (compared after
+normalizing the single trailing-newline difference between cmark and rehype).
 
 The tree crosses the wasm→JS boundary as a compact **binary wire format** read
 straight out of linear memory into plain objects — no JSON serialize, no
