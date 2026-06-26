@@ -1755,17 +1755,26 @@ pub fn to_mdast_wire_fast_opts(src: &str, opts: crate::Options) -> Vec<u8> {
     let tree = crate::block::parse_with_opts(src, opts);
     let mut scratch = fn_scratch(&tree);
     let ctx = PosCtx::pooled();
-    let mut structure = Vec::<u8>::with_capacity(src.len() + 64);
-    bwire(&tree, tree.root, &mut scratch, &ctx, &mut structure);
+    // The pool holds only inline text, so it never exceeds the source length;
+    // reserve once up front to avoid ~log2(N) growth reallocs as strings append.
+    ctx.pool
+        .as_ref()
+        .expect("pooled ctx always carries a pool")
+        .borrow_mut()
+        .reserve(src.len());
+    // Build the structure directly into `out`, after a 4-byte poolStart placeholder,
+    // so it is never copied a second time; backpatch poolStart once the pool offset
+    // (the structure's end) is known.
+    let mut out = Vec::<u8>::with_capacity(src.len() * 2 + 64);
+    out.extend_from_slice(&[0u8; 4]);
+    bwire(&tree, tree.root, &mut scratch, &ctx, &mut out);
     let pool = ctx
         .pool
         .expect("pooled ctx always carries a pool")
         .into_inner();
-    let pool_start = 4 + structure.len();
-    let mut out = Vec::<u8>::with_capacity(pool_start + pool.len());
-    w_u32(pool_start as u32, &mut out);
-    out.extend_from_slice(&structure);
+    let pool_start = out.len() as u32;
     out.extend_from_slice(&pool);
+    w_u32_at(&mut out, 0, pool_start);
     out
 }
 
