@@ -132,6 +132,45 @@ even with **all** extensions active the parser still beats pulldown-cmark (the
 0.63 ms row above). For a warm, reusable context use
 `Renderer::with_options(opts)`.
 
+## Extension bundles
+
+Extensions use **two-layer gating**: a Cargo **feature** decides whether an
+extension's code is *compiled into a build*, and a runtime **`Options` flag**
+toggles it *per call*. So one shipped artifact lets you switch — per render —
+exactly the extensions it was compiled with; excluding one keeps its code out of
+the binary entirely. We ship a few **bundles**, each a build with a chosen
+feature set; a Rust dependent can also pick any subset directly
+(`features = ["tables", "emoji"]`).
+
+| extension                                                   | feature          | `pure` | `gfm` | `full` |
+| ----------------------------------------------------------- | ---------------- | :----: | :---: | :----: |
+| CommonMark 0.31.2                                           | —                |   ✅   |  ✅   |   ✅   |
+| strikethrough · tasklist · autolink · tagfilter · tables    | `gfm`            |        |  ✅   |   ✅   |
+| footnotes                                                   | `footnotes`      |        |  ✅   |   ✅   |
+| hard_wraps                                                  | *(render option)*|        |  ✅   |   ✅   |
+| frontmatter (YAML / TOML)                                   | `frontmatter`    |        |       |   ✅   |
+| emoji `:shortcode:`                                         | `emoji`          |        |       |   ✅   |
+| external links (`rel`)                                      | `external_links` |        |       |   ✅   |
+| diagram (mermaid)                                           | `diagram`        |        |       |   ✅   |
+| definition lists                                            | `deflist`        |        |       |   ✅   |
+| directives (`:::`)                                          | `directives`     |        |       |   ✅   |
+
+| bundle   | crate features | npm package                    | contents                |
+| -------- | -------------- | ------------------------------ | ----------------------- |
+| **pure** | *(none)*       | `@momiji-rs/sparkdown`         | CommonMark only, smallest |
+| **gfm**  | `gfm`          | `@momiji-rs/sparkdown/gfm`     | + GitHub Flavored Markdown |
+| **full** | `full`         | `@momiji-rs/sparkdown/full`    | + every extension       |
+
+`gfm = ["footnotes"]` and `full = ["gfm", "extras"]` are umbrella features.
+Within any bundle, `toHtml(md, { footnotes: false, tables: true, … })` switches
+extensions **per call** — no rebuild, the flags fold to no-ops for whatever the
+bundle didn't compile.
+
+> **Status:** `gfm`, `footnotes`, `emoji`, and `diagram` are feature-gated today.
+> `frontmatter` / `external_links` / `deflist` / `directives` are being gated with
+> the same (measured moat-neutral) technique; the `full` bundle and the leanest
+> `pure` build land as that completes.
+
 ## WebAssembly
 
 A **WASI-free** WebAssembly build runs in Node, browsers, bundlers, Deno, Bun,

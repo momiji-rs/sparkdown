@@ -23,9 +23,10 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 # GFM extensions (opt-in, OFF by default): strikethrough, task lists, extended
-# autolinks, tag filter, and pipe tables. Off, none of this code is compiled —
-# the parser is byte-for-byte the pure-CommonMark fast path.
-gfm = []
+# autolinks, tag filter, pipe tables, and footnotes — the full GitHub Flavored
+# Markdown set. Off, none of this code is compiled — the parser is byte-for-byte
+# the pure-CommonMark fast path. (Umbrella: pulls in `footnotes`.)
+gfm = ["footnotes"]
 # Diagram extension (opt-in, OFF by default): a fenced code block tagged with a
 # client-side diagram language (currently `mermaid`) renders as a bare wrapper
 # element (`<pre class="mermaid">`) for a browser library to pick up, instead of
