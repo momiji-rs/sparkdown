@@ -371,6 +371,38 @@ fn render_node(tree: &Tree, idx: usize, out: &mut String, scratch: &mut Scratch)
         // A footnote definition emits nothing where it sits; referenced ones are
         // collected and rendered as the footnotes <section> after the document.
         Kind::FootnoteDef => {}
+        Kind::DefList => {
+            cr(out);
+            out.push_str("<dl>\n");
+            children(tree, idx, out, scratch);
+            out.push_str("</dl>");
+            cr(out);
+        }
+        Kind::DefTerm => {
+            // Each source line of the term holder renders as its own <dt>.
+            for line in tree.content(idx).split('\n') {
+                let line = line.trim_matches([' ', '\t', '\r']);
+                if line.is_empty() {
+                    continue;
+                }
+                out.push_str("<dt>");
+                render_inline(line, out, &tree.refmap, scratch, tree.opts);
+                out.push_str("</dt>\n");
+            }
+        }
+        Kind::DefDesc => {
+            let body = tree.content(idx).trim_matches([' ', '\t', '\n', '\r']);
+            if node.level == 1 {
+                // Loose: a blank line preceded the marker, so wrap the body in <p>.
+                out.push_str("<dd>\n<p>");
+                render_inline(body, out, &tree.refmap, scratch, tree.opts);
+                out.push_str("</p>\n</dd>\n");
+            } else {
+                out.push_str("<dd>");
+                render_inline(body, out, &tree.refmap, scratch, tree.opts);
+                out.push_str("\n</dd>\n");
+            }
+        }
         Kind::BlockQuote => {
             cr(out);
             out.push_str("<blockquote>");

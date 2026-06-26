@@ -131,6 +131,120 @@ mod frontmatter {
     }
 }
 
+mod definition_lists {
+    use sparkdown::{Options, to_html_with};
+
+    fn on() -> Options {
+        Options {
+            deflist: true,
+            ..Options::default()
+        }
+    }
+
+    #[test]
+    fn tight_single() {
+        assert_eq!(
+            to_html_with("Term\n: Definition\n", &on()),
+            "<dl>\n<dt>Term</dt>\n<dd>Definition\n</dd>\n</dl>\n"
+        );
+    }
+
+    #[test]
+    fn multi_term_multi_def() {
+        assert_eq!(
+            to_html_with("T1\nT2\n: D\n", &on()),
+            "<dl>\n<dt>T1</dt>\n<dt>T2</dt>\n<dd>D\n</dd>\n</dl>\n"
+        );
+        assert_eq!(
+            to_html_with("Apple\n: fruit\n: company\n", &on()),
+            "<dl>\n<dt>Apple</dt>\n<dd>fruit\n</dd>\n<dd>company\n</dd>\n</dl>\n"
+        );
+    }
+
+    #[test]
+    fn loose_wraps_in_paragraph() {
+        // A blank line before the marker makes the description loose.
+        assert_eq!(
+            to_html_with("Term\n\n: Loose def\n", &on()),
+            "<dl>\n<dt>Term</dt>\n<dd>\n<p>Loose def</p>\n</dd>\n</dl>\n"
+        );
+    }
+
+    #[test]
+    fn groups_merge_across_blanks() {
+        assert_eq!(
+            to_html_with("T1\n: D1\n\nT2\n: D2\n", &on()),
+            "<dl>\n<dt>T1</dt>\n<dd>D1\n</dd>\n<dt>T2</dt>\n<dd>D2\n</dd>\n</dl>\n"
+        );
+    }
+
+    #[test]
+    fn trailing_paragraph_is_evicted() {
+        assert_eq!(
+            to_html_with("before\n\nTerm\n: Def\n\nafter\n", &on()),
+            "<p>before</p>\n<dl>\n<dt>Term</dt>\n<dd>Def\n</dd>\n</dl>\n<p>after</p>\n"
+        );
+    }
+
+    #[test]
+    fn inline_markup_in_term_and_def() {
+        assert_eq!(
+            to_html_with("*Rich* term\n: def with *em*\n", &on()),
+            "<dl>\n<dt><em>Rich</em> term</dt>\n<dd>def with <em>em</em>\n</dd>\n</dl>\n"
+        );
+    }
+
+    #[test]
+    fn marker_requires_space() {
+        // `:NoSpace` is not a marker → plain paragraph.
+        assert_eq!(to_html_with("Term\n:NoSpace\n", &on()), "<p>Term\n:NoSpace</p>\n");
+        // An orphan marker (no preceding term) stays literal.
+        assert_eq!(to_html_with(": orphan\n", &on()), "<p>: orphan</p>\n");
+    }
+
+    #[test]
+    fn off_by_default() {
+        assert_eq!(
+            to_html_with("Term\n: Definition\n", &Options::default()),
+            "<p>Term\n: Definition</p>\n"
+        );
+    }
+}
+
+#[cfg(feature = "ast")]
+mod definition_lists_mdast {
+    use sparkdown::Options;
+    use sparkdown::ast::to_mdast_json_opts;
+
+    fn on() -> Options {
+        Options {
+            deflist: true,
+            ..Options::default()
+        }
+    }
+
+    #[test]
+    fn custom_node_types() {
+        // remark-definition-list shape: defList → defListTerm + defListDescription.
+        let j = to_mdast_json_opts("Term\n: Def\n", on());
+        assert!(j.contains(r#""type":"defList""#), "{j}");
+        assert!(j.contains(r#""type":"defListTerm""#), "{j}");
+        assert!(j.contains(r#""type":"defListDescription","spread":false"#), "{j}");
+    }
+
+    #[test]
+    fn loose_sets_spread() {
+        let j = to_mdast_json_opts("Term\n\n: Def\n", on());
+        assert!(j.contains(r#""type":"defListDescription","spread":true"#), "{j}");
+    }
+
+    #[test]
+    fn off_by_default() {
+        let j = to_mdast_json_opts("Term\n: Def\n", Options::default());
+        assert!(!j.contains("defList"), "{j}");
+    }
+}
+
 #[cfg(feature = "ast")]
 mod footnotes {
     use sparkdown::Options;

@@ -35,6 +35,7 @@
   "devDependencies": {
     "gemoji": "^8.1.0",
     "rehype-external-links": "^3.0.0",
+    "remark-definition-list": "^2.0.0",
     "remark-frontmatter": "^5.0.0",
     "remark-gemoji": "^8.0.0",
     "remark-gfm": "^4.0.1"

@@ -49,6 +49,11 @@ pub struct Options {
     /// HTML: the remark-rehype footnotes `<section>` with numbered backrefs. The
     /// label set is collected in the block pass, so forward references work.
     pub footnotes: bool,
+    /// Definition lists (the pandoc / remark-definition-list grammar): a term
+    /// paragraph followed by one or more `: definition` lines becomes
+    /// `<dl><dt>…</dt><dd>…</dd></dl>`. A blank line before a `:` marker makes
+    /// that definition loose (its body is wrapped in `<p>`). Not GFM-gated.
+    pub deflist: bool,
 }
 
 impl Options {
@@ -94,6 +99,7 @@ impl Options {
             emoji: false,
             external_links: false,
             footnotes: false,
+            deflist: false,
         }
     }
 }

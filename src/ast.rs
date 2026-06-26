@@ -44,6 +44,13 @@ pub enum Mdast {
     Toml(String),
     /// GFM footnote definition `[^label]: …` — a block container.
     FootnoteDefinition { identifier: String, label: String, children: Vec<Mdast> },
+    /// Definition list container (remark-definition-list `defList`).
+    DefList(Vec<Mdast>),
+    /// One term of a definition list (`defListTerm`); children are inline.
+    DefListTerm(Vec<Mdast>),
+    /// One description of a definition list (`defListDescription`). `spread` is
+    /// true when loose; children are block content (a wrapping `paragraph`).
+    DefListDescription { spread: bool, children: Vec<Mdast> },
     // --- inline ---
     Text(String),
     Emphasis(Vec<Mdast>),
@@ -303,10 +310,100 @@ fn block(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx) -> (Mdast
             let (kids, last) = block_children(tree, idx, scratch, ctx);
             (Mdast::ListItem { spread: node.item_spread, children: kids }, sb, last.unwrap_or(se))
         }
+        Kind::DefList => {
+            // Build the custom remark-definition-list shape: each term line is a
+            // `defListTerm`, each `: …` line a `defListDescription` wrapping a
+            // `paragraph`. Deflist nodes are not gated against from-markdown
+            // (it has no deflist grammar), so positions are best-effort.
+            let mut kids: Vec<Mdast> = Vec::new();
+            let mut last = se;
+            let mut c = tree.first_child(idx);
+            while let Some(ci) = c {
+                match tree.nodes[ci].kind {
+                    Kind::DefTerm => {
+                        let content = tree.content(ci);
+                        let mut co = 0usize;
+                        for line in content.split_inclusive('\n') {
+                            let lead = line.len() - line.trim_start_matches([' ', '\t']).len();
+                            let body = line.trim_matches([' ', '\t', '\n', '\r']);
+                            if !body.is_empty() {
+                                let off = (co + lead) as u32;
+                                last = tree.content_to_src(ci, off + body.len() as u32) as usize;
+                                let (pos, inl) = inline_span(tree, ci, off, body, scratch, ctx);
+                                kids.push(Mdast::Positioned(
+                                    pos,
+                                    Box::new(Mdast::DefListTerm(inl)),
+                                ));
+                            }
+                            co += line.len();
+                        }
+                    }
+                    Kind::DefDesc => {
+                        let spread = tree.nodes[ci].level == 1;
+                        let content = tree.content(ci);
+                        let lead =
+                            content.len() - content.trim_start_matches([' ', '\t', '\n']).len();
+                        let body = content.trim_matches([' ', '\t', '\n', '\r']);
+                        last = tree.content_to_src(ci, (lead + body.len()) as u32) as usize;
+                        let (pos, inl) =
+                            inline_span(tree, ci, lead as u32, body, scratch, ctx);
+                        let para =
+                            Mdast::Positioned(pos.clone(), Box::new(Mdast::Paragraph(inl)));
+                        kids.push(Mdast::Positioned(
+                            pos,
+                            Box::new(Mdast::DefListDescription { spread, children: vec![para] }),
+                        ));
+                    }
+                    _ => {
+                        let (m, eb) = block(tree, ci, scratch, ctx);
+                        last = eb;
+                        kids.push(m);
+                    }
+                }
+                c = tree.next_sibling(ci);
+            }
+            (Mdast::DefList(kids), sb, last)
+        }
+        // Term/description nodes are built inline by their `DefList` parent; these
+        // arms keep the match exhaustive and are not reached in practice.
+        Kind::DefTerm => {
+            let eb = ctx.rtrim_nl(se);
+            (Mdast::DefListTerm(inline(tree, idx, scratch, ctx, sb, eb)), sb, eb)
+        }
+        Kind::DefDesc => {
+            let eb = ctx.rtrim_nl(se);
+            let para =
+                Mdast::Positioned(ctx.pos(sb, eb), Box::new(Mdast::Paragraph(inline(tree, idx, scratch, ctx, sb, eb))));
+            (
+                Mdast::DefListDescription { spread: node.level == 1, children: vec![para] },
+                sb,
+                eb,
+            )
+        }
         #[cfg(feature = "gfm")]
         Kind::Table => (Mdast::Html(tree.content(idx).to_owned()), sb, ctx.rtrim(sb, se)),
     };
     (Mdast::Positioned(ctx.pos(start_b, end_b), Box::new(inner)), end_b)
+}
+
+/// Tokenize and position-map a single inline run `body` that starts at content
+/// offset `content_off` within node `ci`. Used to build definition-list term and
+/// description children (which split or trim a block's content). Returns the run's
+/// position and its inline mdast children.
+fn inline_span(
+    tree: &Tree,
+    ci: usize,
+    content_off: u32,
+    body: &str,
+    scratch: &mut Scratch,
+    ctx: &PosCtx,
+) -> (Pos, Vec<Mdast>) {
+    let sbb = tree.content_to_src(ci, content_off) as usize;
+    let ebb = tree.content_to_src(ci, content_off + body.len() as u32) as usize;
+    let toks = render_inline_to_tokens(body, &tree.refmap, scratch, tree.opts);
+    let bpos = ctx.pos(sbb, ebb);
+    let inl = build_inline(toks, ctx, &|o| tree.content_to_src(ci, content_off + o) as usize, &bpos);
+    (bpos, inl)
 }
 
 /// Build a container's children; also report the last child's source byte end.
@@ -734,6 +831,99 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
             w_opt(&d.title, out);
             eb
         }
+        Kind::DefList => {
+            // tag 24 = defList; children are built from the term/description
+            // nodes the same way as `block()` (terms split per line).
+            out.push(24);
+            w_point(out, ctx.point(sb));
+            let eoff = reserve(out, 12);
+            let coff = reserve(out, 4);
+            let mut n = 0u32;
+            let mut last = se;
+            let mut c = tree.first_child(idx);
+            while let Some(ci) = c {
+                match tree.nodes[ci].kind {
+                    Kind::DefTerm => {
+                        let content = tree.content(ci);
+                        let mut co = 0usize;
+                        for line in content.split_inclusive('\n') {
+                            let lead = line.len() - line.trim_start_matches([' ', '\t']).len();
+                            let body = line.trim_matches([' ', '\t', '\n', '\r']);
+                            if !body.is_empty() {
+                                let off = (co + lead) as u32;
+                                let sbb = tree.content_to_src(ci, off) as usize;
+                                out.push(25); // defListTerm
+                                w_point(out, ctx.point(sbb));
+                                let teoff = reserve(out, 12);
+                                let tcoff = reserve(out, 4);
+                                let (ebb, tn) =
+                                    inline_wire_slice(tree, ci, off, body, scratch, ctx, out);
+                                patch_point(out, teoff, ctx.point(ebb));
+                                w_u32_at(out, tcoff, tn);
+                                last = ebb;
+                                n += 1;
+                            }
+                            co += line.len();
+                        }
+                    }
+                    Kind::DefDesc => {
+                        let spread = tree.nodes[ci].level == 1;
+                        let content = tree.content(ci);
+                        let lead =
+                            content.len() - content.trim_start_matches([' ', '\t', '\n']).len();
+                        let body = content.trim_matches([' ', '\t', '\n', '\r']);
+                        let off = lead as u32;
+                        let sbb = tree.content_to_src(ci, off) as usize;
+                        out.push(26); // defListDescription
+                        w_point(out, ctx.point(sbb));
+                        let deoff = reserve(out, 12);
+                        out.push(spread as u8);
+                        let dcoff = reserve(out, 4);
+                        // Single child: a paragraph wrapping the inline body.
+                        out.push(1); // paragraph
+                        w_point(out, ctx.point(sbb));
+                        let peoff = reserve(out, 12);
+                        let pcoff = reserve(out, 4);
+                        let (ebb, pn) =
+                            inline_wire_slice(tree, ci, off, body, scratch, ctx, out);
+                        patch_point(out, peoff, ctx.point(ebb));
+                        w_u32_at(out, pcoff, pn);
+                        patch_point(out, deoff, ctx.point(ebb));
+                        w_u32_at(out, dcoff, 1);
+                        last = ebb;
+                        n += 1;
+                    }
+                    _ => {
+                        last = bwire(tree, ci, scratch, ctx, out);
+                        n += 1;
+                    }
+                }
+                c = tree.next_sibling(ci);
+            }
+            patch_point(out, eoff, ctx.point(last));
+            w_u32_at(out, coff, n);
+            last
+        }
+        // Built inline by their `DefList` parent; unreachable but kept exhaustive.
+        Kind::DefTerm => {
+            let eb = ctx.rtrim_nl(se);
+            out.push(25);
+            w_point(out, ctx.point(sb));
+            w_point(out, ctx.point(eb));
+            let coff = reserve(out, 4);
+            let n = inline_wire(tree, idx, scratch, ctx, sb, eb, out);
+            w_u32_at(out, coff, n);
+            eb
+        }
+        Kind::DefDesc => {
+            let eb = ctx.rtrim_nl(se);
+            out.push(26);
+            w_point(out, ctx.point(sb));
+            w_point(out, ctx.point(eb));
+            out.push((node.level == 1) as u8);
+            w_u32(0, out);
+            eb
+        }
         #[cfg(feature = "gfm")]
         Kind::Table => {
             let eb = ctx.rtrim(sb, se);
@@ -781,6 +971,7 @@ fn inline_wire(
         out,
         tree,
         idx,
+        obase: 0,
         ctx,
         bpos: ctx.pos(sb, eb),
         stack: Vec::new(),
@@ -788,6 +979,34 @@ fn inline_wire(
     };
     render_inline_to_sink(tree.content(idx), &tree.refmap, scratch, tree.opts, &mut sink);
     sink.top
+}
+
+/// Like [`inline_wire`] but for a single inline run `body` that starts at content
+/// offset `content_off` within node `ci` — the term/description lines of a
+/// definition list. Returns the run's source byte end and the child count.
+fn inline_wire_slice(
+    tree: &Tree,
+    ci: usize,
+    content_off: u32,
+    body: &str,
+    scratch: &mut Scratch,
+    ctx: &PosCtx,
+    out: &mut Vec<u8>,
+) -> (usize, u32) {
+    let sbb = tree.content_to_src(ci, content_off) as usize;
+    let ebb = tree.content_to_src(ci, content_off + body.len() as u32) as usize;
+    let mut sink = WireSink {
+        out,
+        tree,
+        idx: ci,
+        obase: content_off,
+        ctx,
+        bpos: ctx.pos(sbb, ebb),
+        stack: Vec::new(),
+        top: 0,
+    };
+    render_inline_to_sink(body, &tree.refmap, scratch, tree.opts, &mut sink);
+    (ebb, sink.top)
 }
 
 /// An open inline container: byte offsets to backpatch (end position + child
@@ -807,6 +1026,10 @@ struct WireSink<'a> {
     out: &'a mut Vec<u8>,
     tree: &'a Tree<'a>,
     idx: usize,
+    /// Offset added to every content offset before mapping to source — non-zero
+    /// when emitting a sub-slice (a definition-list term/description line) whose
+    /// token offsets are relative to the slice, not the node's content.
+    obase: u32,
     ctx: &'a PosCtx,
     bpos: Pos,
     stack: Vec<InlineFrame>,
@@ -816,7 +1039,7 @@ struct WireSink<'a> {
 impl WireSink<'_> {
     #[inline]
     fn map(&self, off: u32) -> usize {
-        self.tree.content_to_src(self.idx, off) as usize
+        self.tree.content_to_src(self.idx, self.obase + off) as usize
     }
     /// Position for a content span `[s, e)`; `s == u32::MAX` falls back to the
     /// block span (mirrors `inline_wire`'s former `mkpos` closure exactly).
@@ -1124,6 +1347,23 @@ fn write_json_pos(node: &Mdast, pos: Option<&Pos>, out: &mut String) {
             key("children", out);
             json_children(children, out);
         }
+        Mdast::DefList(c) => {
+            out.push_str("\"defList\",");
+            key("children", out);
+            json_children(c, out);
+        }
+        Mdast::DefListTerm(c) => {
+            out.push_str("\"defListTerm\",");
+            key("children", out);
+            json_children(c, out);
+        }
+        Mdast::DefListDescription { spread, children } => {
+            out.push_str("\"defListDescription\",");
+            key("spread", out);
+            out.push_str(if *spread { "true," } else { "false," });
+            key("children", out);
+            json_children(children, out);
+        }
         Mdast::FootnoteReference { identifier, label } => {
             out.push_str("\"footnoteReference\",");
             key("identifier", out);
@@ -1241,12 +1481,14 @@ pub fn node_count(node: &Mdast) -> usize {
     use Mdast::*;
     let kids = |c: &[Mdast]| c.iter().map(node_count).sum::<usize>();
     match node {
-        Root(c) | Paragraph(c) | Blockquote(c) | Emphasis(c) | Strong(c) | Delete(c) => 1 + kids(c),
+        Root(c) | Paragraph(c) | Blockquote(c) | Emphasis(c) | Strong(c) | Delete(c)
+        | DefList(c) | DefListTerm(c) => 1 + kids(c),
         Heading { children, .. }
         | List { children, .. }
         | ListItem { children, .. }
         | Link { children, .. }
         | FootnoteDefinition { children, .. }
+        | DefListDescription { children, .. }
         | LinkReference { children, .. } => 1 + kids(children),
         ThematicBreak
         | Code { .. }

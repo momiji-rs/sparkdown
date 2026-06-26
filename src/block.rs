@@ -35,6 +35,17 @@ pub enum Kind {
     /// A block container (fixed 4-space content indent, lazy paragraph
     /// continuation) carrying its label via [`Node::fn_idx`] → [`Tree::fn_defs`].
     FootnoteDef,
+    /// Definition list container (`<dl>`), opt-in via [`Options::deflist`]. Holds
+    /// an alternating sequence of [`Kind::DefTerm`] and [`Kind::DefDesc`] children.
+    DefList,
+    /// Definition-list term holder: a former [`Kind::Paragraph`] reinterpreted as
+    /// the term(s) when a `: definition` line follows it. Its content may span
+    /// several lines; each line renders as one `<dt>`.
+    DefTerm,
+    /// One definition-list description (`<dd>`). A leaf that accepts lazy
+    /// continuation lines like a paragraph; `level` is 1 when loose (a blank line
+    /// preceded the `:` marker, so the body is wrapped in `<p>`), 0 when tight.
+    DefDesc,
     /// SPIKE (`ast` feature): a link reference definition `[label]: url "title"`.
     /// Renders to nothing (HTML output unchanged); carries an index into
     /// [`Tree::defs`] via [`Node::def`] for the mdast `definition` node.
@@ -365,6 +376,10 @@ struct Parser<'a> {
     indent: usize,
     indented: bool,
     blank: bool,
+    /// Whether the immediately-preceding line was blank. Used by the definition
+    /// list grammar to mark a `: definition` loose (its body wrapped in `<p>`)
+    /// when a blank line separates it from the term.
+    prev_blank: bool,
     partially_consumed_tab: bool,
     opts: Options,
     /// GFM footnote-definition payloads, in creation order; a node's
@@ -417,6 +432,7 @@ impl<'a> Parser<'a> {
             indent: 0,
             indented: false,
             blank: false,
+            prev_blank: false,
             partially_consumed_tab: false,
             opts,
             fn_defs: Vec::new(),
@@ -508,7 +524,8 @@ impl<'a> Parser<'a> {
         let mut node = Node::new(kind, parent, self.line_number);
         // Paragraphs try to borrow a contiguous source slice; other leaves
         // (ATX heading, code, HTML) assemble into `buf`. Set the buffered start.
-        node.content_src = matches!(kind, Kind::Paragraph | Kind::CodeBlock | Kind::HtmlBlock);
+        node.content_src =
+            matches!(kind, Kind::Paragraph | Kind::CodeBlock | Kind::HtmlBlock | Kind::DefDesc);
         node.cstart = self.buf.len() as u32;
         node.cend = node.cstart;
         // SPIKE (`ast`): the block's mdast `position.start` is its first non-space
@@ -868,6 +885,22 @@ impl<'a> Parser<'a> {
                 #[cfg(feature = "ast")]
                 self.compute_spread(idx);
             }
+            Kind::DefList => {
+                // A trailing plain paragraph is a dangling term candidate (no
+                // description ever followed it); evict it to become the list's
+                // next sibling so it renders as an ordinary paragraph.
+                let lc = self.nodes[idx].last_child;
+                if lc != NO_NODE && self.nodes[lc as usize].kind == Kind::Paragraph {
+                    self.unlink(lc as usize);
+                    let after = self.nodes[idx].next_sibling;
+                    self.nodes[lc as usize].parent = parent;
+                    self.nodes[lc as usize].next_sibling = after;
+                    self.nodes[idx].next_sibling = lc;
+                    if self.nodes[parent].last_child == idx as u32 {
+                        self.nodes[parent].last_child = lc;
+                    }
+                }
+            }
             _ => {}
         }
         let _ = parent;
@@ -1113,7 +1146,10 @@ impl<'a> Parser<'a> {
                 1 => {
                     all_matched = false;
                 }
-                2 => return, // line fully consumed (code block)
+                2 => {
+                    self.prev_blank = self.blank; // line fully consumed (code block)
+                    return;
+                }
                 _ => unreachable!(),
             }
             if !all_matched {
@@ -1144,6 +1180,9 @@ impl<'a> Parser<'a> {
             // A footnote definition starts with `[` (not in `maybe_special`); keep
             // the fast skip on for `[` lines unless footnotes are enabled.
             let fast_skip = fast_skip && !(self.opts.footnotes && first == Some(b'['));
+            // A definition-list marker starts with `:` (not in `maybe_special`);
+            // let `:` lines through to `start_def_list` when deflists are enabled.
+            let fast_skip = fast_skip && !(self.opts.deflist && first == Some(b':'));
             if fast_skip {
                 self.advance_next_nonspace();
                 break;
@@ -1236,6 +1275,7 @@ impl<'a> Parser<'a> {
                 self.add_line();
             }
         }
+        self.prev_blank = self.blank;
     }
 
     // ---- continuation per block kind ------------------------------------
@@ -1310,6 +1350,23 @@ impl<'a> Parser<'a> {
                     0
                 }
             }
+            // A definition list stays open across blanks and intervening term
+            // paragraphs; it closes only when a block that cannot be its child
+            // forces it shut (handled by `add_child`) or at EOF.
+            Kind::DefList => 0,
+            // A description accepts lazy continuation lines like a paragraph, but
+            // a blank line or a fresh `:` marker ends it (the marker then opens a
+            // sibling description via `start_def_list`).
+            Kind::DefDesc => {
+                if self.blank || self.is_def_marker() {
+                    1
+                } else {
+                    0
+                }
+            }
+            // Term holders are closed the moment their description is attached, so
+            // they are never re-entered as an open container.
+            Kind::DefTerm => 1,
             Kind::Heading | Kind::ThematicBreak => 1,
             // Definitions are inserted already-closed (never an open container).
             #[cfg(feature = "ast")]
@@ -1376,8 +1433,9 @@ impl<'a> Parser<'a> {
             6 => self.start_list_item(container),
             7 => self.start_indented_code(),
             8 => self.start_footnote_def(container),
+            9 => self.start_def_list(container),
             #[cfg(feature = "gfm")]
-            9 => self.start_table(container),
+            10 => self.start_table(container),
             _ => 0,
         }
     }
@@ -1648,6 +1706,102 @@ impl<'a> Parser<'a> {
         1
     }
 
+    /// Is the current line a definition-list marker — `:` (≤3 spaces indent)
+    /// followed by a space or tab?
+    fn is_def_marker(&self) -> bool {
+        !self.indented
+            && peek(self.line, self.next_nonspace) == Some(b':')
+            && is_space_or_tab(peek(self.line, self.next_nonspace + 1))
+    }
+
+    /// Definition list (pandoc / remark-definition-list). A `: definition` line
+    /// attaches a description to the preceding term paragraph, opening a `<dl>`;
+    /// further markers add more descriptions (and intervening paragraphs add more
+    /// terms) to the same list. A blank line before the marker makes the
+    /// description *loose* (its body is wrapped in `<p>`).
+    fn start_def_list(&mut self, container: usize) -> u8 {
+        if !self.opts.deflist || self.indented || !self.is_def_marker() {
+            return 0;
+        }
+        let loose = self.prev_blank;
+        match self.nodes[container].kind {
+            // An open paragraph directly above the marker is the term (tight). It
+            // may already sit inside an open list (a second term/def group).
+            Kind::Paragraph => {
+                let para = container;
+                let parent = self.nodes[para].parent;
+                self.nodes[para].kind = Kind::DefTerm;
+                self.nodes[para].open = false;
+                self.tip = if self.nodes[parent].kind == Kind::DefList {
+                    parent
+                } else {
+                    self.splice_def_list(parent, para)
+                };
+            }
+            // The marker continues an open list (e.g. `Term\n: a\n: b`): another
+            // description for the most recent term.
+            Kind::DefList => {
+                self.close_unmatched_blocks();
+                self.tip = container;
+            }
+            // A blank line separated the term from the marker, so the term is the
+            // container's (closed) last-child paragraph — a loose description.
+            _ => {
+                let Some(lc) = self.last_child(container) else {
+                    return 0;
+                };
+                if self.nodes[lc].kind != Kind::Paragraph {
+                    return 0;
+                }
+                self.nodes[lc].kind = Kind::DefTerm;
+                self.nodes[lc].open = false;
+                self.tip = self.splice_def_list(container, lc);
+            }
+        }
+        let dd = self.add_child(Kind::DefDesc);
+        self.nodes[dd].level = u8::from(loose);
+        // Consume `:` and one optional space/tab; the rest of the line flows into
+        // the description as its first content line.
+        self.advance_next_nonspace();
+        self.advance_offset(1, false);
+        if is_space_or_tab(peek(self.line, self.offset)) {
+            self.advance_offset(1, true);
+        }
+        2
+    }
+
+    /// Splice a fresh `DefList` into `parent`'s child list where `para` sits, then
+    /// move `para` (already retyped as a `DefTerm`) inside it. Returns the list.
+    fn splice_def_list(&mut self, parent: usize, para: usize) -> usize {
+        let dl = self.nodes.len();
+        let mut node = Node::new(Kind::DefList, parent, self.nodes[para].start_line);
+        #[cfg(feature = "ast")]
+        {
+            node.src_start = self.nodes[para].src_start;
+            node.src_end = self.nodes[para].src_end;
+        }
+        node.first_child = para as u32;
+        node.last_child = para as u32;
+        node.next_sibling = self.nodes[para].next_sibling;
+        self.nodes.push(node);
+        let (dl32, para32) = (dl as u32, para as u32);
+        if self.nodes[parent].first_child == para32 {
+            self.nodes[parent].first_child = dl32;
+        } else {
+            let mut prev = self.nodes[parent].first_child;
+            while self.nodes[prev as usize].next_sibling != para32 {
+                prev = self.nodes[prev as usize].next_sibling;
+            }
+            self.nodes[prev as usize].next_sibling = dl32;
+        }
+        if self.nodes[parent].last_child == para32 {
+            self.nodes[parent].last_child = dl32;
+        }
+        self.nodes[para].parent = dl;
+        self.nodes[para].next_sibling = NO_NODE;
+        dl
+    }
+
     fn start_indented_code(&mut self) -> u8 {
         if self.indented && self.nodes[self.tip].kind != Kind::Paragraph && !self.blank {
             // mdast indented code starts at the line content region (incl. indent).
@@ -1779,7 +1933,7 @@ impl<'a> Parser<'a> {
     }
 }
 
-const NUM_STARTS: usize = if cfg!(feature = "gfm") { 10 } else { 9 };
+const NUM_STARTS: usize = if cfg!(feature = "gfm") { 11 } else { 10 };
 
 /// Could a line whose first non-space byte is `c` begin a block other than a
 /// paragraph? (`#` ATX, `>` quote, `` ` ``/`~` fence, `*+-_` thematic/list,
@@ -1841,12 +1995,19 @@ fn can_contain(parent: Kind, child: Kind) -> bool {
     match parent {
         Kind::Document | Kind::BlockQuote | Kind::Item | Kind::FootnoteDef => child != Kind::Item,
         Kind::List => child == Kind::Item,
+        // A definition list holds term holders and descriptions; a plain
+        // paragraph child is a pending term candidate (a dangling one is evicted
+        // when the list finalizes).
+        Kind::DefList => matches!(child, Kind::DefTerm | Kind::DefDesc | Kind::Paragraph),
         _ => false,
     }
 }
 
 fn accepts_lines(kind: Kind) -> bool {
-    if matches!(kind, Kind::Paragraph | Kind::CodeBlock | Kind::HtmlBlock) {
+    if matches!(
+        kind,
+        Kind::Paragraph | Kind::CodeBlock | Kind::HtmlBlock | Kind::DefDesc
+    ) {
         return true;
     }
     #[cfg(feature = "gfm")]

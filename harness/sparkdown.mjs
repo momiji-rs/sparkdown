@@ -143,6 +143,9 @@ function parseToMdastWire(md, flags = 0) {
       case 21: return { type: 'toml', value: str(), position };
       case 22: { const identifier = str(); const label = str(); return { type: 'footnoteDefinition', identifier, label, children: kids(), position }; }
       case 23: { const identifier = str(); const label = str(); return { type: 'footnoteReference', identifier, label, position }; }
+      case 24: return { type: 'defList', children: kids(), position };
+      case 25: return { type: 'defListTerm', children: kids(), position };
+      case 26: { const spread = !!u8[p++]; return { type: 'defListDescription', spread, children: kids(), position }; }
       default: throw new Error('bad wire tag ' + tag);
     }
   }
