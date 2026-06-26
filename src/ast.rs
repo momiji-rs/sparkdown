@@ -3032,8 +3032,8 @@ mod wire_nopos_tests {
                     self.wopt(); // meta
                     self.wstr(); // value
                 }
-                8 | 9 | 13 => self.wstr(),   // html, text, inlineCode
-                10..=12 => self.kids(), // emphasis, strong, delete
+                8 | 9 | 13 => self.wstr(), // html, text, inlineCode
+                10..=12 => self.kids(),    // emphasis, strong, delete
                 15 => {
                     // link OR autolink. Disambiguate: a link container emits
                     // url,opt(title),kids; the autolink leaf emits
