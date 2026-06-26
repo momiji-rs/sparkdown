@@ -38,6 +38,11 @@ pub struct Options {
     /// Emoji shortcodes: inline `:smile:` → 😄 (the remark-gemoji dataset).
     /// Effective only with the `emoji` Cargo feature (it carries the data table).
     pub emoji: bool,
+    /// External-link transform (the rehype-external-links default): add
+    /// `rel="nofollow"` to every link whose href begins with `http://`/`https://`
+    /// (inline links and autolinks alike; `mailto:`/relative/fragment untouched).
+    /// A post-render pass — `<a href="` only ever appears in real link tags.
+    pub external_links: bool,
     /// GFM footnotes: inline `[^label]` references and `[^label]: …` block
     /// definitions (the remark-gfm grammar). References resolve only when a
     /// matching definition exists. mdast: `footnoteReference`/`footnoteDefinition`;
@@ -87,6 +92,7 @@ impl Options {
             heading_ids: false,
             frontmatter: false,
             emoji: false,
+            external_links: false,
             footnotes: false,
         }
     }

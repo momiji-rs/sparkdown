@@ -31,5 +31,12 @@
     "unified": "^11.0.5",
     "unist-util-visit": "^5.1.0",
     "vfile": "^6.0.3"
+  },
+  "devDependencies": {
+    "gemoji": "^8.1.0",
+    "rehype-external-links": "^3.0.0",
+    "remark-frontmatter": "^5.0.0",
+    "remark-gemoji": "^8.0.0",
+    "remark-gfm": "^4.0.1"
   }
 }

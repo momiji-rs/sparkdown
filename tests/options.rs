@@ -125,6 +125,37 @@ fn footnotes() {
 }
 
 #[test]
+fn external_links() {
+    let on = Options {
+        external_links: true,
+        ..Options::default()
+    };
+    let go = |s: &str| to_html_with(s, &on);
+    // http(s) links get rel="nofollow" (the rehype-external-links default).
+    assert_eq!(
+        go("[x](https://a.com)\n"),
+        "<p><a href=\"https://a.com\" rel=\"nofollow\">x</a></p>\n"
+    );
+    // rel goes after the title attribute (hast property order).
+    assert_eq!(
+        go("[x](http://a.com \"t\")\n"),
+        "<p><a href=\"http://a.com\" title=\"t\" rel=\"nofollow\">x</a></p>\n"
+    );
+    // Relative, fragment, and mailto links are left alone.
+    assert_eq!(go("[x](/p)\n"), "<p><a href=\"/p\">x</a></p>\n");
+    assert_eq!(go("[x](#f)\n"), "<p><a href=\"#f\">x</a></p>\n");
+    assert_eq!(
+        go("[x](mailto:a@b.com)\n"),
+        "<p><a href=\"mailto:a@b.com\">x</a></p>\n"
+    );
+    // Off by default.
+    assert_eq!(
+        to_html("[x](https://a.com)\n"),
+        "<p><a href=\"https://a.com\">x</a></p>\n"
+    );
+}
+
+#[test]
 fn renderer_carries_options() {
     let mut r = Renderer::with_options(Options {
         hard_wraps: true,

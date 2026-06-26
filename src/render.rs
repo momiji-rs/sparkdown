@@ -42,6 +42,54 @@ pub(crate) fn render_with(tree: &Tree, out: &mut String, scratch: &mut Scratch) 
     if tree.opts.footnotes && !scratch.footnote_order.is_empty() {
         render_footnote_section(tree, out, scratch);
     }
+    // External-link transform: a single post-render pass over the finished HTML.
+    if tree.opts.external_links {
+        decorate_external_links(out);
+    }
+}
+
+/// Add `rel="nofollow"` to every `<a>` whose href begins with `http://`/`https://`
+/// (the rehype-external-links default). Safe as a post-pass because `<` is always
+/// escaped to `&lt;` in text/code, so the literal `<a href="` appears only in
+/// genuine link tags (inline links, autolinks, and raw-HTML links — which the
+/// rehype transform also decorates). `rel` is inserted before the tag's `>`, after
+/// any `href`/`title` (matching hast property order); the scan is quote-aware so a
+/// `>` inside an attribute value is not mistaken for the tag end.
+fn decorate_external_links(out: &mut String) {
+    const PAT: &str = "<a href=\"";
+    if !out.contains(PAT) {
+        return;
+    }
+    let src = std::mem::take(out);
+    let mut rest = src.as_str();
+    while let Some(p) = rest.find(PAT) {
+        out.push_str(&rest[..p]);
+        let tag = &rest[p..]; // starts with `<a href="`
+        let href_start = PAT.len();
+        let Some(q) = tag[href_start..].find('"') else {
+            out.push_str(tag);
+            return;
+        };
+        let href = &tag[href_start..href_start + q];
+        // Find the tag-closing `>` (quote-aware), starting past the href value.
+        let b = tag.as_bytes();
+        let mut j = href_start + q + 1;
+        let mut in_quote = false;
+        while j < b.len() {
+            match b[j] {
+                b'"' => in_quote = !in_quote,
+                b'>' if !in_quote => break,
+                _ => {}
+            }
+            j += 1;
+        }
+        out.push_str(&tag[..j]);
+        if href.starts_with("http://") || href.starts_with("https://") {
+            out.push_str(" rel=\"nofollow\"");
+        }
+        rest = &tag[j..]; // from the `>` onward
+    }
+    out.push_str(rest);
 }
 
 /// Render the GFM footnotes `<section>` exactly as remark-rehype does: an ordered

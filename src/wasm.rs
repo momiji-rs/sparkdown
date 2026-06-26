@@ -128,6 +128,7 @@ pub unsafe extern "C" fn sparkdown_to_mdast_wire_opts(
         heading_ids: flags & 128 != 0,
         frontmatter: flags & 256 != 0,
         emoji: flags & 1024 != 0,
+        external_links: flags & 2048 != 0,
         footnotes: flags & 512 != 0,
     };
     box_html(&crate::ast::to_mdast_wire_opts(&md, opts))
@@ -136,7 +137,7 @@ pub unsafe extern "C" fn sparkdown_to_mdast_wire_opts(
 /// Like [`sparkdown_to_html`] but applies extension options from a bitmask: bit
 /// 0 strikethrough, 1 task lists, 2 autolinks, 3 tag filter, 4 tables, 5 hard
 /// wraps, 6 diagram, 7 heading ids (built-in slug transform), 8 frontmatter
-/// (YAML `---` / TOML `+++`), 9 footnotes (GFM), 10 emoji. A bit only takes
+/// (YAML `---` / TOML `+++`), 9 footnotes (GFM), 10 emoji, 11 external links. A bit only takes
 /// effect if the matching Cargo feature was compiled in. Built with the `gfm`
 /// feature.
 ///
@@ -158,6 +159,7 @@ pub unsafe extern "C" fn sparkdown_to_html_opts(ptr: *const u8, len: usize, flag
         heading_ids: flags & 128 != 0,
         frontmatter: flags & 256 != 0,
         emoji: flags & 1024 != 0,
+        external_links: flags & 2048 != 0,
         footnotes: flags & 512 != 0,
     };
     RENDERER.with(|cell| {
