@@ -1816,6 +1816,11 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                         can_open,
                         can_close,
                     });
+                    // SPIKE (`ast`): record the run's byte span like `*`/`_` do —
+                    // the strikethrough match below shrinks it by `use_delims`,
+                    // which underflows if the span is left at its `(MAX, 0)` default.
+                    #[cfg(feature = "ast")]
+                    cspan!(idx, i, i + count);
                     stack.push(StackItem::Emph(idx));
                 } else {
                     cur.push_str(&src[i..i + count]);
