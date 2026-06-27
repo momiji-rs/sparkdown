@@ -1040,6 +1040,19 @@ fn al_transform_tree(node: &mut Mdast) {
         | Delete(c) => c,
         #[cfg(feature = "footnotes")]
         FootnoteDefinition { children, .. } => children,
+        // Non-GFM container extensions also carry phrasing text that the wire
+        // path transforms; recurse so the object path stays consistent with it
+        // (and with remark) when those features are enabled.
+        #[cfg(feature = "deflist")]
+        DefList(c) | DefListTerm(c) => c,
+        #[cfg(feature = "deflist")]
+        DefListDescription { children, .. } => children,
+        #[cfg(feature = "directives")]
+        ContainerDirective { children, .. }
+        | LeafDirective { children, .. }
+        | TextDirective { children, .. } => children,
+        #[cfg(feature = "directives")]
+        DirectiveLabel(c) => c,
         _ => return,
     };
     let mut i = 0;
