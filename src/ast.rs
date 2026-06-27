@@ -2062,8 +2062,22 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
             w_pos(ctx, out, sb);
             let eoff = reserve_pos(ctx, out);
             out.push(node.item_spread as u8);
+            // GFM task list: a `[ ]`/`[x]` marker (+ one whitespace) at the very
+            // start of the item's first paragraph sets `checked` and is stripped
+            // from that paragraph. `2` encodes mdast's `checked: null` (not a task).
+            let task = task_marker(tree, idx);
+            out.push(match task {
+                Some((true, ..)) => 1,
+                Some((false, ..)) => 0,
+                None => 2,
+            });
             let coff = reserve(out, 4);
-            let (n, last) = bchildren(tree, idx, scratch, ctx, out);
+            let (n, last) = match task {
+                Some((_, strip, para)) => {
+                    task_item_children(tree, para, strip, scratch, ctx, out)
+                }
+                None => bchildren(tree, idx, scratch, ctx, out),
+            };
             let end = last.unwrap_or(se);
             patch_pos(ctx, out, eoff, end);
             w_u32_at(out, coff, n);
@@ -2320,6 +2334,76 @@ fn bchildren(
     let mut n = 0u32;
     let mut last = None;
     let mut c = tree.first_child(idx);
+    while let Some(ci) = c {
+        last = Some(bwire(tree, ci, scratch, ctx, out));
+        n += 1;
+        c = tree.next_sibling(ci);
+    }
+    (n, last)
+}
+
+/// GFM task list (`mdast-util-gfm-task-list-item`): if list `item`'s first child
+/// is a paragraph beginning with `[ ]`/`[x]`/`[X]` *followed by whitespace*, return
+/// `(checked, strip, paragraph)` where `strip` is the marker + one whitespace byte
+/// to drop. A bare `[ ]` with no trailing whitespace is literal text (not a task),
+/// matching remark — note this is stricter than the HTML render's `task_input`.
+fn task_marker(tree: &Tree, item: usize) -> Option<(bool, usize, usize)> {
+    if !tree.opts.tasklist {
+        return None;
+    }
+    let para = tree.first_child(item)?;
+    if tree.nodes[para].kind != Kind::Paragraph {
+        return None;
+    }
+    let s = tree.content(para).as_bytes();
+    if s.len() < 4 || s[0] != b'[' || s[2] != b']' || !matches!(s[3], b' ' | b'\t' | b'\n') {
+        return None;
+    }
+    let checked = match s[1] {
+        b' ' => false,
+        b'x' | b'X' => true,
+        _ => return None,
+    };
+    // The marker must be followed by real (non-whitespace) content; a bare `[ ]`
+    // with only trailing whitespace is literal text, not a task (matches micromark).
+    if s[4..].iter().all(u8::is_ascii_whitespace) {
+        return None;
+    }
+    Some((checked, 4, para))
+}
+
+/// Emit a task-list item's children: the first paragraph with its `[x] ` marker
+/// stripped, then the remaining children verbatim. Returns the child count and the
+/// item's source end.
+fn task_item_children(
+    tree: &Tree,
+    para: usize,
+    strip: usize,
+    scratch: &mut Scratch,
+    ctx: &PosCtx,
+    out: &mut Vec<u8>,
+) -> (u32, Option<usize>) {
+    out.push(1); // paragraph
+    let p_start_off = reserve_pos(ctx, out);
+    let (_ps, pe) = tree.src_span(para);
+    let p_end = ctx.rtrim_nl(pe as usize);
+    w_pos(ctx, out, p_end);
+    let pcoff = reserve(out, 4);
+    let children_at = out.len();
+    let body = &tree.content(para)[strip..];
+    let (_e, pn) = inline_wire_slice(tree, para, strip as u32, body, scratch, ctx, out);
+    w_u32_at(out, pcoff, pn);
+    // `mdast-util-gfm-task-list-item` moves the paragraph start past the stripped
+    // `[x] ` only when the first inline child survives as a text node; if that child
+    // is a construct (its whitespace-only text node was dropped) the paragraph keeps
+    // its original `[` start. Tag 9 == text in the wire.
+    let first_is_text = pn > 0 && out[children_at] == 9;
+    let p_start = tree.content_to_src(para, if first_is_text { strip as u32 } else { 0 });
+    patch_pos(ctx, out, p_start_off, p_start as usize);
+
+    let mut n = 1u32;
+    let mut last = Some(p_end);
+    let mut c = tree.next_sibling(para);
     while let Some(ci) = c {
         last = Some(bwire(tree, ci, scratch, ctx, out));
         n += 1;
@@ -3381,6 +3465,7 @@ mod wire_nopos_tests {
                 }
                 5 => {
                     self.u8(); // spread
+                    self.u8(); // checked (0=false, 1=true, 2=none)
                     self.kids();
                 }
                 6 | 14 => {} // thematicBreak, break
@@ -3607,7 +3692,8 @@ mod wire_pooled_tests {
                     self.kids();
                 }
                 5 => {
-                    self.u8();
+                    self.u8(); // spread
+                    self.u8(); // checked
                     self.kids();
                 }
                 6 | 14 => {}

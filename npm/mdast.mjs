@@ -187,7 +187,7 @@ function readWire(ex, markdown, flags, withPos) {
         const st = u32();
         return { type: "list", ordered: !!(f & 1), start: st === 0xffffffff ? null : st, spread: !!(f & 2), children: kids(), position };
       }
-      case 5: { const spread = !!u8[p++]; return { type: "listItem", spread, checked: null, children: kids(), position }; }
+      case 5: { const spread = !!u8[p++]; const ck = u8[p++]; return { type: "listItem", spread, checked: ck === 2 ? null : ck === 1, children: kids(), position }; }
       case 6: return { type: "thematicBreak", position };
       case 7: { const lang = opt(); const meta = opt(); const value = str(); return { type: "code", lang, meta, value, position }; }
       case 8: return { type: "html", value: str(), position };
