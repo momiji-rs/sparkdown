@@ -465,6 +465,11 @@ struct Parser<'a> {
     /// EOF; one ended mid-document (blank line / container exit) drops it.
     #[cfg(feature = "ast")]
     at_eof: bool,
+    /// The final line has no trailing newline (input does not end in `\n`). At
+    /// such an EOF, micromark extends a nested blockquote closed by a bare-marker
+    /// final line through that line's markers; see the phase-3 blockquote spike.
+    #[cfg(feature = "ast")]
+    final_unterminated: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -509,6 +514,8 @@ impl<'a> Parser<'a> {
             buf_segs: Vec::new(),
             #[cfg(feature = "ast")]
             at_eof: false,
+            #[cfg(feature = "ast")]
+            final_unterminated: false,
         }
     }
 
@@ -1169,8 +1176,15 @@ impl<'a> Parser<'a> {
             start = resume;
         }
         while start < bytes.len() {
-            let end = memchr1(&bytes[start..], b'\n').map_or(bytes.len(), |p| start + p);
+            let nl = memchr1(&bytes[start..], b'\n');
+            let end = nl.map_or(bytes.len(), |p| start + p);
             self.line_src_start = start;
+            // `nl.is_none()` ⇔ this is the last line and the input has no trailing
+            // newline (an unterminated EOF).
+            #[cfg(feature = "ast")]
+            {
+                self.final_unterminated = nl.is_none();
+            }
             self.incorporate_line(&bytes[start..end]);
             start = end + 1;
         }
@@ -1316,6 +1330,23 @@ impl<'a> Parser<'a> {
         if !self.all_closed && !self.blank && self.nodes[self.tip].kind == Kind::Paragraph {
             self.add_line(); // lazy paragraph continuation
         } else {
+            // SPIKE (`ast`): an unterminated-EOF bare-marker blank line (e.g. a
+            // final `>`) extends the nested blockquote(s) it closes through to that
+            // line's marker end, matching micromark. With a trailing newline the
+            // blockquote instead ends at its last content, so this is gated on
+            // `final_unterminated`. Walk only the blocks being closed (oldtip up to
+            // but not including the still-open `last_matched_container`).
+            #[cfg(feature = "ast")]
+            if self.blank && self.final_unterminated && !self.all_closed {
+                let end = (self.line_src_start + self.line.len()) as u32;
+                let mut n = self.oldtip;
+                while n != self.last_matched_container && n != 0 {
+                    if self.nodes[n].kind == Kind::BlockQuote {
+                        self.nodes[n].src_end = end;
+                    }
+                    n = self.nodes[n].parent;
+                }
+            }
             self.close_unmatched_blocks();
             if self.blank
                 && let Some(lc) = self.last_child(container)
