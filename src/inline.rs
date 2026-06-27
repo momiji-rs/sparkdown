@@ -2236,10 +2236,19 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                 run = i;
             }
             b'\n' => {
-                // Trailing spaces in the pending run decide the break kind.
+                // Trailing spaces in the pending run decide the break kind. mdast and
+                // cmark diverge on tabs: cmark keeps a soft break's trailing tabs and
+                // lets ≥2 trailing spaces force a hard break even past an adjacent tab
+                // (`a\t  \n` is hard); mdast drops trailing tabs from the text and a
+                // tab in the trailing run cancels the hard break (`a\t  \n` is soft).
                 let line = &src[run..i];
-                let trimmed = line.trim_end_matches(' ');
-                let hard = line.len() - trimmed.len() >= 2;
+                let sp = line.trim_end_matches(' ');
+                let hard = line.len() - sp.len() >= 2 && (!ast_mode || !sp.ends_with('\t'));
+                let trimmed = if ast_mode {
+                    line.trim_end_matches([' ', '\t'])
+                } else {
+                    sp
+                };
                 emit_text(raw, trimmed, cur);
                 if (hard || HW) && ast_mode {
                     // The text node ends before the trailing spaces; the break
@@ -2394,10 +2403,12 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
             }
         }
     }
-    // Trailing spaces at the very end of a block are dropped (no following line
-    // to form a hard break). The last text node ends before them (mdast trims
-    // trailing spaces from the final text node's value *and* position).
-    let block_text_end = run + src[run..].trim_end_matches(' ').len();
+    // Trailing whitespace at the very end of a block is dropped (no following line
+    // to form a hard break). The last text node ends before it; mdast trims trailing
+    // spaces *and tabs* from the final text node's value *and* position, while the
+    // cmark HTML path keeps tabs here (matching its block-final handling elsewhere).
+    let block_text_end =
+        run + src[run..].trim_end_matches(|c| c == ' ' || (ast_mode && c == '\t')).len();
     emit_text(raw, &src[run..block_text_end], cur);
     flush!(block_text_end);
 
