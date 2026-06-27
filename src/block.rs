@@ -470,6 +470,14 @@ struct Parser<'a> {
     /// final line through that line's markers; see the phase-3 blockquote spike.
     #[cfg(feature = "ast")]
     final_unterminated: bool,
+    /// The current line is a blank continuation of an indented code block whose
+    /// indent is below the code level (e.g. a trailing `>` / `>  ` inside a
+    /// blockquote, or `\n` / `  \n` at top level). mdast drops such a line from the
+    /// code block's `position.end`, so it must not extend `src_end`; a blank line
+    /// indented to the code level is kept (it takes the `indent >= CODE_INDENT`
+    /// path instead). `rtrim_code_end` then drops the final newline.
+    #[cfg(feature = "ast")]
+    code_bare_blank: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -516,6 +524,8 @@ impl<'a> Parser<'a> {
             at_eof: false,
             #[cfg(feature = "ast")]
             final_unterminated: false,
+            #[cfg(feature = "ast")]
+            code_bare_blank: false,
         }
     }
 
@@ -725,7 +735,12 @@ impl<'a> Parser<'a> {
             if self.nodes[tip].src_start == u32::MAX {
                 self.nodes[tip].src_start = (self.line_src_start + self.offset) as u32;
             }
-            self.nodes[tip].src_end = (line_end + nl) as u32;
+            // A bare-marker blank line keeps the previous `src_end` (the last line
+            // with content or spaces), so a trailing `>` doesn't push an indented
+            // code block's `position.end` onto its own line.
+            if !self.code_bare_blank {
+                self.nodes[tip].src_end = (line_end + nl) as u32;
+            }
         }
         // Try to (keep) borrowing a contiguous slice of the source. Borrowed
         // ranges include each line's trailing newline (so code/HTML literals,
@@ -1233,6 +1248,10 @@ impl<'a> Parser<'a> {
         self.column = 0;
         self.partially_consumed_tab = false;
         self.blank = false;
+        #[cfg(feature = "ast")]
+        {
+            self.code_bare_blank = false;
+        }
 
         // Phase 1: descend through open containers, checking continuation.
         let mut all_matched = true;
@@ -1556,6 +1575,15 @@ impl<'a> Parser<'a> {
                     self.advance_offset(CODE_INDENT, true);
                     0
                 } else if self.blank {
+                    // A blank continuation line under the code indent (this arm only
+                    // runs when `indent < CODE_INDENT`) must not extend the block's
+                    // `position.end`: mdast drops it. A blank line indented to the
+                    // code level takes the `indent >= CODE_INDENT` arm above and is
+                    // kept. `rtrim_code_end` then drops the final newline.
+                    #[cfg(feature = "ast")]
+                    {
+                        self.code_bare_blank = true;
+                    }
                     self.advance_next_nonspace();
                     0
                 } else {
