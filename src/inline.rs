@@ -1982,13 +1982,23 @@ fn alx_url_pass(s: &str) -> Option<Vec<AlPiece>> {
     let (mut start, mut from, mut changed) = (0usize, 0usize, false);
     while from < b.len() {
         // Next regex match at-or-after `from` (triggers start with h/H/w/W).
-        let pos = match (from..b.len())
-            .find(|&p| matches!(b[p], b'h' | b'H' | b'w' | b'W') && alx_url_at(b, p).is_some())
-        {
-            Some(p) => p,
+        // Scan once: capture `alx_url_at`'s result instead of re-running it.
+        let mut p = from;
+        let found = loop {
+            if p >= b.len() {
+                break None;
+            }
+            if matches!(b[p], b'h' | b'H' | b'w' | b'W')
+                && let Some(m) = alx_url_at(b, p)
+            {
+                break Some((p, m));
+            }
+            p += 1;
+        };
+        let (pos, (g1, g2, g3, is_www)) = match found {
+            Some(x) => x,
             None => break,
         };
-        let (g1, g2, g3, is_www) = alx_url_at(b, pos).unwrap();
         let matchend = pos + g1 + g2 + g3;
         // findUrl
         if alx_previous(s, pos, false) {
