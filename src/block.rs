@@ -465,6 +465,19 @@ struct Parser<'a> {
     /// EOF; one ended mid-document (blank line / container exit) drops it.
     #[cfg(feature = "ast")]
     at_eof: bool,
+    /// The final line has no trailing newline (input does not end in `\n`). At
+    /// such an EOF, micromark extends a nested blockquote closed by a bare-marker
+    /// final line through that line's markers; see the phase-3 blockquote spike.
+    #[cfg(feature = "ast")]
+    final_unterminated: bool,
+    /// The current line is a blank continuation of an indented code block whose
+    /// indent is below the code level (e.g. a trailing `>` / `>  ` inside a
+    /// blockquote, or `\n` / `  \n` at top level). mdast drops such a line from the
+    /// code block's `position.end`, so it must not extend `src_end`; a blank line
+    /// indented to the code level is kept (it takes the `indent >= CODE_INDENT`
+    /// path instead). `rtrim_code_end` then drops the final newline.
+    #[cfg(feature = "ast")]
+    code_bare_blank: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -509,6 +522,10 @@ impl<'a> Parser<'a> {
             buf_segs: Vec::new(),
             #[cfg(feature = "ast")]
             at_eof: false,
+            #[cfg(feature = "ast")]
+            final_unterminated: false,
+            #[cfg(feature = "ast")]
+            code_bare_blank: false,
         }
     }
 
@@ -718,7 +735,12 @@ impl<'a> Parser<'a> {
             if self.nodes[tip].src_start == u32::MAX {
                 self.nodes[tip].src_start = (self.line_src_start + self.offset) as u32;
             }
-            self.nodes[tip].src_end = (line_end + nl) as u32;
+            // A bare-marker blank line keeps the previous `src_end` (the last line
+            // with content or spaces), so a trailing `>` doesn't push an indented
+            // code block's `position.end` onto its own line.
+            if !self.code_bare_blank {
+                self.nodes[tip].src_end = (line_end + nl) as u32;
+            }
         }
         // Try to (keep) borrowing a contiguous slice of the source. Borrowed
         // ranges include each line's trailing newline (so code/HTML literals,
@@ -1169,8 +1191,15 @@ impl<'a> Parser<'a> {
             start = resume;
         }
         while start < bytes.len() {
-            let end = memchr1(&bytes[start..], b'\n').map_or(bytes.len(), |p| start + p);
+            let nl = memchr1(&bytes[start..], b'\n');
+            let end = nl.map_or(bytes.len(), |p| start + p);
             self.line_src_start = start;
+            // `nl.is_none()` ⇔ this is the last line and the input has no trailing
+            // newline (an unterminated EOF).
+            #[cfg(feature = "ast")]
+            {
+                self.final_unterminated = nl.is_none();
+            }
             self.incorporate_line(&bytes[start..end]);
             start = end + 1;
         }
@@ -1219,6 +1248,10 @@ impl<'a> Parser<'a> {
         self.column = 0;
         self.partially_consumed_tab = false;
         self.blank = false;
+        #[cfg(feature = "ast")]
+        {
+            self.code_bare_blank = false;
+        }
 
         // Phase 1: descend through open containers, checking continuation.
         let mut all_matched = true;
@@ -1250,6 +1283,16 @@ impl<'a> Parser<'a> {
 
         let mut matched_leaf = self.nodes[container].kind != Kind::Paragraph
             && accepts_lines(self.nodes[container].kind);
+        // A table, like a paragraph, must let phase 2 run so that a new block start
+        // (heading, list, blockquote, fence, indented code, thematic break, HTML)
+        // can interrupt it and `add_child` finalizes it. Only a blank line — caught
+        // in phase 1 — closes it directly; everything else either interrupts here
+        // or, finding no start, is appended as a body row in phase 3. Without this
+        // the table would greedily swallow the interrupting line as a row.
+        #[cfg(feature = "gfm")]
+        if self.nodes[container].kind == Kind::Table {
+            matched_leaf = false;
+        }
 
         // Phase 2: look for new block starts.
         while !matched_leaf {
@@ -1306,6 +1349,23 @@ impl<'a> Parser<'a> {
         if !self.all_closed && !self.blank && self.nodes[self.tip].kind == Kind::Paragraph {
             self.add_line(); // lazy paragraph continuation
         } else {
+            // SPIKE (`ast`): an unterminated-EOF bare-marker blank line (e.g. a
+            // final `>`) extends the nested blockquote(s) it closes through to that
+            // line's marker end, matching micromark. With a trailing newline the
+            // blockquote instead ends at its last content, so this is gated on
+            // `final_unterminated`. Walk only the blocks being closed (oldtip up to
+            // but not including the still-open `last_matched_container`).
+            #[cfg(feature = "ast")]
+            if self.blank && self.final_unterminated && !self.all_closed {
+                let end = (self.line_src_start + self.line.len()) as u32;
+                let mut n = self.oldtip;
+                while n != self.last_matched_container && n != 0 {
+                    if self.nodes[n].kind == Kind::BlockQuote {
+                        self.nodes[n].src_end = end;
+                    }
+                    n = self.nodes[n].parent;
+                }
+            }
             self.close_unmatched_blocks();
             if self.blank
                 && let Some(lc) = self.last_child(container)
@@ -1515,6 +1575,15 @@ impl<'a> Parser<'a> {
                     self.advance_offset(CODE_INDENT, true);
                     0
                 } else if self.blank {
+                    // A blank continuation line under the code indent (this arm only
+                    // runs when `indent < CODE_INDENT`) must not extend the block's
+                    // `position.end`: mdast drops it. A blank line indented to the
+                    // code level takes the `indent >= CODE_INDENT` arm above and is
+                    // kept. `rtrim_code_end` then drops the final newline.
+                    #[cfg(feature = "ast")]
+                    {
+                        self.code_bare_blank = true;
+                    }
                     self.advance_next_nonspace();
                     0
                 } else {
@@ -1529,10 +1598,14 @@ impl<'a> Parser<'a> {
                     0
                 }
             }
-            // A table continues while rows keep coming: non-blank lines that
-            // still look like a row (contain a pipe). Anything else closes it.
+            // A table consumes every non-blank line as a body row (a pipeless line
+            // is a single-cell row); only a blank line closes it here. Lines that
+            // begin another block (heading, list, quote, fence, indented code,
+            // thematic break, HTML) interrupt it in the block-start phase, exactly
+            // as they would a paragraph — plus indented code, which a table yields
+            // to but a paragraph does not.
             #[cfg(feature = "gfm")]
-            Kind::Table => u8::from(self.blank || !self.line[self.next_nonspace..].contains(&b'|')),
+            Kind::Table => u8::from(self.blank),
         }
     }
 
@@ -2265,11 +2338,15 @@ fn count_cells(line: &[u8]) -> usize {
 }
 
 #[cfg(feature = "gfm")]
-/// If `line` is a valid GFM delimiter row (cells of `:?-+:?`, with at least one
-/// pipe to disambiguate it from a setext underline), return the column count.
+/// If `line` is a valid GFM delimiter row (cells of `:?-+:?`, carrying a pipe — or,
+/// when pipeless, a colon — to disambiguate it from a setext underline), return the
+/// column count.
 fn delim_row_cols(line: &[u8]) -> Option<usize> {
     let mut t = trim_sp(line);
-    if !t.contains(&b'|') {
+    // A pipeless delimiter row is a table (not a setext underline) only when it
+    // carries a colon to disambiguate — `--:`/`:-:` are right/center single
+    // columns, while pure-dash `---`/`-` stay a setext heading underline.
+    if !t.contains(&b'|') && !t.contains(&b':') {
         return None;
     }
     if t.first() == Some(&b'|') {

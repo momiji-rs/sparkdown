@@ -46,7 +46,7 @@ function run(mode) {
         case 2: { const depth = u8[p++]; const c = kids(); return mode === 1 ? 0 : K ? { type: 'heading', depth, children: c, position: undefined } : { type: 'heading', depth, children: c }; }
         case 3: { const c = kids(); return mode === 1 ? 0 : { type: 'blockquote', children: c }; }
         case 4: { const f = u8[p++]; const st = u32(); const c = kids(); return mode === 1 ? 0 : { type: 'list', ordered: !!(f & 1), start: st === 0xffffffff ? null : st, spread: !!(f & 2), children: c }; }
-        case 5: { const spread = !!u8[p++]; const c = kids(); return mode === 1 ? 0 : { type: 'listItem', spread, checked: null, children: c }; }
+        case 5: { const spread = !!u8[p++]; const ck = u8[p++]; const c = kids(); return mode === 1 ? 0 : { type: 'listItem', spread, checked: ck === 2 ? null : ck === 1, children: c }; }
         case 6: return mode === 1 ? 0 : { type: 'thematicBreak' };
         case 7: { const lang = opt(); const meta = opt(); const value = str(); return mode === 1 ? 0 : { type: 'code', lang, meta, value }; }
         case 8: { const v = str(); return mode === 1 ? 0 : { type: 'html', value: v }; }
@@ -61,6 +61,9 @@ function run(mode) {
         case 17: { const identifier = str(); const label = str(); const url = str(); const title = opt(); return mode === 1 ? 0 : { type: 'definition', identifier, label, url, title }; }
         case 18: { const identifier = str(); const label = str(); const rt = REFTYPE[u8[p++]]; const c = kids(); return mode === 1 ? 0 : { type: 'linkReference', identifier, label, referenceType: rt, children: c }; }
         case 19: { const identifier = str(); const label = str(); const rt = REFTYPE[u8[p++]]; const alt = str(); return mode === 1 ? 0 : { type: 'imageReference', identifier, label, referenceType: rt, alt }; }
+        case 31: { const ncols = u32(); p += ncols; const c = kids(); return mode === 1 ? 0 : { type: 'table', children: c }; }
+        case 32: { const c = kids(); return mode === 1 ? 0 : { type: 'tableRow', children: c }; }
+        case 33: { const c = kids(); return mode === 1 ? 0 : { type: 'tableCell', children: c }; }
         default: throw new Error('tag ' + tag);
       }
     }

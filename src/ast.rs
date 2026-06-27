@@ -2062,8 +2062,20 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
             w_pos(ctx, out, sb);
             let eoff = reserve_pos(ctx, out);
             out.push(node.item_spread as u8);
+            // GFM task list: a `[ ]`/`[x]` marker (+ one whitespace) at the very
+            // start of the item's first paragraph sets `checked` and is stripped
+            // from that paragraph. `2` encodes mdast's `checked: null` (not a task).
+            let task = task_marker(tree, idx);
+            out.push(match task {
+                Some((true, ..)) => 1,
+                Some((false, ..)) => 0,
+                None => 2,
+            });
             let coff = reserve(out, 4);
-            let (n, last) = bchildren(tree, idx, scratch, ctx, out);
+            let (n, last) = match task {
+                Some((_, strip, para)) => task_item_children(tree, para, strip, scratch, ctx, out),
+                None => bchildren(tree, idx, scratch, ctx, out),
+            };
             let end = last.unwrap_or(se);
             patch_pos(ctx, out, eoff, end);
             w_u32_at(out, coff, n);
@@ -2306,14 +2318,7 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
             eb
         }
         #[cfg(feature = "gfm")]
-        Kind::Table => {
-            let eb = ctx.rtrim(sb, se);
-            out.push(8);
-            w_pos(ctx, out, sb);
-            w_pos(ctx, out, eb);
-            w_str(tree.content(idx), ctx, out);
-            eb
-        }
+        Kind::Table => bwire_table(tree, idx, scratch, ctx, out),
     }
 }
 
@@ -2327,6 +2332,76 @@ fn bchildren(
     let mut n = 0u32;
     let mut last = None;
     let mut c = tree.first_child(idx);
+    while let Some(ci) = c {
+        last = Some(bwire(tree, ci, scratch, ctx, out));
+        n += 1;
+        c = tree.next_sibling(ci);
+    }
+    (n, last)
+}
+
+/// GFM task list (`mdast-util-gfm-task-list-item`): if list `item`'s first child
+/// is a paragraph beginning with `[ ]`/`[x]`/`[X]` *followed by whitespace*, return
+/// `(checked, strip, paragraph)` where `strip` is the marker + one whitespace byte
+/// to drop. A bare `[ ]` with no trailing whitespace is literal text (not a task),
+/// matching remark — note this is stricter than the HTML render's `task_input`.
+fn task_marker(tree: &Tree, item: usize) -> Option<(bool, usize, usize)> {
+    if !tree.opts.tasklist {
+        return None;
+    }
+    let para = tree.first_child(item)?;
+    if tree.nodes[para].kind != Kind::Paragraph {
+        return None;
+    }
+    let s = tree.content(para).as_bytes();
+    if s.len() < 4 || s[0] != b'[' || s[2] != b']' || !matches!(s[3], b' ' | b'\t' | b'\n') {
+        return None;
+    }
+    let checked = match s[1] {
+        b' ' => false,
+        b'x' | b'X' => true,
+        _ => return None,
+    };
+    // The marker must be followed by real (non-whitespace) content; a bare `[ ]`
+    // with only trailing whitespace is literal text, not a task (matches micromark).
+    if s[4..].iter().all(u8::is_ascii_whitespace) {
+        return None;
+    }
+    Some((checked, 4, para))
+}
+
+/// Emit a task-list item's children: the first paragraph with its `[x] ` marker
+/// stripped, then the remaining children verbatim. Returns the child count and the
+/// item's source end.
+fn task_item_children(
+    tree: &Tree,
+    para: usize,
+    strip: usize,
+    scratch: &mut Scratch,
+    ctx: &PosCtx,
+    out: &mut Vec<u8>,
+) -> (u32, Option<usize>) {
+    out.push(1); // paragraph
+    let p_start_off = reserve_pos(ctx, out);
+    let (_ps, pe) = tree.src_span(para);
+    let p_end = ctx.rtrim_nl(pe as usize);
+    w_pos(ctx, out, p_end);
+    let pcoff = reserve(out, 4);
+    let children_at = out.len();
+    let body = &tree.content(para)[strip..];
+    let (_e, pn) = inline_wire_slice(tree, para, strip as u32, body, scratch, ctx, out);
+    w_u32_at(out, pcoff, pn);
+    // `mdast-util-gfm-task-list-item` moves the paragraph start past the stripped
+    // `[x] ` only when the first inline child survives as a text node; if that child
+    // is a construct (its whitespace-only text node was dropped) the paragraph keeps
+    // its original `[` start. Tag 9 == text in the wire.
+    let first_is_text = pn > 0 && out[children_at] == 9;
+    let p_start = tree.content_to_src(para, if first_is_text { strip as u32 } else { 0 });
+    patch_pos(ctx, out, p_start_off, p_start as usize);
+
+    let mut n = 1u32;
+    let mut last = Some(p_end);
+    let mut c = tree.next_sibling(para);
     while let Some(ci) = c {
         last = Some(bwire(tree, ci, scratch, ctx, out));
         n += 1;
@@ -2435,6 +2510,188 @@ fn inline_wire_slice(
     };
     render_inline_to_sink(body, &tree.refmap, scratch, tree.opts, &mut sink);
     (ebb, sink.top)
+}
+
+/// GFM pipe table → wire: `table` (tag 31, an `align` array + `tableRow` kids),
+/// each `tableRow` (tag 32), each `tableCell` (tag 33, inline kids). Matches
+/// `mdast-util-gfm-table`: the delimiter row sets alignment and is not emitted;
+/// every data row keeps the cells it actually has — short rows are not padded and
+/// long rows are not truncated (only the HTML render normalizes to the column count).
+#[cfg(feature = "gfm")]
+fn bwire_table(
+    tree: &Tree,
+    idx: usize,
+    scratch: &mut Scratch,
+    ctx: &PosCtx,
+    out: &mut Vec<u8>,
+) -> usize {
+    let content = tree.content(idx);
+    // Non-blank lines with their content-byte offsets. A Table node only exists
+    // once a header + delimiter row validated, so there are always >= 2 lines.
+    let mut lines: Vec<(usize, &str)> = Vec::new();
+    let mut o = 0usize;
+    for line in content.split('\n') {
+        if !line.trim().is_empty() {
+            lines.push((o, line));
+        }
+        o += line.len() + 1;
+    }
+    let header = lines[0].1;
+    let hcells = scan_cells(header);
+    let ncols = hcells.len();
+    // Column alignments from the delimiter row's trimmed cells.
+    let delim = lines[1].1;
+    let mut aligns: Vec<u8> = scan_cells(delim)
+        .iter()
+        .map(|&(_, _, cs, ce)| {
+            let t = &delim.as_bytes()[cs as usize..ce as usize];
+            match (t.first() == Some(&b':'), t.last() == Some(&b':')) {
+                (true, true) => 3,  // center
+                (true, false) => 1, // left
+                (false, true) => 2, // right
+                (false, false) => 0,
+            }
+        })
+        .collect();
+    aligns.resize(ncols, 0);
+
+    out.push(31); // table
+    let t_start = tree.content_to_src(idx, lines[0].0 as u32 + hcells[0].0) as usize;
+    w_pos(ctx, out, t_start);
+    let teoff = reserve_pos(ctx, out);
+    w_u32(ncols as u32, out);
+    out.extend_from_slice(&aligns);
+    let tcoff = reserve(out, 4);
+
+    // Rows: the header line, then every data line (lines[2..]). The delimiter
+    // (lines[1]) is consumed for alignment and never emitted as a row.
+    let mut nrows = 1u32;
+    bwire_table_row(tree, idx, lines[0].0, header, scratch, ctx, out);
+    for &(lo, body) in &lines[2..] {
+        bwire_table_row(tree, idx, lo, body, scratch, ctx, out);
+        nrows += 1;
+    }
+    w_u32_at(out, tcoff, nrows);
+
+    // Table spans to the end of its last source line's last cell (the delimiter
+    // row when there are no data rows) — same cell-end convention as the rows.
+    let (llo, lbody) = *lines.last().unwrap();
+    let lend = scan_cells(lbody).last().map_or(0, |c| c.1);
+    let t_end = tree.content_to_src(idx, llo as u32 + lend) as usize;
+    patch_pos(ctx, out, teoff, t_end);
+    t_end
+}
+
+/// Emit one `tableRow` (tag 32) and its `tableCell` children. `lo` is the row
+/// line's offset within the table node content. Like `mdast-util-gfm-table`, every
+/// cell the row actually has is kept — short rows are not padded and long rows are
+/// not truncated (only the HTML render pads/truncates to the column count).
+#[cfg(feature = "gfm")]
+fn bwire_table_row(
+    tree: &Tree,
+    idx: usize,
+    lo: usize,
+    body: &str,
+    scratch: &mut Scratch,
+    ctx: &PosCtx,
+    out: &mut Vec<u8>,
+) {
+    let cells = scan_cells(body);
+    out.push(32); // tableRow
+    // The row runs from the first cell's start (after any leading line whitespace)
+    // to the last cell's end — which `scan_cells` carries to the raw line end, so a
+    // trailing pipe and any trailing whitespace ARE inside the row span (matching
+    // `mdast-util-gfm-table`, which trims only the leading edge, not the trailing tail).
+    let r_start = tree.content_to_src(idx, lo as u32 + cells[0].0) as usize;
+    w_pos(ctx, out, r_start);
+    let reoff = reserve_pos(ctx, out);
+    let rcoff = reserve(out, 4);
+    for &(ns, ne, cs, ce) in &cells {
+        out.push(33); // tableCell
+        let c_start = tree.content_to_src(idx, lo as u32 + ns) as usize;
+        w_pos(ctx, out, c_start);
+        let ceoff = reserve_pos(ctx, out);
+        let ccoff = reserve(out, 4);
+        let cell = &body[cs as usize..ce as usize];
+        let (_end, nk) = inline_wire_slice(tree, idx, lo as u32 + cs, cell, scratch, ctx, out);
+        w_u32_at(out, ccoff, nk);
+        let c_end = tree.content_to_src(idx, lo as u32 + ne) as usize;
+        patch_pos(ctx, out, ceoff, c_end);
+    }
+    w_u32_at(out, rcoff, cells.len() as u32);
+    let r_end = tree.content_to_src(idx, lo as u32 + cells.last().unwrap().1) as usize;
+    patch_pos(ctx, out, reoff, r_end);
+}
+
+/// GFM pipe-table cell spans for one row line, all **line-relative** byte offsets
+/// `(node_start, node_end, content_start, content_end)`. Node spans tile the line
+/// edge-to-edge at the interior (separator) pipes — a leading pipe folds into the
+/// first cell, a trailing pipe into the last — matching `mdast-util-gfm-table`.
+/// Content spans are the cell text trimmed of spaces/tabs (inline-parsed); `\|`
+/// is not a separator (it is later handled as a backslash escape).
+#[cfg(feature = "gfm")]
+fn scan_cells(body: &str) -> Vec<(u32, u32, u32, u32)> {
+    let b = body.as_bytes();
+    // The row spans only its non-whitespace extent `[e0, e1)` — leading/trailing
+    // line whitespace is outside every cell (matching `mdast-util-gfm-table`, whose
+    // row/first-cell positions start at the first non-space, not the line start).
+    let Some(e0) = b.iter().position(|&c| c != b' ' && c != b'\t') else {
+        return Vec::new(); // all-whitespace line (filtered out before emit)
+    };
+    let e1 = b.iter().rposition(|&c| c != b' ' && c != b'\t').unwrap() + 1;
+
+    let mut pipes: Vec<usize> = Vec::new();
+    let mut esc = false;
+    for (i, &c) in b.iter().enumerate() {
+        if esc {
+            esc = false;
+        } else if c == b'\\' {
+            esc = true;
+        } else if c == b'|' {
+            pipes.push(i);
+        }
+    }
+    let has_leading = pipes.first() == Some(&e0);
+    let has_trailing = pipes.last() == Some(&(e1 - 1));
+    let lo = usize::from(has_leading);
+    let hi = pipes.len() - usize::from(has_trailing);
+    let interior: &[usize] = if lo <= hi { &pipes[lo..hi] } else { &[] };
+
+    let count = interior.len() + 1;
+    let mut cells = Vec::with_capacity(count);
+    for k in 0..count {
+        let ns = if k == 0 { e0 } else { interior[k - 1] };
+        // The first cell starts at the first non-whitespace (`e0`), but the last
+        // cell always runs to the raw line end `n` — including a closing pipe and
+        // any trailing whitespace. (`mdast-util-gfm-table` trims the leading edge
+        // but not the trailing tail.) Interior cells end at the next pipe.
+        let ne = if k == count - 1 { b.len() } else { interior[k] };
+        let craw_l = if k == 0 {
+            if has_leading { pipes[0] + 1 } else { e0 }
+        } else {
+            interior[k - 1] + 1
+        };
+        let craw_r = (if k == count - 1 {
+            if has_trailing {
+                *pipes.last().unwrap()
+            } else {
+                e1
+            }
+        } else {
+            interior[k]
+        })
+        .max(craw_l);
+        let mut cs = craw_l;
+        let mut ce = craw_r;
+        while cs < ce && (b[cs] == b' ' || b[cs] == b'\t') {
+            cs += 1;
+        }
+        while ce > cs && (b[ce - 1] == b' ' || b[ce - 1] == b'\t') {
+            ce -= 1;
+        }
+        cells.push((ns as u32, ne as u32, cs as u32, ce as u32));
+    }
+    cells
 }
 
 /// An open inline container: byte offsets to backpatch (end position + child
@@ -3213,6 +3470,7 @@ mod wire_nopos_tests {
                 }
                 5 => {
                     self.u8(); // spread
+                    self.u8(); // checked (0=false, 1=true, 2=none)
                     self.kids();
                 }
                 6 | 14 => {} // thematicBreak, break
@@ -3439,7 +3697,8 @@ mod wire_pooled_tests {
                     self.kids();
                 }
                 5 => {
-                    self.u8();
+                    self.u8(); // spread
+                    self.u8(); // checked
                     self.kids();
                 }
                 6 | 14 => {}
