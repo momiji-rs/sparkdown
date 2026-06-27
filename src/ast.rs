@@ -987,7 +987,13 @@ pub fn to_mdast_opts(src: &str, opts: crate::Options) -> Mdast {
     let tree = crate::block::parse_with_opts(src, opts);
     let mut scratch = fn_scratch(&tree);
     let ctx = PosCtx::new(src);
-    block(&tree, tree.root, &mut scratch, &ctx).0
+    #[cfg_attr(not(feature = "gfm"), allow(unused_mut))]
+    let mut root = block(&tree, tree.root, &mut scratch, &ctx).0;
+    #[cfg(feature = "gfm")]
+    if opts.autolink {
+        al_transform_tree(&mut root);
+    }
+    root
 }
 
 /// Like [`to_mdast_opts`] but builds the tree WITHOUT unist `position` — for the
@@ -999,7 +1005,88 @@ pub fn to_mdast_opts_nopos(src: &str, opts: crate::Options) -> Mdast {
     let tree = crate::block::parse_with_opts(src, opts);
     let mut scratch = fn_scratch(&tree);
     let ctx = PosCtx::disabled();
-    block(&tree, tree.root, &mut scratch, &ctx).0
+    #[cfg_attr(not(feature = "gfm"), allow(unused_mut))]
+    let mut root = block(&tree, tree.root, &mut scratch, &ctx).0;
+    #[cfg(feature = "gfm")]
+    if opts.autolink {
+        al_transform_tree(&mut root);
+    }
+    root
+}
+
+/// GFM autolink-literal transform over a built mdast tree — the object-path
+/// counterpart of [`WireSink`]'s streaming `text` handling. Replaces phrasing
+/// `text` nodes with the transform's pieces (bare, i.e. position-less, matching
+/// `mdast-util-find-and-replace`), recursing into every container except
+/// `link`/`linkReference`/`image` subtrees (`ignore: ['link','linkReference']`,
+/// and `image` has no phrasing children).
+#[cfg(feature = "gfm")]
+fn al_transform_tree(node: &mut Mdast) {
+    use Mdast::*;
+    let inner = match node {
+        Positioned(_, b) => b.as_mut(),
+        n => n,
+    };
+    let children: &mut Vec<Mdast> = match inner {
+        Link { .. } | Image { .. } | LinkReference { .. } => return,
+        Root(c)
+        | Paragraph(c)
+        | Blockquote(c)
+        | Heading { children: c, .. }
+        | List { children: c, .. }
+        | ListItem { children: c, .. }
+        | Emphasis(c)
+        | Strong(c)
+        | Delete(c) => c,
+        #[cfg(feature = "footnotes")]
+        FootnoteDefinition { children, .. } => children,
+        // Non-GFM container extensions also carry phrasing text that the wire
+        // path transforms; recurse so the object path stays consistent with it
+        // (and with remark) when those features are enabled.
+        #[cfg(feature = "deflist")]
+        DefList(c) | DefListTerm(c) => c,
+        #[cfg(feature = "deflist")]
+        DefListDescription { children, .. } => children,
+        #[cfg(feature = "directives")]
+        ContainerDirective { children, .. }
+        | LeafDirective { children, .. }
+        | TextDirective { children, .. } => children,
+        #[cfg(feature = "directives")]
+        DirectiveLabel(c) => c,
+        _ => return,
+    };
+    let mut i = 0;
+    while i < children.len() {
+        let val = match &children[i] {
+            Text(s) => Some(s.as_str()),
+            Positioned(_, b) => match b.as_ref() {
+                Text(s) => Some(s.as_str()),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(pieces) = val.and_then(crate::inline::al_transform_text) {
+            let repl: Vec<Mdast> = pieces
+                .into_iter()
+                .map(|p| match p {
+                    crate::inline::AlPiece::Text(t) => Text(t),
+                    crate::inline::AlPiece::Link { url, text } => Link {
+                        url,
+                        title: None,
+                        children: vec![Text(text)],
+                    },
+                })
+                .collect();
+            let n = repl.len();
+            children.splice(i..=i, repl);
+            i += n;
+        } else {
+            i += 1;
+        }
+    }
+    for c in children.iter_mut() {
+        al_transform_tree(c);
+    }
 }
 
 /// A fresh [`Scratch`] seeded with the tree's footnote labels, so inline
@@ -1575,10 +1662,14 @@ fn build_inline(
                 ));
             }
             InlineTok::Autolink { url, text } => {
-                // The link spans `<url>`; its text child spans the url itself.
+                // The child text spans only the visible text. A `<url>`/`<email>`
+                // autolink wraps it in `<>` (one byte each side); a bare GFM
+                // autolink has none. Derive the symmetric padding from the span vs
+                // the text length so both land right (mirrors `WireSink::autolink`).
+                let pad = (((end - start) as usize).saturating_sub(text.len()) / 2) as u32;
                 let child = wrapm(
-                    start.saturating_add(1),
-                    end.saturating_sub(1),
+                    start.saturating_add(pad),
+                    end.saturating_sub(pad),
                     Mdast::Text(text),
                 );
                 stack.last_mut().unwrap().1.push(wrapm(
@@ -2433,6 +2524,8 @@ fn inline_wire(
         bpos: ctx.bpos(sb, eb),
         stack: Vec::new(),
         top: 0,
+        al: crate::Options::GFM && tree.opts.autolink,
+        link_depth: 0,
     };
     render_inline_to_sink(
         tree.content(idx),
@@ -2467,6 +2560,8 @@ fn inline_wire_src(
         bpos: ctx.bpos(src_start as usize, end),
         stack: Vec::new(),
         top: 0,
+        al: crate::Options::GFM && tree.opts.autolink,
+        link_depth: 0,
     };
     render_inline_to_sink(body, &tree.refmap, scratch, tree.opts, &mut sink);
     (end, sink.top)
@@ -2507,6 +2602,8 @@ fn inline_wire_slice(
         bpos: ctx.bpos(sbb, ebb),
         stack: Vec::new(),
         top: 0,
+        al: crate::Options::GFM && tree.opts.autolink,
+        link_depth: 0,
     };
     render_inline_to_sink(body, &tree.refmap, scratch, tree.opts, &mut sink);
     (ebb, sink.top)
@@ -2702,6 +2799,9 @@ struct InlineFrame {
     os: u32,
     oe: u32,
     count: u32,
+    /// True for a `link`/`linkReference` frame, so `close` can keep `link_depth`
+    /// (the "ignore inside link" guard for the autolink transform) accurate.
+    is_link: bool,
 }
 
 /// [`InlineSink`] that writes the binary wire form directly. Container nesting
@@ -2722,6 +2822,11 @@ struct WireSink<'a> {
     bpos: Pos,
     stack: Vec<InlineFrame>,
     top: u32,
+    /// GFM autolink-literal transform enabled (`Options::GFM && opts.autolink`).
+    al: bool,
+    /// Nesting depth of `link`/`linkReference` ancestors; the transform skips text
+    /// while `> 0` (`ignore: ['link','linkReference']`).
+    link_depth: u32,
 }
 
 impl WireSink<'_> {
@@ -2787,10 +2892,54 @@ impl WireSink<'_> {
             POS_DISABLED
         }
     }
+    /// A leaf prologue with NO unist position — for the nodes the GFM autolink
+    /// transform creates (`mdast-util-find-and-replace` leaves them position-less).
+    /// When positions are on, a sentinel point (`u32::MAX×3`) is written that the
+    /// JS reader maps to `position: undefined`.
+    fn leaf_nopos(&mut self, tag: u8) {
+        self.out.push(tag);
+        if self.ctx.enabled {
+            let s = (u32::MAX, u32::MAX, u32::MAX);
+            w_point(self.out, s);
+            w_point(self.out, s);
+        }
+    }
+    /// A position-less `text` node (a transform text piece).
+    fn al_text(&mut self, value: &str) {
+        self.leaf_nopos(9);
+        w_str(value, self.ctx, self.out);
+        self.bump();
+    }
+    /// A position-less autolink `link` (a transform autolink) — one text child,
+    /// also position-less. Mirrors the [`autolink`](WireSink::autolink) layout.
+    fn al_link(&mut self, url: &str, text: &str) {
+        self.leaf_nopos(15);
+        w_str(url, self.ctx, self.out);
+        w_u32(u32::MAX, self.out); // title: None
+        w_u32(1, self.out); // one text child
+        self.leaf_nopos(9);
+        w_str(text, self.ctx, self.out);
+        self.bump();
+    }
 }
 
 impl InlineSink for WireSink<'_> {
     fn text(&mut self, value: &str, start: u32, end: u32) {
+        // GFM autolink-literal transform: outside any link, re-scan the (already
+        // coalesced) text node for bare autolinks the tokenizer missed. On a hit,
+        // replace it with position-less text/link pieces (matching remark-gfm).
+        if self.al
+            && self.link_depth == 0
+            && let Some(pieces) = crate::inline::al_transform_text(value)
+        {
+            for piece in pieces {
+                match piece {
+                    crate::inline::AlPiece::Text(t) => self.al_text(&t),
+                    crate::inline::AlPiece::Link { url, text } => self.al_link(&url, &text),
+                }
+            }
+            return;
+        }
         self.leaf(9, start, end);
         w_str(value, self.ctx, self.out);
         self.bump();
@@ -2894,6 +3043,7 @@ impl InlineSink for WireSink<'_> {
             os: start,
             oe: end,
             count: 0,
+            is_link: false,
         });
     }
     fn link_open(&mut self, url: &str, title: Option<&str>, start: u32, end: u32) {
@@ -2904,12 +3054,14 @@ impl InlineSink for WireSink<'_> {
         w_str(url, self.ctx, self.out);
         w_opt_str(title, self.ctx, self.out);
         let coff = reserve(self.out, 4);
+        self.link_depth += 1;
         self.stack.push(InlineFrame {
             eoff,
             coff,
             os: start,
             oe: end,
             count: 0,
+            is_link: true,
         });
     }
     fn linkref_open(
@@ -2928,16 +3080,21 @@ impl InlineSink for WireSink<'_> {
         w_str(label, self.ctx, self.out);
         self.out.push(reftype_code(reftype));
         let coff = reserve(self.out, 4);
+        self.link_depth += 1;
         self.stack.push(InlineFrame {
             eoff,
             coff,
             os: start,
             oe: end,
             count: 0,
+            is_link: true,
         });
     }
     fn close(&mut self, _start: u32, end: u32) {
         if let Some(f) = self.stack.pop() {
+            if f.is_link {
+                self.link_depth -= 1;
+            }
             if self.ctx.enabled {
                 let cend = if end > f.oe { end } else { f.oe };
                 let p = self.mkpos(f.os, cend);
