@@ -2407,8 +2407,10 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
     // to form a hard break). The last text node ends before it; mdast trims trailing
     // spaces *and tabs* from the final text node's value *and* position, while the
     // cmark HTML path keeps tabs here (matching its block-final handling elsewhere).
-    let block_text_end =
-        run + src[run..].trim_end_matches(|c| c == ' ' || (ast_mode && c == '\t')).len();
+    let block_text_end = run
+        + src[run..]
+            .trim_end_matches(|c| c == ' ' || (ast_mode && c == '\t'))
+            .len();
     emit_text(raw, &src[run..block_text_end], cur);
     flush!(block_text_end);
 

@@ -2073,9 +2073,7 @@ fn bwire(tree: &Tree, idx: usize, scratch: &mut Scratch, ctx: &PosCtx, out: &mut
             });
             let coff = reserve(out, 4);
             let (n, last) = match task {
-                Some((_, strip, para)) => {
-                    task_item_children(tree, para, strip, scratch, ctx, out)
-                }
+                Some((_, strip, para)) => task_item_children(tree, para, strip, scratch, ctx, out),
                 None => bchildren(tree, idx, scratch, ctx, out),
             };
             let end = last.unwrap_or(se);
@@ -2671,7 +2669,11 @@ fn scan_cells(body: &str) -> Vec<(u32, u32, u32, u32)> {
             interior[k - 1] + 1
         };
         let craw_r = (if k == count - 1 {
-            if has_trailing { *pipes.last().unwrap() } else { e1 }
+            if has_trailing {
+                *pipes.last().unwrap()
+            } else {
+                e1
+            }
         } else {
             interior[k]
         })
