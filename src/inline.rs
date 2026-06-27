@@ -1563,7 +1563,9 @@ fn emit_url(src: &str, start: usize, end: usize, out: &mut String) {
 /// The mdast `link` url for a GFM extended URL autolink: a `www.` link gets an
 /// `http://` scheme prefix, an explicit `http(s)://` is kept verbatim (mirrors
 /// the href [`emit_url`] writes, but unescaped — mdast carries the raw url).
-#[cfg(feature = "gfm")]
+/// Ungated like [`emit_url`]/[`emit_email`]: the call sites live in `if ast_mode`
+/// (a runtime `const false` without `ast`) blocks that are still compiled and
+/// name-resolved, so the fn must exist in every feature configuration.
 fn gfm_url_href(text: &str) -> String {
     if text.starts_with("http") {
         text.to_owned()
