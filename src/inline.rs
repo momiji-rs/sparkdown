@@ -1560,6 +1560,20 @@ fn emit_url(src: &str, start: usize, end: usize, out: &mut String) {
     out.push_str("</a>");
 }
 
+/// The mdast `link` url for a GFM extended URL autolink: a `www.` link gets an
+/// `http://` scheme prefix, an explicit `http(s)://` is kept verbatim (mirrors
+/// the href [`emit_url`] writes, but unescaped — mdast carries the raw url).
+/// Ungated like [`emit_url`]/[`emit_email`]: the call sites live in `if ast_mode`
+/// (a runtime `const false` without `ast`) blocks that are still compiled and
+/// name-resolved, so the fn must exist in every feature configuration.
+fn gfm_url_href(text: &str) -> String {
+    if text.starts_with("http") {
+        text.to_owned()
+    } else {
+        format!("http://{text}")
+    }
+}
+
 /// Emit a bare email autolink as `<a href="mailto:…">…</a>`.
 fn emit_email(src: &str, start: usize, end: usize, out: &mut String) {
     let email = &src[start..end];
@@ -2285,7 +2299,23 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
             b'@' if al => {
                 if let Some((s, e)) = gfm_scan_email(bytes, i) {
                     emit_text(raw, &src[run..s], cur);
-                    emit_email(src, s, e, cur);
+                    if ast_mode {
+                        // GFM extended email autolink → mdast `link` (mailto: href,
+                        // verbatim text child) — the same node a `<addr>` autolink
+                        // yields, instead of leaking `<a …>` HTML into a text node.
+                        flush!(s);
+                        let text = src[s..e].to_owned();
+                        let si = sem.len() as u32;
+                        sem.push(Sem::Autolink {
+                            url: format!("mailto:{text}"),
+                            text,
+                        });
+                        let aid = list.push(Node::Sem(si));
+                        cspan!(aid, s, e);
+                        seg = cur.len();
+                    } else {
+                        emit_email(src, s, e, cur);
+                    }
                     i = e;
                     run = i;
                 } else {
@@ -2295,7 +2325,19 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
             b'w' | b'W' if al && al_boundary(bytes, i) => {
                 if let Some(end) = gfm_scan_url(bytes, i) {
                     emit_text(raw, &src[run..i], cur);
-                    emit_url(src, i, end, cur);
+                    if ast_mode {
+                        // GFM extended `www.` autolink → mdast `link`.
+                        flush!(i);
+                        let text = src[i..end].to_owned();
+                        let url = gfm_url_href(&text);
+                        let si = sem.len() as u32;
+                        sem.push(Sem::Autolink { url, text });
+                        let aid = list.push(Node::Sem(si));
+                        cspan!(aid, i, end);
+                        seg = cur.len();
+                    } else {
+                        emit_url(src, i, end, cur);
+                    }
                     i = end;
                     run = i;
                 } else {
@@ -2305,7 +2347,19 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
             b':' if al || emo || dir => {
                 if al && let Some((s, e)) = gfm_scan_url_at_colon(bytes, i) {
                     emit_text(raw, &src[run..s], cur);
-                    emit_url(src, s, e, cur);
+                    if ast_mode {
+                        // GFM extended `http(s)://` autolink → mdast `link`.
+                        flush!(s);
+                        let text = src[s..e].to_owned();
+                        let url = gfm_url_href(&text);
+                        let si = sem.len() as u32;
+                        sem.push(Sem::Autolink { url, text });
+                        let aid = list.push(Node::Sem(si));
+                        cspan!(aid, s, e);
+                        seg = cur.len();
+                    } else {
+                        emit_url(src, s, e, cur);
+                    }
                     i = e;
                     run = i;
                 } else if emo && let Some((emoji, e)) = emoji_lookup(bytes, i) {

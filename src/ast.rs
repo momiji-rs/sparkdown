@@ -2864,7 +2864,13 @@ impl InlineSink for WireSink<'_> {
         w_u32(1, self.out); // one text child
         self.out.push(9);
         if self.ctx.enabled {
-            let cp = self.mkpos(start.saturating_add(1), end.saturating_sub(1));
+            // The text child spans only the visible text. A `<url>` autolink wraps
+            // it in `<>` (one byte each side); a bare GFM autolink has no wrapper.
+            // Derive the symmetric padding from the span vs the text length so both
+            // land right: `<https://x>` → text [start+1, end-1], `https://x` → text
+            // [start, end] (equal to the link span, matching remark-gfm).
+            let pad = (((end - start) as usize).saturating_sub(text.len()) / 2) as u32;
+            let cp = self.mkpos(start.saturating_add(pad), end.saturating_sub(pad));
             w_point(self.out, cp.start);
             w_point(self.out, cp.end);
         }
