@@ -68,6 +68,7 @@ export const ready = {
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const REFTYPE = ["shortcut", "collapsed", "full"];
+const ALIGN = [null, "left", "right", "center"];
 
 // Default: pure CommonMark (a faithful `remark-parse` drop-in). Pass options to
 // opt into grammar extensions, e.g. `toMdast(md, { tables: true, footnotes: true })`.
@@ -212,6 +213,14 @@ function readWire(ex, markdown, flags, withPos) {
       case 28: { const name = str(); const attributes = attrs(); return { type: "leafDirective", name, attributes, children: kids(), position }; }
       case 29: { const name = str(); const attributes = attrs(); return { type: "containerDirective", name, attributes, children: kids(), position }; }
       case 30: return { type: "paragraph", data: { directiveLabel: true }, children: kids(), position };
+      case 31: {
+        const ncols = u32();
+        const align = new Array(ncols);
+        for (let i = 0; i < ncols; i++) align[i] = ALIGN[u8[p++]];
+        return { type: "table", align, children: kids(), position };
+      }
+      case 32: return { type: "tableRow", children: kids(), position };
+      case 33: return { type: "tableCell", children: kids(), position };
       default: throw new Error("sparkdown/mdast: bad wire tag " + tag);
     }
   }
