@@ -1422,128 +1422,351 @@ fn footnote_ref_html(
 /// arms of [`render_inline`] (kept in sync by the conformance suite).
 // `HW` (hard_wraps) is a const generic so the default `HW = false` folds
 // `if hard || HW` back to the original `if hard` — zero per-newline cost.
-/// A GFM extended autolink may begin at text start or just after whitespace or
-/// one of `*`, `_`, `~`, `(`.
-fn al_boundary(b: &[u8], i: usize) -> bool {
-    i == 0 || matches!(b[i - 1], b' ' | b'\t' | b'\n' | b'*' | b'_' | b'~' | b'(')
+// ── GFM autolink-literal detection (GFM §6.9) ──────────────────────────────
+// Ported faithfully from `micromark-extension-gfm-autolink-literal` (the engine
+// behind remark-gfm) so the HTML and mdast paths match it byte-for-byte. The
+// three trigger arms (`w`/`W`, `:`, `@`) in both inline scanners — `stream_inline`
+// (HTML fast path) and `render_inline_impl` (mdast + HTML) — share these helpers,
+// so a fix here lands on both paths. Unicode domain/path chars reuse the flanking
+// proxies [`boundary_punct`] / [`boundary_ws`].
+//
+/// Decode the UTF-8 char at `b[j]` (`b` is the bytes of a valid `&str`),
+/// returning `(char, byte_len)`.
+fn al_char(b: &[u8], j: usize) -> (char, usize) {
+    let first = b[j];
+    if first < 0x80 {
+        return (first as char, 1);
+    }
+    let len = if first >= 0xF0 {
+        4
+    } else if first >= 0xE0 {
+        3
+    } else {
+        2
+    };
+    let end = (j + len).min(b.len());
+    core::str::from_utf8(&b[j..end])
+        .ok()
+        .and_then(|s| s.chars().next())
+        .map_or(('\u{FFFD}', 1), |c| (c, c.len_utf8()))
 }
 
-/// Trim trailing punctuation off a matched autolink (GFM §6.9): `?!.,:*_~`, an
-/// unbalanced `)`, and a trailing entity reference `&…;`.
-fn gfm_trim_url(b: &[u8], start: usize, mut end: usize) -> usize {
-    while end > start {
-        match b[end - 1] {
-            b'?' | b'!' | b'.' | b',' | b':' | b'*' | b'_' | b'~' => end -= 1,
-            b')' => {
-                let opens = b[start..end].iter().filter(|&&x| x == b'(').count();
-                let closes = b[start..end].iter().filter(|&&x| x == b')').count();
-                if closes > opens {
-                    end -= 1;
+/// micromark `gfmAtext` — an email local-part char: `+ - . _` or alphanumeric.
+fn al_atext(c: u8) -> bool {
+    matches!(c, b'+' | b'-' | b'.' | b'_') || c.is_ascii_alphanumeric()
+}
+
+/// `previousProtocol`: a `http(s)://` autolink may start unless the preceding
+/// byte is an ASCII letter.
+fn al_prev_protocol(b: &[u8], i: usize) -> bool {
+    i == 0 || !b[i - 1].is_ascii_alphabetic()
+}
+
+/// `previousWww` — the micromark *tokenizer* rule: a `www.` autolink may start at
+/// text start, after ASCII whitespace, or after one of `( * _ [ ] ~`. (The looser
+/// boundaries the observable remark output also allows — e.g. after `,`/`:`/`<` —
+/// come from the separate mdast tree-transform pass (`al_transform`), not here.)
+fn al_prev_www(b: &[u8], i: usize) -> bool {
+    i == 0
+        || matches!(
+            b[i - 1],
+            b' ' | b'\t' | b'\n' | b'\r' | b'(' | b'*' | b'_' | b'[' | b']' | b'~'
+        )
+}
+
+/// micromark `previousUnbalanced`: a GFM autolink in the tokenizer pass is
+/// suppressed when an unclosed `[`/`![` label opener precedes it (the leftover
+/// gets a second chance in the mdast tree-transform). An open `Bracket` on the
+/// delimiter stack is exactly such an opener.
+fn al_in_open_label(stack: &[StackItem]) -> bool {
+    stack.iter().any(|s| matches!(s, StackItem::Bracket { .. }))
+}
+
+/// `previousEmail`: an email autolink may start unless the preceding byte is `/`
+/// or a `gfmAtext` char.
+fn al_prev_email(b: &[u8], i: usize) -> bool {
+    i == 0 || {
+        let c = b[i - 1];
+        !(c == b'/' || al_atext(c))
+    }
+}
+
+/// Does the domain/path scan end at `b[j]` — eof, or ASCII/Unicode whitespace?
+fn al_at_end(b: &[u8], j: usize) -> bool {
+    j >= b.len()
+        || (b[j] < 0x80 && matches!(b[j], b' ' | b'\t' | b'\n' | b'\r'))
+        || (b[j] >= 0x80 && boundary_ws(Some(al_char(b, j).0)))
+}
+
+/// micromark `tokenizeTrail`: starting at `b[j]` (a candidate trailing char),
+/// does the maximal run of trailing punctuation / `&entity;` / `]` reach an end
+/// (`<`, whitespace, or eof)?  `true` ⇒ everything from `j` is trailing and is
+/// trimmed off the link; `false` ⇒ `b[j]` is part of the link.
+fn al_is_trail(b: &[u8], mut j: usize) -> bool {
+    loop {
+        if j >= b.len() {
+            return true;
+        }
+        match b[j] {
+            b'!' | b'"' | b'\'' | b')' | b'*' | b',' | b'.' | b':' | b';' | b'?' | b'_' | b'~' => {
+                j += 1;
+            }
+            // `&` + one or more ASCII letters + `;` is a single trailing entity;
+            // anything else means `&` continues the link.
+            b'&' => {
+                let mut k = j + 1;
+                while k < b.len() && b[k].is_ascii_alphabetic() {
+                    k += 1;
+                }
+                if k > j + 1 && b.get(k) == Some(&b';') {
+                    j = k + 1;
                 } else {
-                    break;
+                    return false;
                 }
             }
-            b';' => {
-                let mut j = end - 1;
-                while j > start && b[j - 1].is_ascii_alphanumeric() {
-                    j -= 1;
-                }
-                if j > start && b[j - 1] == b'&' {
-                    end = j - 1;
-                } else {
-                    break;
+            // `]` is trailing only when followed by an end or by `(` / `[`
+            // (`cmark-gfm` issue #278); otherwise re-enter the trail.
+            b']' => {
+                j += 1;
+                match b.get(j) {
+                    None | Some(b'(' | b'[' | b' ' | b'\t' | b'\n' | b'\r') => return true,
+                    Some(&c) if c >= 0x80 && boundary_ws(Some(al_char(b, j).0)) => return true,
+                    _ => {}
                 }
             }
-            _ => break,
+            b'<' | b' ' | b'\t' | b'\n' | b'\r' => return true,
+            c if c >= 0x80 && boundary_ws(Some(al_char(b, j).0)) => return true,
+            _ => return false,
         }
     }
-    end
 }
 
-/// If a `www.` / `http(s)://` autolink starts at `b[start]`, return its end.
-fn gfm_scan_url(b: &[u8], start: usize) -> Option<usize> {
+/// micromark `tokenizeDomain`: scan a domain from `b[start]`. Returns `Some(end)`
+/// when the domain is non-empty and has no underscore in either of its last two
+/// segments, else `None`.
+fn al_scan_domain(b: &[u8], start: usize) -> Option<usize> {
+    let mut i = start;
+    let mut seen = false;
+    let mut us_last = false; // `_` in the current (last) segment
+    let mut us_penult = false; // `_` in the penultimate segment
+    loop {
+        // `.` / `_` are trailing-punctuation candidates first.
+        if i < b.len() && (b[i] == b'.' || b[i] == b'_') {
+            if al_is_trail(b, i) {
+                break;
+            }
+            if b[i] == b'_' {
+                us_last = true;
+            } else {
+                us_penult = us_last;
+                us_last = false;
+            }
+            i += 1;
+            continue;
+        }
+        if al_at_end(b, i) {
+            break;
+        }
+        let c = b[i];
+        if c < 0x80 {
+            if c != b'-' && is_ascii_punct(c) {
+                break; // non-dash ASCII punctuation ends the domain
+            }
+            seen = true;
+            i += 1;
+        } else {
+            let (ch, len) = al_char(b, i);
+            if ch != '-' && boundary_punct(Some(ch)) {
+                break;
+            }
+            seen = true;
+            i += len;
+        }
+    }
+    (seen && !us_last && !us_penult).then_some(i)
+}
+
+/// micromark `tokenizePath`: scan the path from `b[start]`, returning the end
+/// after trailing punctuation is trimmed (balanced `()` stay in the path).
+fn al_scan_path(b: &[u8], start: usize) -> usize {
+    let mut i = start;
+    let mut open = 0u32;
+    let mut close = 0u32;
+    loop {
+        if i >= b.len() {
+            return i;
+        }
+        let c = b[i];
+        if c == b'(' {
+            open += 1;
+            i += 1;
+            continue;
+        }
+        if c == b')' && close < open {
+            close += 1;
+            i += 1;
+            continue;
+        }
+        if matches!(
+            c,
+            b'!' | b'"'
+                | b'&'
+                | b'\''
+                | b')'
+                | b'*'
+                | b','
+                | b'.'
+                | b':'
+                | b';'
+                | b'<'
+                | b'?'
+                | b']'
+                | b'_'
+                | b'~'
+        ) {
+            if al_is_trail(b, i) {
+                return i;
+            }
+            if c == b')' {
+                close += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if al_at_end(b, i) {
+            return i;
+        }
+        i += if c < 0x80 { 1 } else { al_char(b, i).1 };
+    }
+}
+
+/// A `www.` autolink at `b[start]` (case-insensitive `www`, then `.`, then at
+/// least one more char). The domain scan runs over the whole thing — `www`
+/// included — exactly as micromark does. Returns the end.
+fn al_scan_www(b: &[u8], start: usize) -> Option<usize> {
+    // micromark `wwwPrefixAfter`: after `www.` there must be at least one more
+    // byte (eof right after the dot → no link). The mdast tree-transform gives a
+    // trailing `www.` its own second chance.
+    if start + 4 >= b.len()
+        || !b[start].eq_ignore_ascii_case(&b'w')
+        || !b[start + 1].eq_ignore_ascii_case(&b'w')
+        || !b[start + 2].eq_ignore_ascii_case(&b'w')
+        || b[start + 3] != b'.'
+    {
+        return None;
+    }
+    let dend = al_scan_domain(b, start)?;
+    Some(al_scan_path(b, dend))
+}
+
+/// A `http(s)://` autolink at `b[start]` (case-insensitive scheme). The first
+/// char after `://` may not be eof / control / whitespace / punctuation. Returns
+/// the end.
+fn al_scan_protocol(b: &[u8], start: usize) -> Option<usize> {
     let rest = &b[start..];
-    let scan = if rest.starts_with(b"http://") {
+    let after = if rest.len() >= 7
+        && rest[..4].eq_ignore_ascii_case(b"http")
+        && rest[4..7] == *b"://"
+    {
         start + 7
-    } else if rest.starts_with(b"https://") {
+    } else if rest.len() >= 8 && rest[..5].eq_ignore_ascii_case(b"https") && rest[5..8] == *b"://" {
         start + 8
-    } else if rest.starts_with(b"www.") {
-        start + 4
     } else {
         return None;
     };
-    // Domain: dot-separated labels of [A-Za-z0-9_-]; needs at least one dot.
-    let mut i = scan;
-    let mut dots = 0usize;
-    while i < b.len() {
-        match b[i] {
-            b'.' => dots += 1,
-            c if c.is_ascii_alphanumeric() || c == b'-' || c == b'_' => {}
-            _ => break,
-        }
-        i += 1;
-    }
-    if i == scan || dots == 0 {
+    if after >= b.len() {
         return None;
     }
-    // Path: up to whitespace or `<`.
-    let mut end = i;
-    while end < b.len() && !matches!(b[end], b' ' | b'\t' | b'\n' | b'\r' | b'<') {
-        end += 1;
+    let stop = if b[after] < 0x80 {
+        let c = b[after];
+        c < 0x20 || c == 0x7f || c == b' ' || is_ascii_punct(c)
+    } else {
+        let ch = al_char(b, after).0;
+        ch.is_control() || boundary_ws(Some(ch)) || boundary_punct(Some(ch))
+    };
+    if stop {
+        return None;
     }
-    let end = gfm_trim_url(b, start, end);
-    (end > scan && b[scan..end].contains(&b'.')).then_some(end)
+    let dend = al_scan_domain(b, after)?;
+    Some(al_scan_path(b, dend))
 }
 
-/// At a `:` opening `://`, if a preceding `http`/`https` scheme sits at an
-/// autolink boundary, return the URL `(start, end)`. Lets the scan trigger on the
-/// rare `:` instead of every `h`.
-fn gfm_scan_url_at_colon(b: &[u8], i: usize) -> Option<(usize, usize)> {
+/// At a `:` opening `://`, look back for a `http`/`https` scheme (case-insensitive)
+/// at a protocol boundary and return the URL `(start, end)`. Lets the scan trigger
+/// on the rare `:` instead of every `h`.
+fn gfm_scan_url_at_colon(b: &[u8], i: usize, lo: usize) -> Option<(usize, usize)> {
     if b.get(i + 1) != Some(&b'/') || b.get(i + 2) != Some(&b'/') {
         return None;
     }
-    let start = if i >= 5 && &b[i - 5..i] == b"https" {
+    let start = if i >= 5 && b[i - 5..i].eq_ignore_ascii_case(b"https") {
         i - 5
-    } else if i >= 4 && &b[i - 4..i] == b"http" {
+    } else if i >= 4 && b[i - 4..i].eq_ignore_ascii_case(b"http") {
         i - 4
     } else {
         return None;
     };
-    if !al_boundary(b, start) {
+    // The scheme cannot reach back past `lo` (the start of the still-uncommitted
+    // text run) — e.g. an earlier email already consumed it (`a@b.https://…`).
+    if start < lo || !al_prev_protocol(b, start) {
         return None;
     }
-    gfm_scan_url(b, start).map(|end| (start, end))
+    al_scan_protocol(b, start).map(|end| (start, end))
 }
 
-/// If a bare email autolink ends at the `@` `b[at]`, return `(localpart start,
-/// end)`. The local part must sit at an autolink boundary.
-fn gfm_scan_email(b: &[u8], at: usize) -> Option<(usize, usize)> {
+/// micromark `tokenizeEmailAutolink`, anchored at the `@` `b[at]`. Returns
+/// `(localpart start, end)`. The local part is `gfmAtext` scanned back to a
+/// boundary; the domain must be non-empty, contain a real dot, and end in an
+/// ASCII letter (`-`/`_`/digit/trailing-`.` endings reject the whole match).
+fn gfm_scan_email(b: &[u8], at: usize, lo: usize) -> Option<(usize, usize)> {
+    // The local part cannot reach back past `lo` (the start of the current,
+    // still-uncommitted text run) — chars before it are already emitted as nodes.
     let mut s = at;
-    while s > 0
-        && matches!(b[s - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'_' | b'+' | b'-')
-    {
+    while s > lo && al_atext(b[s - 1]) {
         s -= 1;
     }
-    if s == at || !al_boundary(b, s) {
+    if s == at || !al_prev_email(b, s) {
         return None;
     }
-    // Domain: [A-Za-z0-9_-] labels separated by `.`, at least one dot, ending on
-    // an alphanumeric (a trailing `.`/`-`/`_` is not part of the address).
     let mut i = at + 1;
-    let dstart = i;
+    let mut data = false;
+    let mut dot = false;
+    let mut end = i; // one past the last consumed alnum/`-`/`_`
     while i < b.len() {
-        match b[i] {
-            b'.' | b'-' | b'_' => {}
-            c if c.is_ascii_alphanumeric() => {}
-            _ => break,
+        let c = b[i];
+        if c == b'.' {
+            // A dot is real only when followed by an alphanumeric; otherwise it
+            // is trailing and ends the domain.
+            if b.get(i + 1).is_some_and(u8::is_ascii_alphanumeric) {
+                dot = true;
+                i += 1;
+                continue;
+            }
+            break;
         }
-        i += 1;
+        if c == b'-' || c == b'_' || c.is_ascii_alphanumeric() {
+            data = true;
+            i += 1;
+            end = i;
+            continue;
+        }
+        break;
     }
-    let mut e = i;
-    while e > dstart && !b[e - 1].is_ascii_alphanumeric() {
-        e -= 1;
+    (data && dot && end > at + 1 && b[end - 1].is_ascii_alphabetic()).then_some((s, end))
+}
+
+/// Is the `_` at `b[i]` part of a GFM email local part (`a_b@x.com`)? micromark
+/// tokenizes the literal email BEFORE emphasis, so such a `_` never becomes an
+/// emphasis delimiter; we keep it in the text run (rather than pre-committing a
+/// delimiter node that would strand the local part behind `run`) so the `@`
+/// autolink scan reclaims it — preserving the email's tokenizer position. Only
+/// `_` matters: `*` is not email "atext". Scans forward over atext to the `@`,
+/// then confirms a valid email there whose local part reaches back to `i`.
+fn al_underscore_in_email(b: &[u8], i: usize, run: usize) -> bool {
+    let mut j = i;
+    while j < b.len() && al_atext(b[j]) {
+        j += 1;
     }
-    (e > dstart && b[dstart..e].contains(&b'.')).then_some((s, e))
+    b.get(j) == Some(&b'@') && matches!(gfm_scan_email(b, j, run), Some((s, _)) if s <= i)
 }
 
 /// Emit a `www.`/`http(s)://` autolink as `<a href="…">…</a>` (www gets an
@@ -1551,13 +1774,20 @@ fn gfm_scan_email(b: &[u8], at: usize) -> Option<(usize, usize)> {
 fn emit_url(src: &str, start: usize, end: usize, out: &mut String) {
     let text = &src[start..end];
     out.push_str("<a href=\"");
-    if !text.starts_with("http") {
+    if !al_has_scheme(text) {
         out.push_str("http://");
     }
     escape_href(text, out);
     out.push_str("\">");
     escape_html(text, out);
     out.push_str("</a>");
+}
+
+/// Does an extended-URL autolink carry an explicit `http(s)` scheme (any case)?
+/// A `www.` autolink does not, so it needs an `http://` href prefix; an explicit
+/// `HTTP://`/`https://` keeps its scheme — and case — verbatim.
+fn al_has_scheme(text: &str) -> bool {
+    text.len() >= 4 && text.as_bytes()[..4].eq_ignore_ascii_case(b"http")
 }
 
 /// The mdast `link` url for a GFM extended URL autolink: a `www.` link gets an
@@ -1567,7 +1797,7 @@ fn emit_url(src: &str, start: usize, end: usize, out: &mut String) {
 /// (a runtime `const false` without `ast`) blocks that are still compiled and
 /// name-resolved, so the fn must exist in every feature configuration.
 fn gfm_url_href(text: &str) -> String {
-    if text.starts_with("http") {
+    if al_has_scheme(text) {
         text.to_owned()
     } else {
         format!("http://{text}")
@@ -1582,6 +1812,346 @@ fn emit_email(src: &str, start: usize, end: usize, out: &mut String) {
     out.push_str("\">");
     escape_html(email, out);
     out.push_str("</a>");
+}
+
+// ── GFM autolink-literal mdast TRANSFORM (the second pass) ──────────────────
+// The micromark *tokenizer* (the `al_*` helpers above) catches most autolink
+// literals during parse, but remark-gfm's mdast output is the UNION of the
+// tokenizer and a tree post-pass: `transformGfmAutolinkLiterals` in
+// `mdast-util-gfm-autolink-literal`, run via `mdast-util-find-and-replace` over
+// every `text` node (skipping `link`/`linkReference` subtrees) AFTER emphasis
+// resolution. It catches the literals the tokenizer missed — emphasis-wrapped
+// (`_https://x_`), angle-wrapped (`<www.x.com>`), and ones preceded by `,`/`:`/
+// `<`. Ported faithfully here so the mdast path matches byte-for-byte.
+//
+// KEY: `find-and-replace` sets NO `position` on the nodes it creates, and when a
+// text node is split, the surrounding text pieces lose their position too. So a
+// transform that fires replaces the whole text node with UN-positioned pieces.
+/// One output piece of the transform: a plain text run or an autolink `link`
+/// (with its single text child value). Both carry no unist position.
+#[cfg(feature = "ast")]
+pub enum AlPiece {
+    Text(String),
+    Link { url: String, text: String },
+}
+
+/// `[-.\w+]` — the email local-part ("atext") class (ASCII, no `u` regex flag).
+#[cfg(feature = "ast")]
+fn alx_atext(c: u8) -> bool {
+    matches!(c, b'-' | b'.' | b'_' | b'+') || c.is_ascii_alphanumeric()
+}
+
+/// `[-\w]` — the email domain-label class.
+#[cfg(feature = "ast")]
+fn alx_label(c: u8) -> bool {
+    c == b'-' || c == b'_' || c.is_ascii_alphanumeric()
+}
+
+/// `[-.\w]` — the URL domain (regex group 2) class.
+#[cfg(feature = "ast")]
+fn alx_urlword(c: u8) -> bool {
+    matches!(c, b'-' | b'.' | b'_') || c.is_ascii_alphanumeric()
+}
+
+/// The char immediately before byte offset `pos` in `s` (`None` at the start).
+#[cfg(feature = "ast")]
+fn alx_prev_char(s: &str, pos: usize) -> Option<char> {
+    s[..pos].chars().next_back()
+}
+
+/// `previous(match, email)`: the preceding char must be the string start, Unicode
+/// whitespace, or Unicode punctuation; for an email it additionally must not be a
+/// slash. (`unicodeWhitespace` = `\s`, `unicodePunctuation` = `\p{P}|\p{S}` — the
+/// `boundary_*` proxies stand in for the Unicode property tests.)
+#[cfg(feature = "ast")]
+fn alx_previous(s: &str, pos: usize, email: bool) -> bool {
+    if pos == 0 {
+        return true;
+    }
+    let c = alx_prev_char(s, pos);
+    (boundary_ws(c) || boundary_punct(c)) && (!email || c != Some('/'))
+}
+
+/// `isCorrectDomain`: split on `.`, need ≥2 parts, and neither of the last two
+/// (when non-empty) may contain `_` or lack an ASCII alphanumeric.
+#[cfg(feature = "ast")]
+fn alx_correct_domain(domain: &str) -> bool {
+    let parts: Vec<&str> = domain.split('.').collect();
+    if parts.len() < 2 {
+        return false;
+    }
+    let bad = |p: &str| -> bool {
+        !p.is_empty() && (p.contains('_') || !p.bytes().any(|b| b.is_ascii_alphanumeric()))
+    };
+    !(bad(parts[parts.len() - 1]) || bad(parts[parts.len() - 2]))
+}
+
+/// `splitUrl`: trim a trailing run of `[!"&'),.:;<>?\]}]`, then push balanced
+/// trailing `)` back onto the URL. Returns `(url, trail)`.
+#[cfg(feature = "ast")]
+fn alx_split_url(url: &str) -> (String, Option<String>) {
+    let b = url.as_bytes();
+    let mut ti = b.len();
+    while ti > 0
+        && matches!(
+            b[ti - 1],
+            b'!' | b'"'
+                | b'&'
+                | b'\''
+                | b')'
+                | b','
+                | b'.'
+                | b':'
+                | b';'
+                | b'<'
+                | b'>'
+                | b'?'
+                | b']'
+                | b'}'
+        )
+    {
+        ti -= 1;
+    }
+    if ti == b.len() {
+        return (url.to_owned(), None);
+    }
+    let mut url_s = url[..ti].to_owned();
+    let mut trail = url[ti..].to_owned();
+    let opening = url_s.matches('(').count();
+    let mut closing = url_s.matches(')').count();
+    let mut cpi = trail.find(')');
+    while let Some(ci) = cpi {
+        if opening > closing {
+            url_s.push_str(&trail[..ci + 1]);
+            trail = trail[ci + 1..].to_owned();
+            closing += 1;
+            cpi = trail.find(')');
+        } else {
+            break;
+        }
+    }
+    (url_s, if trail.is_empty() { None } else { Some(trail) })
+}
+
+/// Match `https?://` or `www` (with a `.` lookahead) at `b[p]`; returns
+/// `(group1_len, is_www)` (the `www` lookahead `.` is not consumed).
+#[cfg(feature = "ast")]
+fn alx_url_proto(b: &[u8], p: usize) -> Option<(usize, bool)> {
+    if p + 4 <= b.len() && b[p..p + 4].eq_ignore_ascii_case(b"http") {
+        let mut q = p + 4;
+        if q < b.len() && b[q] | 0x20 == b's' {
+            q += 1;
+        }
+        if q + 3 <= b.len() && &b[q..q + 3] == b"://" {
+            return Some((q + 3 - p, false));
+        }
+    }
+    if p + 4 <= b.len() && b[p..p + 3].eq_ignore_ascii_case(b"www") && b[p + 3] == b'.' {
+        return Some((3, true));
+    }
+    None
+}
+
+/// The URL regex `/(https?:\/\/|www(?=\.))([-.\w]+)([^ \t\r\n]*)/` matched at
+/// exactly `b[p]`: returns `(g1, g2, g3, is_www)` lengths, or `None` (group 2
+/// must be ≥1 char).
+#[cfg(feature = "ast")]
+fn alx_url_at(b: &[u8], p: usize) -> Option<(usize, usize, usize, bool)> {
+    let (g1, is_www) = alx_url_proto(b, p)?;
+    let g2s = p + g1;
+    let mut q = g2s;
+    while q < b.len() && alx_urlword(b[q]) {
+        q += 1;
+    }
+    if q == g2s {
+        return None;
+    }
+    let g2 = q - g2s;
+    let g3s = q;
+    while q < b.len() && !matches!(b[q], b' ' | b'\t' | b'\r' | b'\n') {
+        q += 1;
+    }
+    Some((g1, g2, q - g3s, is_www))
+}
+
+/// URL pass over `s`: `Some(pieces)` if ≥1 autolink fired, else `None`.
+#[cfg(feature = "ast")]
+fn alx_url_pass(s: &str) -> Option<Vec<AlPiece>> {
+    let b = s.as_bytes();
+    let mut out: Vec<AlPiece> = Vec::new();
+    let (mut start, mut from, mut changed) = (0usize, 0usize, false);
+    while from < b.len() {
+        // Next regex match at-or-after `from` (triggers start with h/H/w/W).
+        let pos = match (from..b.len())
+            .find(|&p| matches!(b[p], b'h' | b'H' | b'w' | b'W') && alx_url_at(b, p).is_some())
+        {
+            Some(p) => p,
+            None => break,
+        };
+        let (g1, g2, g3, is_www) = alx_url_at(b, pos).unwrap();
+        let matchend = pos + g1 + g2 + g3;
+        // findUrl
+        if alx_previous(s, pos, false) {
+            let (domain, prefix, proto): (&str, &str, &str) = if is_www {
+                (&s[pos..pos + g1 + g2], "http://", "")
+            } else {
+                (&s[pos + g1..pos + g1 + g2], "", &s[pos..pos + g1])
+            };
+            if alx_correct_domain(domain) {
+                let dp = format!("{}{}", domain, &s[pos + g1 + g2..matchend]);
+                let (u0, u1) = alx_split_url(&dp);
+                if !u0.is_empty() {
+                    if start != pos {
+                        out.push(AlPiece::Text(s[start..pos].to_owned()));
+                    }
+                    out.push(AlPiece::Link {
+                        url: format!("{prefix}{proto}{u0}"),
+                        text: format!("{proto}{u0}"),
+                    });
+                    if let Some(tr) = u1 {
+                        out.push(AlPiece::Text(tr));
+                    }
+                    start = matchend;
+                    from = matchend;
+                    changed = true;
+                    continue;
+                }
+            }
+        }
+        from = pos + 1; // rejected → retry one char later
+    }
+    if !changed {
+        return None;
+    }
+    if start < b.len() {
+        out.push(AlPiece::Text(s[start..].to_owned()));
+    }
+    Some(out)
+}
+
+/// Match the email label `[-\w]+(\.[-\w]+)+` at `b[ls]`; returns its end offset.
+#[cfg(feature = "ast")]
+fn alx_match_label(b: &[u8], ls: usize) -> Option<usize> {
+    let mut q = ls;
+    while q < b.len() && alx_label(b[q]) {
+        q += 1;
+    }
+    if q == ls {
+        return None;
+    }
+    let mut segs = 0;
+    while q < b.len() && b[q] == b'.' {
+        let seg = q + 1;
+        let mut r = seg;
+        while r < b.len() && alx_label(b[r]) {
+            r += 1;
+        }
+        if r == seg {
+            break; // `.` not followed by [-\w]: don't consume the dot
+        }
+        q = r;
+        segs += 1;
+    }
+    (segs > 0).then_some(q)
+}
+
+/// Next email regex match at-or-after `from`: returns `(start, at, end)` where the
+/// match is `s[start..at]` `@` `s[at+1..end]`. Applies only the regex (lookbehind
+/// `^|\s|\p{P}|\p{S}` + structure); `findEmail`'s extra checks are applied by the
+/// caller so a rejection retries from `start + 1`, mirroring `find-and-replace`.
+#[cfg(feature = "ast")]
+fn alx_next_email(s: &str, b: &[u8], from: usize) -> Option<(usize, usize, usize)> {
+    let mut p = from;
+    while p < b.len() {
+        if !alx_atext(b[p]) {
+            p += 1;
+            continue;
+        }
+        let mut e = p;
+        while e < b.len() && alx_atext(b[e]) {
+            e += 1;
+        }
+        if b.get(e) != Some(&b'@') {
+            p = e; // run not followed by '@'
+            continue;
+        }
+        match alx_match_label(b, e + 1) {
+            Some(end) => {
+                // lookbehind `^|\s|\p{P}|\p{S}` (the regex gate, slash allowed here)
+                if p == 0 || boundary_ws(alx_prev_char(s, p)) || boundary_punct(alx_prev_char(s, p))
+                {
+                    return Some((p, e, end));
+                }
+                p += 1; // try a shorter atext start within the run
+            }
+            None => p = e + 1, // label after '@' invalid; move past '@'
+        }
+    }
+    None
+}
+
+/// Email pass over `s` (run after the URL pass on each text piece).
+#[cfg(feature = "ast")]
+fn alx_email_pass(s: &str) -> Option<Vec<AlPiece>> {
+    let b = s.as_bytes();
+    let mut out: Vec<AlPiece> = Vec::new();
+    let (mut start, mut from, mut changed) = (0usize, 0usize, false);
+    while from < b.len() {
+        let (pos, _at, end) = match alx_next_email(s, b, from) {
+            Some(m) => m,
+            None => break,
+        };
+        // findEmail: previous(email) and label not ending in `-`/digit/`_`.
+        let label_bad = matches!(b[end - 1], b'-' | b'_') || b[end - 1].is_ascii_digit();
+        if alx_previous(s, pos, true) && !label_bad {
+            if start != pos {
+                out.push(AlPiece::Text(s[start..pos].to_owned()));
+            }
+            let body = &s[pos..end]; // atext@label
+            out.push(AlPiece::Link {
+                url: format!("mailto:{body}"),
+                text: body.to_owned(),
+            });
+            start = end;
+            from = end;
+            changed = true;
+        } else {
+            from = pos + 1;
+        }
+    }
+    if !changed {
+        return None;
+    }
+    if start < b.len() {
+        out.push(AlPiece::Text(s[start..].to_owned()));
+    }
+    Some(out)
+}
+
+/// The full GFM autolink-literal transform for one mdast `text` node value: URL
+/// pass, then email pass over each resulting text piece (matching `find-and-
+/// replace`'s pair ordering). Returns `None` when nothing fires (keep the node as
+/// is, with its position); `Some(pieces)` to replace it with un-positioned pieces.
+#[cfg(feature = "ast")]
+pub fn al_transform_text(s: &str) -> Option<Vec<AlPiece>> {
+    let url = alx_url_pass(s);
+    let url_changed = url.is_some();
+    let base = url.unwrap_or_else(|| vec![AlPiece::Text(s.to_owned())]);
+    let mut out: Vec<AlPiece> = Vec::with_capacity(base.len());
+    let mut email_changed = false;
+    for piece in base {
+        match piece {
+            AlPiece::Text(t) => match alx_email_pass(&t) {
+                Some(v) => {
+                    email_changed = true;
+                    out.extend(v);
+                }
+                None => out.push(AlPiece::Text(t)),
+            },
+            link => out.push(link),
+        }
+    }
+    (url_changed || email_changed).then_some(out)
 }
 
 /// Like [`stream_inline`] but also recognizes GFM extended autolinks (bare
@@ -1660,7 +2230,7 @@ fn stream_autolink(src: &str, out: &mut String, hw: bool, tf: bool) {
                 run = i;
             }
             b'@' => {
-                if let Some((s, e)) = gfm_scan_email(bytes, i) {
+                if let Some((s, e)) = gfm_scan_email(bytes, i, run) {
                     escape_html(&src[run..s], out);
                     emit_email(src, s, e, out);
                     i = e;
@@ -1669,8 +2239,8 @@ fn stream_autolink(src: &str, out: &mut String, hw: bool, tf: bool) {
                     i += 1;
                 }
             }
-            b'w' | b'W' if al_boundary(bytes, i) => {
-                if let Some(end) = gfm_scan_url(bytes, i) {
+            b'w' | b'W' if al_prev_www(bytes, i) => {
+                if let Some(end) = al_scan_www(bytes, i) {
                     escape_html(&src[run..i], out);
                     emit_url(src, i, end, out);
                     i = end;
@@ -1680,7 +2250,7 @@ fn stream_autolink(src: &str, out: &mut String, hw: bool, tf: bool) {
                 }
             }
             b':' => {
-                if let Some((s, e)) = gfm_scan_url_at_colon(bytes, i) {
+                if let Some((s, e)) = gfm_scan_url_at_colon(bytes, i, run) {
                     escape_html(&src[run..s], out);
                     emit_url(src, s, e, out);
                     i = e;
@@ -2112,24 +2682,43 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
             }
             b'*' | b'_' => {
                 let ch = bytes[i];
-                emit_text(raw, &src[run..i], cur);
-                flush!(i);
                 let count = bytes[i..].iter().take_while(|&&b| b == ch).count();
+                // A `_` run inside a GFM email local part stays in the text run so
+                // the `@` scan reclaims it (see `al_underscore_in_email`); skipping
+                // the delimiter keeps the email a *tokenizer* autolink (with its
+                // position), matching micromark's autolink-before-emphasis order.
+                if ch == b'_'
+                    && al
+                    && !al_in_open_label(stack)
+                    && al_underscore_in_email(bytes, i, run)
+                {
+                    i += count;
+                    continue;
+                }
                 let before = src[..i].chars().next_back();
                 let after = src[i + count..].chars().next();
                 let (can_open, can_close) = flanking(ch, before, after);
-                let idx = list.push(Node::Delim {
-                    ch,
-                    count,
-                    orig: count,
-                    can_open,
-                    can_close,
-                });
-                #[cfg(feature = "ast")]
-                cspan!(idx, i, i + count);
-                stack.push(StackItem::Emph(idx));
+                if can_open || can_close {
+                    emit_text(raw, &src[run..i], cur);
+                    flush!(i);
+                    let idx = list.push(Node::Delim {
+                        ch,
+                        count,
+                        orig: count,
+                        can_open,
+                        can_close,
+                    });
+                    #[cfg(feature = "ast")]
+                    cspan!(idx, i, i + count);
+                    stack.push(StackItem::Emph(idx));
+                    run = i + count;
+                }
+                // An inert run (neither opener nor closer) stays in the text run
+                // as literal text — so a `_` inside a GFM email local part
+                // (`a_b@x.com`) survives to the `@` autolink scan instead of being
+                // pre-committed as a delimiter node (which would split the run and
+                // strand the local part behind `run`).
                 i += count;
-                run = i;
             }
             // GFM strikethrough: a `~` run of 1 or 2 is a delimiter (→ <del>);
             // 3+ tildes are literal. Only reachable when ST is on.
@@ -2296,8 +2885,8 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
             // GFM autolinks in delimiter-run text (when on). The URL trigger
             // fires at the start, so `gfm_scan_url` swallows the whole URL —
             // including any `_`/`*` in the path — before they become delimiters.
-            b'@' if al => {
-                if let Some((s, e)) = gfm_scan_email(bytes, i) {
+            b'@' if al && !al_in_open_label(stack) => {
+                if let Some((s, e)) = gfm_scan_email(bytes, i, run) {
                     emit_text(raw, &src[run..s], cur);
                     if ast_mode {
                         // GFM extended email autolink → mdast `link` (mailto: href,
@@ -2322,8 +2911,8 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                     i += 1;
                 }
             }
-            b'w' | b'W' if al && al_boundary(bytes, i) => {
-                if let Some(end) = gfm_scan_url(bytes, i) {
+            b'w' | b'W' if al && !al_in_open_label(stack) && al_prev_www(bytes, i) => {
+                if let Some(end) = al_scan_www(bytes, i) {
                     emit_text(raw, &src[run..i], cur);
                     if ast_mode {
                         // GFM extended `www.` autolink → mdast `link`.
@@ -2345,7 +2934,10 @@ fn render_inline_impl<const HW: bool, const ST: bool>(
                 }
             }
             b':' if al || emo || dir => {
-                if al && let Some((s, e)) = gfm_scan_url_at_colon(bytes, i) {
+                if al
+                    && !al_in_open_label(stack)
+                    && let Some((s, e)) = gfm_scan_url_at_colon(bytes, i, run)
+                {
                     emit_text(raw, &src[run..s], cur);
                     if ast_mode {
                         // GFM extended `http(s)://` autolink → mdast `link`.

@@ -153,6 +153,14 @@ function readWire(ex, markdown, flags, withPos) {
     }
     return str();
   };
+  // Read a node's 6×u32 position, or `undefined` when the start point is the
+  // `u32::MAX` sentinel (a position-less autolink-transform node).
+  const readPos = () => {
+    const l = u32(), c = u32(), o = u32(), l2 = u32(), c2 = u32(), o2 = u32();
+    return l === 0xffffffff
+      ? undefined
+      : { start: { line: l, column: c, offset: o }, end: { line: l2, column: c2, offset: o2 } };
+  };
   const kids = () => {
     const n = u32();
     const a = new Array(n);
@@ -171,12 +179,9 @@ function readWire(ex, markdown, flags, withPos) {
 
   function node() {
     const tag = u8[p++];
-    const position = withPos
-      ? {
-          start: { line: u32(), column: u32(), offset: u32() },
-          end: { line: u32(), column: u32(), offset: u32() },
-        }
-      : undefined;
+    // A sentinel start point (`u32::MAX`) marks a node the GFM autolink transform
+    // created — `mdast-util-find-and-replace` leaves those position-less.
+    const position = withPos ? readPos() : undefined;
     switch (tag) {
       case 0: return { type: "root", children: kids(), position };
       case 1: return { type: "paragraph", children: kids(), position };
