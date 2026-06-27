@@ -318,6 +318,22 @@ rather than forked.
 > `momiji-core` crate that both rostdown and sparkdown depend on, so a faster
 > NEON/SWAR scan improves both at once.
 
+## Known limitations
+
+All **652/652** CommonMark examples and the GFM table / tasklist / whitespace
+fuzzers pass. The following are fuzz-discovered edge cases only — root-caused and
+intentionally deferred; they do not appear in realistic documents:
+
+- **Indented-code trailing-blank-line `value`** — for *N* trailing blank lines
+  inside an indented code block, the mdast `value` keeps one fewer newline than
+  remark. The node's `position.end` is correct.
+- **`> >` blockquote ended by a tab/space marker** — a final `>\t` or `>␠␠`
+  closing a nested blockquote over-extends the inner quote by one line versus
+  remark. A final bare `>` is correct.
+- **Native `to_html` end-of-block trailing tabs** — the Rust CommonMark→HTML path
+  keeps a trailing tab at the very end of a block (`foo\t` → `<p>foo\t</p>`) where
+  `cmark` strips it. The mdast / rehype path is unaffected.
+
 ## License
 
 MIT. The vendored CommonMark spec suite under `tests/fixtures/spec.json` is
