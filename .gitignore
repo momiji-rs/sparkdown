@@ -7,3 +7,8 @@ harness/sparkdown-raw.wasm
 harness/isolate-*.log
 harness/prof*.txt
 harness/prof_loop_raw.mjs
+harness/prof_loop_prod.mjs
+
+# scratch dev helpers (untracked, regenerated ad hoc)
+examples/_*.rs
+harness/*_experiment.mjs
