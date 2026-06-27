@@ -38,7 +38,7 @@ function readPooled() {
       case 2: { const depth = u8[p++]; return { type: 'heading', depth, children: kids() }; }
       case 3: return { type: 'blockquote', children: kids() };
       case 4: { const f = u8[p++]; const st = u32(); return { type: 'list', ordered: !!(f & 1), start: st === 0xffffffff ? null : st, spread: !!(f & 2), children: kids() }; }
-      case 5: { const spread = !!u8[p++]; return { type: 'listItem', spread, checked: null, children: kids() }; }
+      case 5: { const spread = !!u8[p++]; const ck = u8[p++]; return { type: 'listItem', spread, checked: ck === 2 ? null : ck === 1, children: kids() }; }
       case 6: return { type: 'thematicBreak' };
       case 7: { const lang = opt(); const meta = opt(); const value = str(); return { type: 'code', lang, meta, value }; }
       case 8: return { type: 'html', value: str() };
@@ -53,6 +53,9 @@ function readPooled() {
       case 17: { const identifier = str(); const label = str(); const url = str(); const title = opt(); return { type: 'definition', identifier, label, url, title }; }
       case 18: { const identifier = str(); const label = str(); const rt = REFTYPE[u8[p++]]; return { type: 'linkReference', identifier, label, referenceType: rt, children: kids() }; }
       case 19: { const identifier = str(); const label = str(); const rt = REFTYPE[u8[p++]]; const alt = str(); return { type: 'imageReference', identifier, label, referenceType: rt, alt }; }
+      case 31: { const ncols = u32(); const align = new Array(ncols); for (let i = 0; i < ncols; i++) align[i] = [null, 'left', 'right', 'center'][u8[p++]]; return { type: 'table', align, children: kids() }; }
+      case 32: return { type: 'tableRow', children: kids() };
+      case 33: return { type: 'tableCell', children: kids() };
       default: throw new Error('tag ' + tag);
     }
   }
@@ -81,7 +84,7 @@ function readInline() {
       case 2: { const depth = u8[p++]; return { type: 'heading', depth, children: kids() }; }
       case 3: return { type: 'blockquote', children: kids() };
       case 4: { const f = u8[p++]; const st = u32(); return { type: 'list', ordered: !!(f & 1), start: st === 0xffffffff ? null : st, spread: !!(f & 2), children: kids() }; }
-      case 5: { const spread = !!u8[p++]; return { type: 'listItem', spread, checked: null, children: kids() }; }
+      case 5: { const spread = !!u8[p++]; const ck = u8[p++]; return { type: 'listItem', spread, checked: ck === 2 ? null : ck === 1, children: kids() }; }
       case 6: return { type: 'thematicBreak' };
       case 7: { const lang = opt(); const meta = opt(); const value = str(); return { type: 'code', lang, meta, value }; }
       case 8: return { type: 'html', value: str() }; case 9: return { type: 'text', value: str() };
@@ -92,6 +95,9 @@ function readInline() {
       case 17: { const identifier = str(); const label = str(); const url = str(); const title = opt(); return { type: 'definition', identifier, label, url, title }; }
       case 18: { const identifier = str(); const label = str(); const rt = REFTYPE[u8[p++]]; return { type: 'linkReference', identifier, label, referenceType: rt, children: kids() }; }
       case 19: { const identifier = str(); const label = str(); const rt = REFTYPE[u8[p++]]; const alt = str(); return { type: 'imageReference', identifier, label, referenceType: rt, alt }; }
+      case 31: { const ncols = u32(); const align = new Array(ncols); for (let i = 0; i < ncols; i++) align[i] = [null, 'left', 'right', 'center'][u8[p++]]; return { type: 'table', align, children: kids() }; }
+      case 32: return { type: 'tableRow', children: kids() };
+      case 33: return { type: 'tableCell', children: kids() };
       default: throw new Error('tag ' + tag);
     }
   }

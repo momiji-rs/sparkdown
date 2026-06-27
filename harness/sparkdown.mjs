@@ -149,7 +149,7 @@ function parseToMdastWire(md, flags = 0) {
         const st = u32();
         return { type: 'list', ordered: !!(flags & 1), start: st === 0xffffffff ? null : st, spread: !!(flags & 2), children: kids(), position };
       }
-      case 5: { const spread = !!u8[p++]; return { type: 'listItem', spread, checked: null, children: kids(), position }; }
+      case 5: { const spread = !!u8[p++]; const ck = u8[p++]; return { type: 'listItem', spread, checked: ck === 2 ? null : ck === 1, children: kids(), position }; }
       case 6: return { type: 'thematicBreak', position };
       case 7: { const lang = opt(); const meta = opt(); const value = str(); return { type: 'code', lang, meta, value, position }; }
       case 8: return { type: 'html', value: str(), position };
@@ -178,6 +178,9 @@ function parseToMdastWire(md, flags = 0) {
       case 28: { const name = str(); const attributes = attrs(); return { type: 'leafDirective', name, attributes, children: kids(), position }; }
       case 29: { const name = str(); const attributes = attrs(); return { type: 'containerDirective', name, attributes, children: kids(), position }; }
       case 30: return { type: 'paragraph', data: { directiveLabel: true }, children: kids(), position };
+      case 31: { const ncols = u32(); const align = new Array(ncols); for (let i = 0; i < ncols; i++) align[i] = [null, 'left', 'right', 'center'][u8[p++]]; return { type: 'table', align, children: kids(), position }; }
+      case 32: return { type: 'tableRow', children: kids(), position };
+      case 33: return { type: 'tableCell', children: kids(), position };
       default: throw new Error('bad wire tag ' + tag);
     }
   }

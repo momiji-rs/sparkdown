@@ -50,7 +50,7 @@ function makeRead(withPos) {
         case 2: { const depth = u8[p++]; return { type: 'heading', depth, children: kids(), position }; }
         case 3: return { type: 'blockquote', children: kids(), position };
         case 4: { const f = u8[p++]; const st = u32(); return { type: 'list', ordered: !!(f & 1), start: st === 0xffffffff ? null : st, spread: !!(f & 2), children: kids(), position }; }
-        case 5: { const spread = !!u8[p++]; return { type: 'listItem', spread, checked: null, children: kids(), position }; }
+        case 5: { const spread = !!u8[p++]; const ck = u8[p++]; return { type: 'listItem', spread, checked: ck === 2 ? null : ck === 1, children: kids(), position }; }
         case 6: return { type: 'thematicBreak', position };
         case 7: { const lang = opt(); const meta = opt(); const value = str(); return { type: 'code', lang, meta, value, position }; }
         case 8: return { type: 'html', value: str(), position };
@@ -65,6 +65,9 @@ function makeRead(withPos) {
         case 17: { const identifier = str(); const label = str(); const url = str(); const title = opt(); return { type: 'definition', identifier, label, url, title, position }; }
         case 18: { const identifier = str(); const label = str(); const referenceType = REFTYPE[u8[p++]]; return { type: 'linkReference', identifier, label, referenceType, children: kids(), position }; }
         case 19: { const identifier = str(); const label = str(); const referenceType = REFTYPE[u8[p++]]; const alt = str(); return { type: 'imageReference', identifier, label, referenceType, alt, position }; }
+        case 31: { const ncols = u32(); const align = new Array(ncols); for (let i = 0; i < ncols; i++) align[i] = [null, 'left', 'right', 'center'][u8[p++]]; return { type: 'table', align, children: kids(), position }; }
+        case 32: return { type: 'tableRow', children: kids(), position };
+        case 33: return { type: 'tableCell', children: kids(), position };
         default: throw new Error('tag ' + tag);
       }
     }
