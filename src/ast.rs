@@ -2514,8 +2514,9 @@ fn inline_wire_slice(
 
 /// GFM pipe table → wire: `table` (tag 31, an `align` array + `tableRow` kids),
 /// each `tableRow` (tag 32), each `tableCell` (tag 33, inline kids). Matches
-/// `mdast-util-gfm-table`: the delimiter row sets alignment and is not emitted,
-/// data rows are truncated to the header's column count and never padded.
+/// `mdast-util-gfm-table`: the delimiter row sets alignment and is not emitted;
+/// every data row keeps the cells it actually has — short rows are not padded and
+/// long rows are not truncated (only the HTML render normalizes to the column count).
 #[cfg(feature = "gfm")]
 fn bwire_table(
     tree: &Tree,
@@ -2597,8 +2598,10 @@ fn bwire_table_row(
 ) {
     let cells = scan_cells(body);
     out.push(32); // tableRow
-    // The row spans its cells' extent (first cell start → last cell end), which
-    // already excludes leading/trailing line whitespace.
+    // The row runs from the first cell's start (after any leading line whitespace)
+    // to the last cell's end — which `scan_cells` carries to the raw line end, so a
+    // trailing pipe and any trailing whitespace ARE inside the row span (matching
+    // `mdast-util-gfm-table`, which trims only the leading edge, not the trailing tail).
     let r_start = tree.content_to_src(idx, lo as u32 + cells[0].0) as usize;
     w_pos(ctx, out, r_start);
     let reoff = reserve_pos(ctx, out);

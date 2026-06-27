@@ -2338,8 +2338,9 @@ fn count_cells(line: &[u8]) -> usize {
 }
 
 #[cfg(feature = "gfm")]
-/// If `line` is a valid GFM delimiter row (cells of `:?-+:?`, with at least one
-/// pipe to disambiguate it from a setext underline), return the column count.
+/// If `line` is a valid GFM delimiter row (cells of `:?-+:?`, carrying a pipe — or,
+/// when pipeless, a colon — to disambiguate it from a setext underline), return the
+/// column count.
 fn delim_row_cols(line: &[u8]) -> Option<usize> {
     let mut t = trim_sp(line);
     // A pipeless delimiter row is a table (not a setext underline) only when it
